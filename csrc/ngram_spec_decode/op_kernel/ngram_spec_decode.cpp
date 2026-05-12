@@ -1,19 +1,48 @@
 // Licensed under the BSD 3-Clause License  (the "License");
 // you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
 
 #include "kernel_operator.h"
 #include "ngram_spec_decode_tiling.h"
 
-constexpr int32_t ELEM_SIZE = sizeof(int32_t);  // 4 bytes
-// Safety UB buffer size：32768(128KB)
-constexpr uint32_t SAFE_CHUNK = 32768u;
+constexpr int32_t ELEM_SIZE = sizeof(int32_t);
+constexpr uint32_t SAFE_CHUNK = 8192u;
+
+// GM -> UB copy (DataCopyPad, handles unaligned GM addresses)
+#define COPY_GM_TO_UB(dst, src, src_offset, count, T)                       \
+    do {                                                                    \
+        if ((count) > 0) {                                                  \
+            constexpr uint32_t __align_elem = 8u;                           \
+            uint32_t __c = static_cast<uint32_t>(count);                    \
+            uint32_t __aligned = ((__c + __align_elem - 1u) / __align_elem) \
+                                 * __align_elem;                            \
+            uint8_t __pad = static_cast<uint8_t>(__aligned - __c);          \
+            AscendC::DataCopyExtParams __p{                                 \
+                1,                                                          \
+                static_cast<uint32_t>(__c * sizeof(T)),                     \
+                0, 0, 0};                                                   \
+            AscendC::DataCopyPadExtParams<T> __pp{true, 0, __pad, -1};      \
+            AscendC::DataCopyPad((dst), (src)[(src_offset)], __p, __pp);    \
+        }                                                                   \
+    } while (0)
+
+// UB -> GM copy (reverse direction)
+#define COPY_UB_TO_GM(dst, dst_offset, src, src_offset, count, T)           \
+    do {                                                                    \
+        if ((count) > 0) {                                                  \
+            constexpr uint32_t __store_max = 16383u;                        \
+            uint32_t __c = static_cast<uint32_t>(count);                    \
+            for (uint32_t __off = 0; __off < __c; __off += __store_max) {   \
+                uint32_t __chunk = (__off + __store_max <= __c)             \
+                                    ? __store_max                           \
+                                    : (__c - __off);                        \
+                AscendC::DataCopyParams __p{                                \
+                    1, static_cast<uint16_t>(__chunk * sizeof(T)), 0, 0};   \
+                AscendC::DataCopyPad(                                       \
+                    (dst)[(dst_offset) + __off],                            \
+                    (src)[(src_offset) + __off], __p);                      \
+            }                                                               \
+        }                                                                   \
+    } while (0)
 
 class KernelNgramSpecDecode {
 public:
@@ -27,595 +56,662 @@ public:
         REGISTER_TILING_DEFAULT(NgramSpecDecodeTilingData);
         GET_TILING_DATA_WITH_STRUCT(NgramSpecDecodeTilingData, tilingData, tiling);
 
-        this->batch_size = static_cast<int32_t>(tilingData.ngramInfo.batchSize);
-        this->max_seq_len = static_cast<int32_t>(tilingData.ngramInfo.maxSeqLen);
-        this->max_new_tokens = static_cast<int32_t>(tilingData.ngramInfo.maxNewTokens);
-        this->vocab_size_val = static_cast<int32_t>(tilingData.ngramInfo.vocabSize);
-        this->min_n_val = static_cast<int32_t>(tilingData.ngramInfo.minN);
-        this->max_n_val = static_cast<int32_t>(tilingData.ngramInfo.maxN);
-        this->k_val = static_cast<int32_t>(tilingData.ngramInfo.k);
-        this->former_num = static_cast<int32_t>(tilingData.ngramInfo.formerNum);
-        this->rows_per_core = static_cast<int32_t>(tilingData.ngramInfo.rowsPerCore);
-        this->tail_rows = static_cast<int32_t>(tilingData.ngramInfo.tailRows);
-        this->block_rows = static_cast<int32_t>(tilingData.ngramInfo.blockRows);
+        batch_size = tilingData.ngramInfo.batchSize;
+        max_seq_len = tilingData.ngramInfo.maxSeqLen;
+        max_new_tokens = tilingData.ngramInfo.maxNewTokens;
+        vocab_size_val = tilingData.ngramInfo.vocabSize;
+        min_n_val = tilingData.ngramInfo.minN;
+        max_n_val = tilingData.ngramInfo.maxN;
+        k_val = tilingData.ngramInfo.k;
+        former_num = tilingData.ngramInfo.formerNum;
+        rows_per_core = tilingData.ngramInfo.rowsPerCore;
+        tail_rows = tilingData.ngramInfo.tailRows;
+        block_rows = tilingData.ngramInfo.blockRows;
 
-        int32_t align_elems = 32 / ELEM_SIZE;  // = 8
-        this->max_seq_len_align = ((this->max_seq_len + align_elems - 1) / align_elems) * align_elems;
-        this->max_new_tokens_align = ((this->max_new_tokens + align_elems - 1) / align_elems) * align_elems;
-        this->k_align = ((this->k_val + align_elems - 1) / align_elems) * align_elems;
-
-        this->is_large_row = (this->max_seq_len_align > static_cast<int32_t>(SAFE_CHUNK));
+        int32_t align_elems = 32 / ELEM_SIZE;
+        max_seq_len_align = ((max_seq_len + align_elems - 1) / align_elems) * align_elems;
+        max_new_tokens_align = ((max_new_tokens + align_elems - 1) / align_elems) * align_elems;
+        k_align = ((k_val + align_elems - 1) / align_elems) * align_elems;
 
         uint32_t blockIdx = AscendC::GetBlockIdx();
-        if (blockIdx < static_cast<uint32_t>(this->former_num)) {
-            this->my_rows = static_cast<uint32_t>(this->rows_per_core);
-            this->row_offset = static_cast<uint32_t>(this->rows_per_core) * blockIdx;
+        if (blockIdx < static_cast<uint32_t>(former_num)) {
+            my_rows = static_cast<uint32_t>(rows_per_core) + 1;
+            row_offset = (static_cast<uint32_t>(rows_per_core) + 1) * blockIdx;
         } else {
-            this->my_rows = static_cast<uint32_t>(this->tail_rows);
-            this->row_offset = static_cast<uint32_t>(this->rows_per_core) * static_cast<uint32_t>(this->former_num);
+            my_rows = static_cast<uint32_t>(rows_per_core);
+            row_offset = static_cast<uint32_t>(rows_per_core + 1)
+                       * static_cast<uint32_t>(former_num)
+                       + my_rows * (blockIdx - static_cast<uint32_t>(former_num));
         }
 
         tokenGm.SetGlobalBuffer((__gm__ int32_t *)token_ids_gm,
-            static_cast<uint64_t>(this->batch_size) * this->max_seq_len);
+            static_cast<uint64_t>(batch_size) * max_seq_len);
         numTokensGm.SetGlobalBuffer((__gm__ int32_t *)num_tokens_gm,
-            static_cast<uint64_t>(this->batch_size));
+            static_cast<uint64_t>(batch_size));
         sampledGm.SetGlobalBuffer((__gm__ int32_t *)sampled_gm,
-            static_cast<uint64_t>(this->batch_size) * this->max_new_tokens);
+            static_cast<uint64_t>(batch_size) * max_new_tokens);
         discardGm.SetGlobalBuffer((__gm__ int32_t *)discard_gm,
-            static_cast<uint64_t>(this->batch_size));
+            static_cast<uint64_t>(batch_size));
         nextTokensGm.SetGlobalBuffer((__gm__ int32_t *)next_tokens_gm,
-            static_cast<uint64_t>(this->batch_size));
+            static_cast<uint64_t>(batch_size));
         draftTokensGm.SetGlobalBuffer((__gm__ int32_t *)draft_tokens_gm,
-            static_cast<uint64_t>(this->batch_size) * this->k_val);
+            static_cast<uint64_t>(batch_size) * k_val);
         numValidGm.SetGlobalBuffer((__gm__ int32_t *)num_valid_gm,
-            static_cast<uint64_t>(this->batch_size));
+            static_cast<uint64_t>(batch_size));
 
-        uint32_t br = static_cast<uint32_t>(this->block_rows);
-        uint32_t br_align = ((br * ELEM_SIZE + 31) / 32) * 32 / ELEM_SIZE;
+        // buffer sizes
+        uint32_t mnta_u = static_cast<uint32_t>(max_new_tokens_align);
+        uint32_t ka_u = static_cast<uint32_t>(k_align);
+        uint32_t my_rows_align = ((my_rows + 7u) / 8u) * 8u;
 
-        if (!this->is_large_row) {
-            pipe.InitBuffer(tokenTileBuf, br * static_cast<uint32_t>(this->max_seq_len_align) * ELEM_SIZE);
-        } else {
-            uint32_t chunk_ub = SAFE_CHUNK + static_cast<uint32_t>(this->max_n_val);
-            uint32_t chunk_ub_align = ((chunk_ub + 7u) / 8u) * 8u;
-            pipe.InitBuffer(tokenTileBuf, chunk_ub_align * ELEM_SIZE);
-        }
+        // Compute buffer sizes: for short runtime nt≤SAFE_CHUNK need nt, but
+        // at Init time we only know max_seq_len. Safe: always allocate at
+        // most (SAFE_CHUNK + max_n) to bound UB usage.
+        uint32_t chunk_ub = SAFE_CHUNK + static_cast<uint32_t>(max_n_val);
+        uint32_t chunk_ub_align = ((chunk_ub + 7u) / 8u) * 8u;
+        uint32_t token_buf_size = chunk_ub_align * ELEM_SIZE;
 
-        uint32_t mask_bytes = ((SAFE_CHUNK + 7u) / 8u);
-        pipe.InitBuffer(maskBuf, mask_bytes);
+        // input queues (VECIN)
+        pipe.InitBuffer(tokenInQue, 2, token_buf_size);  // depth=2 double buffer
+        pipe.InitBuffer(sampledInQue, 1, my_rows * mnta_u * ELEM_SIZE);
+        pipe.InitBuffer(numTokensInQue, 1, my_rows_align * ELEM_SIZE);
+        pipe.InitBuffer(discardInQue, 1, my_rows_align * ELEM_SIZE);
+        pipe.InitBuffer(suffixInQue, 1, static_cast<uint32_t>(max_n_val) * ELEM_SIZE);
 
-        pipe.InitBuffer(sampledTileBuf, br * static_cast<uint32_t>(this->max_new_tokens_align) * ELEM_SIZE);
-        pipe.InitBuffer(numTokensBuf, br_align * ELEM_SIZE);
-        pipe.InitBuffer(discardTileBuf, br_align * ELEM_SIZE);
-        pipe.InitBuffer(nextTokenBuf, br_align * ELEM_SIZE);
-        pipe.InitBuffer(draftBuf, br * static_cast<uint32_t>(this->k_align) * ELEM_SIZE);
-        pipe.InitBuffer(numValidBuf, br_align * ELEM_SIZE);
-        pipe.InitBuffer(suffixBuf, static_cast<uint32_t>(this->max_n_val) * ELEM_SIZE);
+        // output queues (VECOUT)
+        pipe.InitBuffer(nextOutQue, 1, my_rows_align * ELEM_SIZE);
+        pipe.InitBuffer(draftOutQue, 1, my_rows * ka_u * ELEM_SIZE);
+        pipe.InitBuffer(numValidOutQue, 1, my_rows_align * ELEM_SIZE);
+
+        // VECCALC scratch buffers
+        pipe.InitBuffer(ngramCalcBuf, token_buf_size);
+        pipe.InitBuffer(ngramTempBuf, token_buf_size);
+        pipe.InitBuffer(ngramGatherBuf, token_buf_size);
+        // maskBuf: 2x to hold two independent mask results before Or
+        uint32_t mask_bytes = static_cast<uint32_t>(max_new_tokens_align) / 8;
+        pipe.InitBuffer(maskCalcBuf, 2 * mask_bytes);
+
+        // worst-case reduce: chunk size for long path, max_seq_len for short path
+        uint32_t reduce_count = SAFE_CHUNK;
+        uint32_t reduce_tmp_elems = CalcReduceMinTmpSize(reduce_count, ELEM_SIZE);
+        uint32_t reduce_tmp_bytes = ((reduce_tmp_elems * ELEM_SIZE + 31) / 32) * 32;
+        pipe.InitBuffer(ngramReduceBuf, reduce_tmp_bytes);
     }
 
     __aicore__ inline void Process()
     {
-        uint32_t remaining = this->my_rows;
-        uint32_t cur_offset = 0;
-        while (remaining > 0) {
-            uint32_t cur_rows = (remaining > static_cast<uint32_t>(this->block_rows))
-                                ? static_cast<uint32_t>(this->block_rows) : remaining;
-            if (this->is_large_row) {
-                ProcessChunkedRows(this->row_offset + cur_offset, cur_rows);
-            } else {
-                CopyIn(this->row_offset + cur_offset, cur_rows);
-                Compute(cur_rows);
-                CopyOut(this->row_offset + cur_offset, cur_rows);
+        CopyInMetadata();
+        auto sampledLocal = sampledInQue.DeQue<int32_t>();
+        auto numTokensLocal = numTokensInQue.DeQue<int32_t>();
+        auto discardLocal = discardInQue.DeQue<int32_t>();
+        auto nextLocal = nextOutQue.AllocTensor<int32_t>();
+        auto draftLocal = draftOutQue.AllocTensor<int32_t>();
+        auto numValidLocal = numValidOutQue.AllocTensor<int32_t>();
+
+        // Phase A: validate all rows, write sampled → tokenGm, collect nt[]
+        int32_t nt_vals[256];  // max rows per core is bounded by tiling
+        for (uint32_t r = 0; r < my_rows; ++r) {
+            nt_vals[r] = ValidateTokens(r, row_offset + r,
+                sampledLocal, numTokensLocal, discardLocal, nextLocal);
+        }
+
+        // Sync all Phase A MTE3 writes before Phase B reads from tokenGm
+        AscendC::TQueSync<PIPE_MTE3, PIPE_S> sync_a;
+        auto event = GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE3_S>();
+        sync_a.SetFlag(event);
+        sync_a.WaitFlag(event);
+        GetTPipePtr()->ReleaseEventID<AscendC::HardEvent::MTE3_S>(event);
+
+        // Phase B: interleaved ngram with double-buffer token load.
+        // Preload next row BEFORE computing current row: MTE2 overlaps V.
+        // Short rows → load full sequence; long rows → load first chunk only.
+        int32_t preloaded_row = -1;
+        for (uint32_t r = 0; r < my_rows; ++r) {
+            uint32_t global_row = row_offset + r;
+            int32_t nt = nt_vals[r];
+            bool is_short = (nt > 0 && nt <= static_cast<int32_t>(SAFE_CHUNK));
+
+            if (nt <= 0 || nt < min_n_val) {
+                uint32_t doff = r * static_cast<uint32_t>(k_align);
+                AscendC::Duplicate(draftLocal[doff], static_cast<int32_t>(-1),
+                                   static_cast<uint32_t>(k_align));
+                numValidLocal.SetValue(r, 0);
+                continue;
             }
-            cur_offset += cur_rows;
-            remaining -= cur_rows;
-        }
-    }
 
-private:
+            // Was this row preloaded by the previous iteration?
+            bool this_row_preloaded = (preloaded_row == static_cast<int32_t>(r));
 
-    __aicore__ inline void ProcessChunkedRows(uint32_t start_row, uint32_t rows)
-    {
-        uint32_t msl = static_cast<uint32_t>(this->max_seq_len);
-        uint32_t mnta = static_cast<uint32_t>(this->max_new_tokens_align);
-        uint32_t ka = static_cast<uint32_t>(this->k_align);
-
-        auto sampledLocal = sampledTileBuf.Get<int32_t>();
-        auto numTokensLocal = numTokensBuf.Get<int32_t>();
-        auto discardLocal = discardTileBuf.Get<int32_t>();
-        auto nextLocal = nextTokenBuf.Get<int32_t>();
-        auto draftLocal = draftBuf.Get<int32_t>();
-        auto numValidLocal = numValidBuf.Get<int32_t>();
-        auto suffixLocal = suffixBuf.Get<int32_t>();
-        auto tokenLocal = tokenTileBuf.Get<int32_t>();
-        auto maskLocal = maskBuf.Get<uint8_t>();
-
-        uint32_t metaBytes = rows * ELEM_SIZE;
-        AscendC::DataCopyExtParams metaParams{1, metaBytes, 0, metaBytes, 0};
-        AscendC::DataCopyPadExtParams<int32_t> noPadT{false, 0, 0, 0};
-        AscendC::DataCopyPad(numTokensLocal, numTokensGm[start_row], metaParams, noPadT);
-        AscendC::DataCopyPad(discardLocal, discardGm[start_row], metaParams, noPadT);
-
-        uint32_t srcRowBytes2 = static_cast<uint32_t>(this->max_new_tokens) * ELEM_SIZE;
-        uint32_t dstRowBytes2 = mnta * ELEM_SIZE;
-        AscendC::DataCopyExtParams sampledParams{1, srcRowBytes2, 0, dstRowBytes2, 0};
-        AscendC::DataCopyPadExtParams<int32_t> sampledPad{
-            false, 0, static_cast<uint8_t>(mnta - this->max_new_tokens), 0};
-        for (uint32_t r = 0; r < rows; ++r) {
-            AscendC::DataCopyPad(sampledLocal[static_cast<uint64_t>(r) * mnta],
-                sampledGm[static_cast<uint64_t>(start_row + r) * this->max_new_tokens],
-                sampledParams, sampledPad);
-        }
-
-        for (uint32_t i = 0; i < rows; ++i) {
-            uint64_t gmRow = static_cast<uint64_t>(start_row + i) * msl;
-            int32_t seq_len = numTokensLocal.GetValue(i);
-            int32_t discard = discardLocal.GetValue(i);
-            int32_t valid_count = 0;
-
-            int32_t backup_pos = (seq_len > 0) ? (seq_len - 1) : 0;
-
-            for (int32_t j = 0; j < this->max_new_tokens; ++j) {
-                int32_t val = sampledLocal.GetValue(i * mnta + j);
-                if (discard != 0) {
-                    sampledLocal.SetValue(i * mnta + j, -1);
-                } else if (val != -1 && val < this->vocab_size_val) {
-                    valid_count++;
+            // Only SHORT rows can preload the next row:
+            // - Short row needs 1 buffer for single-pass V compute
+            // - Other buffer is free for next row's MTE2 preload
+            // - Long row uses BOTH buffers for internal chunk double-buffering
+            preloaded_row = -1;
+            if (is_short && r + 1 < my_rows && nt_vals[r + 1] >= min_n_val) {
+                uint32_t next_gr = row_offset + r + 1;
+                int32_t next_nt = nt_vals[r + 1];
+                if (next_nt <= static_cast<int32_t>(SAFE_CHUNK)) {
+                    LaunchPreloadNextRow(next_gr, next_nt);
                 } else {
-                    sampledLocal.SetValue(i * mnta + j, -1);
+                    LaunchPreloadNextLongFirstChunk(next_gr, next_nt);
                 }
+                preloaded_row = static_cast<int32_t>(r + 1);
             }
 
-            int32_t avail_space = this->max_seq_len - seq_len;
-            if (avail_space < 0) avail_space = 0;
-            if (valid_count > avail_space) valid_count = avail_space;
-
-            LoadGmElements(gmRow + backup_pos, 1);
-            int32_t backup_token = tokenLocal.GetValue(0);
-
-            if (valid_count > 0) {
-                nextLocal.SetValue(i, sampledLocal.GetValue(i * mnta + valid_count - 1));
-            } else {
-                nextLocal.SetValue(i, backup_token);
-            }
-
-            int32_t nt = seq_len + valid_count;
-            if (valid_count > 0) {
-                for (int32_t j = 0; j < valid_count; ++j) {
-                    tokenLocal.SetValue(j, sampledLocal.GetValue(i * mnta + j));
-                }
-                StoreGmElements(gmRow + seq_len, valid_count);
-            }
-
+            AscendC::LocalTensor<int32_t> tokenLocal;
             int32_t best_match_pos = -1;
             int32_t best_ngram_len = 0;
 
-            if (valid_count > 0 && nt >= this->min_n_val) {
-                int32_t suffix_gm_start = nt - this->max_n_val;
-                if (suffix_gm_start < 0) suffix_gm_start = 0;
-                LoadGmElements(gmRow + suffix_gm_start, this->max_n_val);
-                for (int32_t s = 0; s < this->max_n_val; ++s) {
-                    suffixLocal.SetValue(static_cast<uint32_t>(s), tokenLocal.GetValue(static_cast<uint32_t>(s)));
-                }
+            // Stage 4: draft
+            uint32_t doff = r * static_cast<uint32_t>(k_align);
+            int32_t draft_load = 0;
+            AscendC::Duplicate(draftLocal[doff], static_cast<int32_t>(-1),
+                               static_cast<uint32_t>(k_align));
 
-                for (int32_t ngram_len = this->min_n_val; ngram_len <= this->max_n_val; ++ngram_len) {
-                    if (ngram_len > nt) break;
-                    int32_t wc = nt - ngram_len;
-                    if (wc <= 0) break;
-
-                    int32_t suffix_offset = this->max_n_val - ngram_len;
-                    int32_t suffix0 = suffixLocal.GetValue(static_cast<uint32_t>(suffix_offset));
-
-                    for (int32_t chunk_start = 0; chunk_start < wc; chunk_start += SAFE_CHUNK) {
-                        int32_t chunk_count = (chunk_start + SAFE_CHUNK <= wc) ? SAFE_CHUNK : (wc - chunk_start);
-                        int32_t load_count = chunk_count + (ngram_len - 1);
-                        if (chunk_start + load_count > nt) load_count = nt - chunk_start;
-                        LoadGmElements(gmRow + chunk_start, load_count);
-
-                        uint32_t cmp_count = ((static_cast<uint32_t>(chunk_count) + 63u) / 64u) * 64u;
-                        uint32_t max_cmp = SAFE_CHUNK > 8192u ? 8192u : SAFE_CHUNK;
-                        if (cmp_count > max_cmp) cmp_count = max_cmp;
-                        if (cmp_count > static_cast<uint32_t>(load_count)) {
-                            cmp_count = ((static_cast<uint32_t>(load_count) + 63u) / 64u) * 64u;
-                        }
-
-                        for (uint32_t cmp_off = 0; cmp_off < static_cast<uint32_t>(chunk_count); cmp_off += cmp_count) {
-                            uint32_t rem = static_cast<uint32_t>(chunk_count) - cmp_off;
-                            uint32_t elements = (rem >= cmp_count) ? cmp_count : rem;
-                            uint32_t aligned = ((elements + 63u) / 64u) * 64u;
-
-                            AscendC::CompareScalar<int32_t, uint8_t>(
-                                maskLocal, tokenLocal[cmp_off],
-                                suffix0, AscendC::CMPMODE::EQ, aligned);
-
-                            for (uint32_t p = 0; p < elements; ++p) {
-                                uint8_t bv = maskLocal.GetValue(p >> 3);
-                                if (bv & (1u << (p & 7u))) {
-                                    bool all_match = true;
-                                    for (int32_t s = 1; s < ngram_len; ++s) {
-                                        int32_t sv = suffixLocal.GetValue(static_cast<uint32_t>(suffix_offset + s));
-                                        if (cmp_off + p + s < static_cast<uint32_t>(load_count)) {
-                                            int32_t tv = tokenLocal.GetValue(cmp_off + p + static_cast<uint32_t>(s));
-                                            if (tv != sv) { all_match = false; break; }
-                                        } else {
-                                            all_match = false; break;
-                                        }
-                                    }
-                                    if (all_match) {
-                                        best_match_pos = chunk_start + static_cast<int32_t>(cmp_off + p);
-                                        best_ngram_len = ngram_len;
-                                        break;
-                                    }
-                                }
-                            }
-                            if (best_match_pos >= 0) break;
-                        }
-                        if (best_match_pos >= 0) break;
-                    }
-                    if (best_match_pos >= 0) break;
-                }
-            }
-
-            if (best_match_pos >= 0) {
-                int32_t draft_start = best_match_pos + best_ngram_len;
-                int32_t tokens_available = nt - draft_start;
-                int32_t draft_load = (tokens_available < this->k_val) ? tokens_available : this->k_val;
-                if (draft_load > 0) {
-                    LoadGmElements(gmRow + draft_start, draft_load);
-                    for (int32_t j = 0; j < this->k_val; ++j) {
-                        if (j < draft_load) {
-                            draftLocal.SetValue(i * ka + j, tokenLocal.GetValue(static_cast<uint32_t>(j)));
-                        } else {
-                            draftLocal.SetValue(i * ka + j, -1);
-                        }
-                    }
+            if (is_short) {
+                // ---- Short row: copy draft from tokenLocal (already in UB) ----
+                if (this_row_preloaded) {
+                    tokenLocal = tokenInQue.DeQue<int32_t>();
                 } else {
-                    for (int32_t j = 0; j < this->k_val; ++j) {
-                        draftLocal.SetValue(i * ka + j, -1);
+                    tokenLocal = LoadOneRowToken(global_row, nt);
+                }
+                NgramMatchRowShort(nt, tokenLocal,
+                                   best_match_pos, best_ngram_len);
+                if (best_match_pos >= 0) {
+                    int32_t draft_start = best_match_pos + best_ngram_len;
+                    int32_t avail = nt - draft_start;
+                    draft_load = (avail < k_val) ? avail : k_val;
+                    // Scalar copy from tokenLocal (k_val ≤ 5, no alignment concern)
+                    for (int32_t j = 0; j < draft_load; ++j) {
+                        draftLocal.SetValue(doff + static_cast<uint32_t>(j),
+                            tokenLocal.GetValue(static_cast<uint32_t>(draft_start + j)));
                     }
                 }
+                tokenInQue.FreeTensor(tokenLocal);
+
             } else {
-                for (int32_t j = 0; j < this->k_val; ++j) {
-                    draftLocal.SetValue(i * ka + j, -1);
+                // ---- Long row ----
+                int32_t next_gr = (r + 1 < my_rows) ? static_cast<int32_t>(row_offset + r + 1) : -1;
+                int32_t next_nt = (r + 1 < my_rows) ? nt_vals[r + 1] : 0;
+                int32_t preloaded_out = -1;
+                NgramMatchRowLong(global_row, nt, this_row_preloaded,
+                                  next_gr, next_nt, preloaded_out,
+                                  best_match_pos, best_ngram_len);
+                if (preloaded_out >= 0) {
+                    preloaded_row = static_cast<int32_t>(r + 1);
+                }
+                if (best_match_pos >= 0) {
+                    int32_t avail = nt - (best_match_pos + best_ngram_len);
+                    draft_load = (avail < k_val) ? avail : k_val;
+                    if (draft_load > 0) {
+                        uint64_t gmRow = static_cast<uint64_t>(global_row) *
+                                         static_cast<uint32_t>(max_seq_len);
+                        COPY_GM_TO_UB(draftLocal[doff], tokenGm,
+                                      gmRow + best_match_pos + best_ngram_len,
+                                      draft_load, int32_t);
+                    }
                 }
             }
+            numValidLocal.SetValue(r, draft_load > 0 ? draft_load : 0);
+        }
 
-            int32_t valid_draft_count = 0;
-            for (int32_t j = 0; j < this->k_val; ++j) {
-                if (draftLocal.GetValue(i * ka + j) != -1) {
-                    valid_draft_count++;
-                } else {
+        // Cleanup any unused preloaded token
+        if (preloaded_row >= 0) {
+            auto unusedToken = tokenInQue.DeQue<int32_t>();
+            tokenInQue.FreeTensor(unusedToken);
+        }
+
+        sampledInQue.FreeTensor(sampledLocal);
+        numTokensInQue.FreeTensor(numTokensLocal);
+        discardInQue.FreeTensor(discardLocal);
+        nextOutQue.EnQue(nextLocal);
+        draftOutQue.EnQue(draftLocal);
+        numValidOutQue.EnQue(numValidLocal);
+        CopyOutMetadata();
+    }
+
+private:
+    // ---------------------------------------------------------------
+    // GM -> UB (MTE2)
+    // ---------------------------------------------------------------
+    __aicore__ inline void CopyInMetadata()
+    {
+        uint32_t mnta_u = static_cast<uint32_t>(max_new_tokens_align);
+
+        // sampled: all rows, one DataCopyPad per row via repeat
+        auto sampledTensor = sampledInQue.AllocTensor<int32_t>();
+        uint32_t srcRowBytes = static_cast<uint32_t>(max_new_tokens) * ELEM_SIZE;
+        AscendC::DataCopyExtParams sampledParams{
+            static_cast<uint16_t>(my_rows), srcRowBytes, 0, 0, 0};
+        AscendC::DataCopyPadExtParams<int32_t> padParams{
+            true, 0, static_cast<uint8_t>(mnta_u - max_new_tokens), 0};
+        AscendC::DataCopyPad(
+            sampledTensor,
+            sampledGm[static_cast<uint64_t>(row_offset) * max_new_tokens],
+            sampledParams, padParams);
+        sampledInQue.EnQue(sampledTensor);
+
+        // numTokens
+        auto numTokensTensor = numTokensInQue.AllocTensor<int32_t>();
+        uint32_t metaBytes = static_cast<uint32_t>(my_rows) * ELEM_SIZE;
+        AscendC::DataCopyExtParams metaParams{1, metaBytes, 0, metaBytes, 0};
+        AscendC::DataCopyPadExtParams<int32_t> noPadT{false, 0, 0, 0};
+        AscendC::DataCopyPad(numTokensTensor, numTokensGm[row_offset], metaParams, noPadT);
+        numTokensInQue.EnQue(numTokensTensor);
+
+        // discard
+        auto discardTensor = discardInQue.AllocTensor<int32_t>();
+        AscendC::DataCopyPad(discardTensor, discardGm[row_offset], metaParams, noPadT);
+        discardInQue.EnQue(discardTensor);
+    }
+
+    // ---------------------------------------------------------------
+    // UB -> GM (MTE3)
+    // ---------------------------------------------------------------
+    __aicore__ inline void CopyOutMetadata()
+    {
+        auto nextLocal = nextOutQue.DeQue<int32_t>();
+        auto draftLocal = draftOutQue.DeQue<int32_t>();
+        auto numValidLocal = numValidOutQue.DeQue<int32_t>();
+
+        uint16_t metaBytes16 = static_cast<uint16_t>(my_rows) * ELEM_SIZE;
+        AscendC::DataCopyParams nextParams{1, metaBytes16, 0, 0};
+        AscendC::DataCopyPad(nextTokensGm[row_offset], nextLocal, nextParams);
+        AscendC::DataCopyPad(numValidGm[row_offset], numValidLocal, nextParams);
+
+        // draft: per-row copies handling UB padding (k_align) -> GM compact (k_val)
+        uint32_t ka_u = static_cast<uint32_t>(k_align);
+        for (uint32_t r = 0; r < my_rows; ++r) {
+            uint32_t kBytes = static_cast<uint32_t>(k_val) * ELEM_SIZE;
+            AscendC::DataCopyExtParams rowParams{1, kBytes, 0, 0, 0};
+            AscendC::DataCopyPad(
+                draftTokensGm[static_cast<uint64_t>(row_offset + r) * k_val],
+                draftLocal[r * ka_u], rowParams);
+        }
+
+        nextOutQue.FreeTensor(nextLocal);
+        draftOutQue.FreeTensor(draftLocal);
+        numValidOutQue.FreeTensor(numValidLocal);
+    }
+
+    // ---------------------------------------------------------------
+    // Phase A: validate sampled + compute nextToken + write to tokenGm
+    // Returns nt = seq_len + valid_count
+    // ---------------------------------------------------------------
+    __aicore__ inline int32_t ValidateTokens(
+        uint32_t local_idx, uint32_t global_row,
+        AscendC::LocalTensor<int32_t>& sampledLocal,
+        AscendC::LocalTensor<int32_t>& numTokensLocal,
+        AscendC::LocalTensor<int32_t>& discardLocal,
+        AscendC::LocalTensor<int32_t>& nextLocal)
+    {
+        uint32_t msl = static_cast<uint32_t>(max_seq_len);
+        uint32_t mnta_u = static_cast<uint32_t>(max_new_tokens_align);
+        uint64_t gmRow = static_cast<uint64_t>(global_row) * msl;
+        uint32_t soff = local_idx * mnta_u;
+        int32_t seq_len = numTokensLocal.GetValue(local_idx);
+        int32_t discard = discardLocal.GetValue(local_idx);
+        int32_t valid_count = 0;
+
+        // Stage 1: validate sampled tokens
+        if (discard != 0) {
+            AscendC::Duplicate(sampledLocal[soff], static_cast<int32_t>(-1),
+                               static_cast<uint32_t>(max_new_tokens_align));
+        } else {
+            uint32_t align_n = static_cast<uint32_t>(max_new_tokens_align);
+            uint32_t mbytes = align_n / 8;
+            auto mask1 = maskCalcBuf.Get<uint8_t>(0);
+            auto mask2 = maskCalcBuf.Get<uint8_t>(mbytes);
+
+            AscendC::CompareScalar<int32_t, uint8_t>(
+                mask1, sampledLocal[soff], static_cast<int32_t>(0),
+                AscendC::CMPMODE::LT, align_n);
+            AscendC::CompareScalar<int32_t, uint8_t>(
+                mask2, sampledLocal[soff], static_cast<int32_t>(vocab_size_val),
+                AscendC::CMPMODE::GE, align_n);
+            AscendC::Or<uint8_t>(mask1, mask1, mask2, mbytes);
+
+            int32_t first_invalid = -1;
+            for (uint32_t mb = 0; mb < mbytes; ++mb) {
+                uint8_t byte = mask1.GetValue(mb);
+                if (byte) {
+                    first_invalid = static_cast<int32_t>(mb * 8 + __builtin_ctz(byte));
                     break;
                 }
             }
-            numValidLocal.SetValue(i, valid_draft_count);
-        }
-
-        uint32_t metaBytes32 = static_cast<uint32_t>(rows) * ELEM_SIZE;
-        AscendC::DataCopyExtParams nextParams{1, metaBytes32, 0, 0, 0};
-        AscendC::DataCopyPad(nextTokensGm[start_row], nextLocal, nextParams);
-
-        uint32_t kBytes = static_cast<uint32_t>(this->k_val) * ELEM_SIZE;
-        for (uint32_t r = 0; r < rows; ++r) {
-            AscendC::DataCopyExtParams draftRowParams{1, kBytes, 0, 0, 0};
-            AscendC::DataCopyPad(
-                draftTokensGm[static_cast<uint64_t>(start_row + r) * this->k_val],
-                draftLocal[static_cast<uint64_t>(r) * this->k_align], draftRowParams);
-        }
-
-        AscendC::DataCopyPad(numValidGm[start_row], numValidLocal, nextParams);
-    }
-
-    __aicore__ inline void LoadGmElements(uint64_t gm_offset, int32_t count)
-    {
-        if (count <= 0) return;
-        auto tokenLocal = tokenTileBuf.Get<int32_t>();
-        uint32_t c = static_cast<uint32_t>(count);
-        uint32_t aligned = ((c + 7u) / 8u) * 8u;
-        uint8_t pad = static_cast<uint8_t>(aligned - c);
-        AscendC::DataCopyExtParams p{1, c * ELEM_SIZE, 0, aligned * ELEM_SIZE, 0};
-        AscendC::DataCopyPadExtParams<int32_t> pp{false, 0, pad, 0};
-        AscendC::DataCopyPad(tokenLocal[0], tokenGm[gm_offset], p, pp);
-    }
-
-    __aicore__ inline void StoreGmElements(uint64_t gm_offset, int32_t count)
-    {
-        if (count <= 0) return;
-        auto tokenLocal = tokenTileBuf.Get<int32_t>();
-        constexpr uint32_t STORE_MAX = 16383u;
-        uint32_t c = static_cast<uint32_t>(count);
-        for (uint32_t off = 0; off < c; off += STORE_MAX) {
-            uint32_t chunk = (off + STORE_MAX <= c) ? STORE_MAX : (c - off);
-            AscendC::DataCopyExtParams p{1, chunk * ELEM_SIZE, 0, 0, 0};
-            AscendC::DataCopyPad(tokenGm[gm_offset + off], tokenLocal[off], p);
-        }
-    }
-
-
-    __aicore__ inline void CopyIn(uint32_t start_row, uint32_t rows)
-    {
-        uint32_t msa = static_cast<uint32_t>(this->max_seq_len_align);
-        uint32_t mnta = static_cast<uint32_t>(this->max_new_tokens_align);
-        constexpr uint32_t MAX_CHUNK_ELEMS = 8192u;
-
-        auto tokenLocal = tokenTileBuf.Get<int32_t>();
-        uint32_t msl = static_cast<uint32_t>(this->max_seq_len);
-        for (uint32_t r = 0; r < rows; ++r) {
-            uint64_t gmRow = static_cast<uint64_t>(start_row + r) * msl;
-            uint32_t ubRow = r * msa;
-            for (uint32_t off = 0; off < msl; off += MAX_CHUNK_ELEMS) {
-                uint32_t chunk = (off + MAX_CHUNK_ELEMS <= msl) ? MAX_CHUNK_ELEMS : (msl - off);
-                uint32_t isLast = (off + chunk >= msl) ? 1u : 0u;
-                uint32_t dstChunk = isLast ? (msa - off) : MAX_CHUNK_ELEMS;
-                uint8_t pad = static_cast<uint8_t>(dstChunk - chunk);
-                AscendC::DataCopyExtParams p{1, chunk * ELEM_SIZE, 0, dstChunk * ELEM_SIZE, 0};
-                AscendC::DataCopyPadExtParams<int32_t> pp{false, 0, pad, 0};
-                AscendC::DataCopyPad(tokenLocal[ubRow + off], tokenGm[gmRow + off], p, pp);
-            }
-        }
-
-        auto sampledLocal = sampledTileBuf.Get<int32_t>();
-        uint32_t srcRowBytes2 = static_cast<uint32_t>(this->max_new_tokens) * ELEM_SIZE;
-        uint32_t dstRowBytes2 = mnta * ELEM_SIZE;
-        AscendC::DataCopyExtParams sampledParams{1, srcRowBytes2, 0, dstRowBytes2, 0};
-        AscendC::DataCopyPadExtParams<int32_t> sampledPad{
-            false, 0, static_cast<uint8_t>(mnta - this->max_new_tokens), 0};
-        for (uint32_t r = 0; r < rows; ++r) {
-            AscendC::DataCopyPad(sampledLocal[static_cast<uint64_t>(r) * mnta],
-                sampledGm[static_cast<uint64_t>(start_row + r) * this->max_new_tokens],
-                sampledParams, sampledPad);
-        }
-
-        auto numTokensLocal = numTokensBuf.Get<int32_t>();
-        uint32_t metaBytes = static_cast<uint32_t>(rows) * ELEM_SIZE;
-        AscendC::DataCopyExtParams metaParams{1, metaBytes, 0, metaBytes, 0};
-        AscendC::DataCopyPadExtParams<int32_t> noPadT{false, 0, 0, 0};
-        AscendC::DataCopyPad(numTokensLocal, numTokensGm[start_row], metaParams, noPadT);
-
-        auto discardLocal = discardTileBuf.Get<int32_t>();
-        AscendC::DataCopyPad(discardLocal, discardGm[start_row], metaParams, noPadT);
-    }
-
-    __aicore__ inline void Compute(uint32_t rows)
-    {
-        auto tokenLocal = tokenTileBuf.Get<int32_t>();
-        auto sampledLocal = sampledTileBuf.Get<int32_t>();
-        auto numTokensLocal = numTokensBuf.Get<int32_t>();
-        auto discardLocal = discardTileBuf.Get<int32_t>();
-        auto nextLocal = nextTokenBuf.Get<int32_t>();
-        auto draftLocal = draftBuf.Get<int32_t>();
-        auto numValidLocal = numValidBuf.Get<int32_t>();
-        auto suffixLocal = suffixBuf.Get<int32_t>();
-        auto maskLocal = maskBuf.Get<uint8_t>();
-
-        for (uint32_t i = 0; i < rows; ++i) {
-            ComputeOneRow(i, tokenLocal, sampledLocal, numTokensLocal,
-                          discardLocal, nextLocal, draftLocal, numValidLocal,
-                          suffixLocal, maskLocal);
-        }
-    }
-
-    __aicore__ inline void ComputeOneRow(
-        uint32_t idx,
-        AscendC::LocalTensor<int32_t> &tokenLocal,
-        AscendC::LocalTensor<int32_t> &sampledLocal,
-        AscendC::LocalTensor<int32_t> &numTokensLocal,
-        AscendC::LocalTensor<int32_t> &discardLocal,
-        AscendC::LocalTensor<int32_t> &nextLocal,
-        AscendC::LocalTensor<int32_t> &draftLocal,
-        AscendC::LocalTensor<int32_t> &numValidLocal,
-        AscendC::LocalTensor<int32_t> &suffixLocal,
-        AscendC::LocalTensor<uint8_t> &maskLocal)
-    {
-        uint32_t msa = this->max_seq_len_align;
-        uint32_t mnta = this->max_new_tokens_align;
-        uint32_t ka = this->k_align;
-
-        int32_t seq_len = numTokensLocal.GetValue(idx);
-        int32_t discard = discardLocal.GetValue(idx);
-        int32_t valid_count = 0;
-
-        int32_t backup_pos = (seq_len > 0) ? (seq_len - 1) : 0;
-        int32_t backup_token = tokenLocal.GetValue(idx * msa + backup_pos);
-
-        for (int32_t j = 0; j < this->max_new_tokens; ++j) {
-            int32_t val = sampledLocal.GetValue(idx * mnta + j);
-            if (discard != 0) {
-                sampledLocal.SetValue(idx * mnta + j, -1);
-            } else if (val != -1 && val < this->vocab_size_val) {
-                valid_count++;
+            if (first_invalid >= 0) {
+                valid_count = first_invalid;
             } else {
-                sampledLocal.SetValue(idx * mnta + j, -1);
+                valid_count = static_cast<int32_t>(align_n);
             }
         }
 
-        int32_t avail_space = this->max_seq_len - seq_len;
+        int32_t avail_space = max_seq_len - seq_len;
         if (avail_space < 0) avail_space = 0;
         if (valid_count > avail_space) valid_count = avail_space;
+        int32_t nt = seq_len + valid_count;
 
+        // Stage 1.5: nextToken
         if (valid_count > 0) {
-            nextLocal.SetValue(idx, sampledLocal.GetValue(idx * mnta + valid_count - 1));
+            nextLocal.SetValue(local_idx,
+                sampledLocal.GetValue(soff + static_cast<uint32_t>(valid_count - 1)));
         } else {
-            nextLocal.SetValue(idx, backup_token);
+            int32_t bp = (nt > 0) ? (nt - 1) : 0;
+            nextLocal.SetValue(local_idx, tokenGm.GetValue(gmRow + bp));
         }
 
-        int32_t num_tokens_tmp = seq_len + valid_count;
-        for (int32_t j = 0; j < valid_count; ++j) {
-            tokenLocal.SetValue(idx * msa + seq_len + j, sampledLocal.GetValue(idx * mnta + j));
+        // Stage 2: write valid sampled tokens → tokenGm
+        if (valid_count > 0) {
+            COPY_UB_TO_GM(tokenGm, static_cast<uint64_t>(gmRow) + seq_len,
+                          sampledLocal, soff, valid_count, int32_t);
         }
-
-        int32_t best_match_pos = -1;
-        int32_t best_ngram_len = 0;
-
-        if (valid_count > 0 && num_tokens_tmp >= this->min_n_val) {
-            if (this->block_rows <= 1) {
-                int32_t nt = num_tokens_tmp;
-                constexpr uint32_t CMP_MAX = 8192u;
-
-                for (int32_t ngram_len = this->min_n_val; ngram_len <= this->max_n_val; ++ngram_len) {
-                    if (ngram_len > nt) break;
-                    int32_t wc = nt - ngram_len;
-                    if (wc <= 0) break;
-
-                    int32_t suffix0 = tokenLocal.GetValue(static_cast<uint32_t>(nt - ngram_len));
-                    uint32_t msa_cmp = static_cast<uint32_t>(msa);
-
-                    for (int32_t cmp_off = 0; cmp_off < wc; cmp_off += CMP_MAX) {
-                        uint32_t remaining = static_cast<uint32_t>(wc - cmp_off);
-                        uint32_t elements = (remaining >= CMP_MAX) ? CMP_MAX : remaining;
-                        uint32_t count_aligned = ((elements + 63u) / 64u) * 64u;
-                        uint32_t buf_avail = msa_cmp - static_cast<uint32_t>(cmp_off);
-                        if (count_aligned > buf_avail) {
-                            count_aligned = (buf_avail / 64u) * 64u;
-                        }
-
-                        if (count_aligned == 0) {
-                            for (int32_t p = 0; p < static_cast<int32_t>(elements); ++p) {
-                                if (tokenLocal.GetValue(static_cast<uint32_t>(cmp_off + p)) == suffix0) {
-                                    bool all_match = true;
-                                    for (int32_t s = 1; s < ngram_len; ++s) {
-                                        int32_t sv = tokenLocal.GetValue(static_cast<uint32_t>(nt - ngram_len + s));
-                                        int32_t tv = tokenLocal.GetValue(static_cast<uint32_t>(cmp_off + p + s));
-                                        if (tv != sv) { all_match = false; break; }
-                                    }
-                                    if (all_match) {
-                                        best_match_pos = cmp_off + p;
-                                        best_ngram_len = ngram_len;
-                                        break;
-                                    }
-                                }
-                            }
-                        } else {
-                            AscendC::CompareScalar<int32_t, uint8_t>(
-                                maskLocal, tokenLocal[static_cast<uint32_t>(cmp_off)],
-                                suffix0, AscendC::CMPMODE::EQ, count_aligned);
-
-                            for (int32_t p = 0; p < static_cast<int32_t>(elements); ++p) {
-                                uint8_t byte_val = maskLocal.GetValue(static_cast<uint32_t>(p) >> 3);
-                                if (byte_val & (1u << (static_cast<uint32_t>(p) & 7u))) {
-                                    bool all_match = true;
-                                    for (int32_t s = 1; s < ngram_len; ++s) {
-                                        int32_t sv = tokenLocal.GetValue(static_cast<uint32_t>(nt - ngram_len + s));
-                                        int32_t tv = tokenLocal.GetValue(static_cast<uint32_t>(cmp_off + p + s));
-                                        if (tv != sv) { all_match = false; break; }
-                                    }
-                                    if (all_match) {
-                                        best_match_pos = cmp_off + p;
-                                        best_ngram_len = ngram_len;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        if (best_match_pos >= 0) break;
-                    }
-                }
-            } else {
-                int32_t row_base = static_cast<int32_t>(idx) * static_cast<int32_t>(msa);
-
-                for (int32_t ngram_len = this->min_n_val; ngram_len <= this->max_n_val; ++ngram_len) {
-                    if (ngram_len > num_tokens_tmp) break;
-
-                    for (int32_t s = 0; s < ngram_len; ++s) {
-                        suffixLocal.SetValue(static_cast<uint32_t>(s),
-                            tokenLocal.GetValue(static_cast<uint32_t>(
-                                row_base + num_tokens_tmp - ngram_len + s)));
-                    }
-
-                    int32_t max_pos = num_tokens_tmp - ngram_len - 1;
-                    for (int32_t pos = 0; pos <= max_pos; ++pos) {
-                        bool match = true;
-                        for (int32_t s = 0; s < ngram_len; ++s) {
-                            if (tokenLocal.GetValue(static_cast<uint32_t>(row_base + pos + s))
-                                != suffixLocal.GetValue(static_cast<uint32_t>(s))) {
-                                match = false;
-                                break;
-                            }
-                        }
-                        if (match) {
-                            best_match_pos = pos;
-                            best_ngram_len = ngram_len;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        if (best_match_pos >= 0) {
-            int32_t draft_start = best_match_pos + best_ngram_len;
-            int32_t tokens_available = num_tokens_tmp - draft_start;
-            for (int32_t j = 0; j < this->k_val; ++j) {
-                if (j < tokens_available) {
-                    draftLocal.SetValue(idx * ka + j, tokenLocal.GetValue(idx * msa + draft_start + j));
-                } else {
-                    draftLocal.SetValue(idx * ka + j, -1);
-                }
-            }
-        } else {
-            for (int32_t j = 0; j < this->k_val; ++j) {
-                draftLocal.SetValue(idx * ka + j, -1);
-            }
-        }
-
-        int32_t valid_draft_count = 0;
-        for (int32_t j = 0; j < this->k_val; ++j) {
-            if (draftLocal.GetValue(idx * ka + j) != -1) {
-                valid_draft_count++;
-            } else {
-                break;
-            }
-        }
-        numValidLocal.SetValue(idx, valid_draft_count);
+        return nt;
     }
 
-    __aicore__ inline void CopyOut(uint32_t start_row, uint32_t rows)
+    // ---------------------------------------------------------------
+    // Load entire sequence token for one row (Alloc→COPY→EnQue→DeQue)
+    // ---------------------------------------------------------------
+    __aicore__ inline AscendC::LocalTensor<int32_t> LoadOneRowToken(
+        uint32_t global_row, int32_t nt)
     {
-        uint32_t msa = static_cast<uint32_t>(this->max_seq_len_align);
-        uint32_t msl = static_cast<uint32_t>(this->max_seq_len);
-        constexpr uint32_t OUT_CHUNK_ELEMS = 8192u;
+        auto t = tokenInQue.AllocTensor<int32_t>();
+        uint64_t gmRow = static_cast<uint64_t>(global_row) *
+                         static_cast<uint32_t>(max_seq_len);
+        COPY_GM_TO_UB(t, tokenGm, gmRow, nt, int32_t);
+        tokenInQue.EnQue(t);
+        return tokenInQue.DeQue<int32_t>();
+    }
 
-        auto tokenLocal = tokenTileBuf.Get<int32_t>();
-        for (uint32_t r = 0; r < rows; ++r) {
-            uint64_t gmRow = static_cast<uint64_t>(start_row + r) * msl;
-            uint32_t ubRow = r * msa;
-            for (uint32_t off = 0; off < msl; off += OUT_CHUNK_ELEMS) {
-                uint32_t chunk = (off + OUT_CHUNK_ELEMS <= msl) ? OUT_CHUNK_ELEMS : (msl - off);
-                AscendC::DataCopyExtParams p{1, chunk * ELEM_SIZE, 0, 0, 0};
-                AscendC::DataCopyPad(tokenGm[gmRow + off], tokenLocal[ubRow + off], p);
+    // ---------------------------------------------------------------
+    // Launch MTE2 preload for next short row (Alloc→COPY→EnQue, no DeQue)
+    // ---------------------------------------------------------------
+    __aicore__ inline void LaunchPreloadNextRow(uint32_t global_row, int32_t nt)
+    {
+        auto t = tokenInQue.AllocTensor<int32_t>();
+        uint64_t gmRow = static_cast<uint64_t>(global_row) *
+                         static_cast<uint32_t>(max_seq_len);
+        COPY_GM_TO_UB(t, tokenGm, gmRow, nt, int32_t);
+        tokenInQue.EnQue(t);
+    }
+
+    // Preload next long row's FIRST chunk only (≤ SAFE_CHUNK + max_n_val)
+    __aicore__ inline void LaunchPreloadNextLongFirstChunk(uint32_t global_row, int32_t nt)
+    {
+        int32_t load_cnt = SAFE_CHUNK + max_n_val;
+        if (load_cnt > nt) load_cnt = nt;
+        auto t = tokenInQue.AllocTensor<int32_t>();
+        uint64_t gmRow = static_cast<uint64_t>(global_row) *
+                         static_cast<uint32_t>(max_seq_len);
+        COPY_GM_TO_UB(t, tokenGm, gmRow, load_cnt, int32_t);
+        tokenInQue.EnQue(t);
+    }
+
+    // ---------------------------------------------------------------
+    // Stage 3: ngram matching with double-buffered chunk load (long path)
+    // ---------------------------------------------------------------
+    // ---------------------------------------------------------------
+    // Stage 3 short path: single-pass ngram on preloaded token
+    // ---------------------------------------------------------------
+    __aicore__ inline void NgramMatchRowShort(
+        int32_t nt,
+        AscendC::LocalTensor<int32_t>& tokenLocal,
+        int32_t& best_match_pos, int32_t& best_ngram_len)
+    {
+        best_match_pos = -1;
+        best_ngram_len = 0;
+
+        // suffix = tokenLocal[nt - max_n .. nt - 1], accessed as tokenLocal[nt - n]
+        auto ngramResult = ngramCalcBuf.Get<int32_t>();
+        auto ngramTemp   = ngramTempBuf.Get<int32_t>();
+        auto ngramTempF  = ngramTempBuf.Get<float>();
+        auto ngramGather = ngramGatherBuf.Get<int32_t>();
+        auto ngramReduce = ngramReduceBuf.Get<float>();
+
+        if (max_n_val > 1) {
+            AscendC::Arange<int32_t>(ngramGather,
+                static_cast<int32_t>(sizeof(int32_t)),
+                static_cast<int32_t>(sizeof(int32_t)), nt);
+        }
+        for (int32_t n = 1; n <= max_n_val; ++n) {
+            int32_t valid_len = nt - n;
+            if (valid_len <= 0) break;
+            if (n > 1) {
+                AscendC::Gather<int32_t>(ngramTemp, ngramResult,
+                    ngramGather.ReinterpretCast<uint32_t>(), 0, valid_len);
             }
+            AscendC::Adds<int32_t>(ngramResult, tokenLocal,
+                -tokenLocal.GetValue(static_cast<uint32_t>(nt - n)),
+                valid_len);
+            if (n > 1) {
+                AscendC::Or<uint16_t>(ngramResult.ReinterpretCast<uint16_t>(),
+                    ngramResult.ReinterpretCast<uint16_t>(),
+                    ngramTemp.ReinterpretCast<uint16_t>(),
+                    static_cast<uint32_t>(valid_len * 2));
+            }
+            if (n < min_n_val) continue;
+            AscendC::Cast<float, int32_t>(ngramTempF, ngramResult,
+                AscendC::RoundMode::CAST_CEIL, nt - n);
+            AscendC::Abs<float>(ngramTempF, ngramTempF, nt - n);
+            AscendC::ReduceMin<float>(ngramReduce, ngramTempF, ngramReduce,
+                static_cast<uint32_t>(nt - n), true);
+            float min_val_f = ngramReduce.GetValue(0);
+            if (min_val_f == 0.0f) {
+                float min_idx_f = ngramReduce.GetValue(1);
+                best_match_pos = static_cast<int32_t>(
+                    *reinterpret_cast<uint32_t*>(&min_idx_f));
+                best_ngram_len = n;
+                if (n == max_n_val) break;
+            } else { break; }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Stage 3 long path: double-buffered chunk loop, frees all internally
+    // ---------------------------------------------------------------
+    __aicore__ inline void NgramMatchRowLong(
+        uint32_t global_row, int32_t nt, bool first_chunk_preloaded,
+        int32_t next_global_row, int32_t next_nt,
+        int32_t& preloaded_row_out,
+        int32_t& best_match_pos, int32_t& best_ngram_len)
+    {
+        best_match_pos = -1;
+        best_ngram_len = 0;
+
+        int32_t suffix_gm_start = nt - max_n_val;
+        if (suffix_gm_start < 0) suffix_gm_start = 0;
+        int32_t suffix_load = max_n_val;
+        if (suffix_gm_start + suffix_load > nt)
+            suffix_load = nt - suffix_gm_start;
+
+        uint64_t gmRow = static_cast<uint64_t>(global_row) *
+                         static_cast<uint32_t>(max_seq_len);
+
+        auto suffixTensor = suffixInQue.AllocTensor<int32_t>();
+        COPY_GM_TO_UB(suffixTensor, tokenGm, gmRow + suffix_gm_start,
+                      suffix_load, int32_t);
+        suffixInQue.EnQue(suffixTensor);
+        auto suffixLocal = suffixInQue.DeQue<int32_t>();
+
+        auto ngramResult = ngramCalcBuf.Get<int32_t>();
+        auto ngramTemp   = ngramTempBuf.Get<int32_t>();
+        auto ngramTempF  = ngramTempBuf.Get<float>();
+        auto ngramGather = ngramGatherBuf.Get<int32_t>();
+        auto ngramReduce = ngramReduceBuf.Get<float>();
+
+        uint32_t max_gather = SAFE_CHUNK + static_cast<uint32_t>(max_n_val);
+        if (max_n_val > 1) {
+            AscendC::Arange<int32_t>(ngramGather,
+                static_cast<int32_t>(sizeof(int32_t)),
+                static_cast<int32_t>(sizeof(int32_t)),
+                static_cast<int32_t>(max_gather));
         }
 
-        auto nextLocal = nextTokenBuf.Get<int32_t>();
-        uint32_t metaBytes32 = static_cast<uint32_t>(rows) * ELEM_SIZE;
-        AscendC::DataCopyExtParams nextParams{1, metaBytes32, 0, 0, 0};
-        AscendC::DataCopyPad(nextTokensGm[start_row], nextLocal, nextParams);
+        preloaded_row_out = -1;
+        bool has_next_row = (next_nt >= min_n_val);
+        bool next_is_short = (next_nt > 0 && next_nt <= static_cast<int32_t>(SAFE_CHUNK));
+        bool found_global_max = false;
+        int32_t search_limit = nt - min_n_val;
 
-        auto draftLocal = draftBuf.Get<int32_t>();
-        uint32_t kBytes = static_cast<uint32_t>(this->k_val) * ELEM_SIZE;
-        for (uint32_t r = 0; r < rows; ++r) {
-            AscendC::DataCopyExtParams draftRowParams{1, kBytes, 0, 0, 0};
-            AscendC::DataCopyPad(
-                draftTokensGm[static_cast<uint64_t>(start_row + r) * this->k_val],
-                draftLocal[static_cast<uint64_t>(r) * this->k_align], draftRowParams);
+        // Load first chunk (use preloaded if previous row launched it)
+        AscendC::LocalTensor<int32_t> tokenLocal;
+        int32_t cs = 0;
+        int32_t cc = (SAFE_CHUNK <= search_limit) ? SAFE_CHUNK : search_limit;
+        int32_t lc = cc + max_n_val;
+        if (cs + lc > nt) lc = nt - cs;
+        if (first_chunk_preloaded) {
+            tokenLocal = tokenInQue.DeQue<int32_t>();
+        } else {
+            auto t0 = tokenInQue.AllocTensor<int32_t>();
+            COPY_GM_TO_UB(t0, tokenGm, gmRow + cs, lc, int32_t);
+            tokenInQue.EnQue(t0);
+            tokenLocal = tokenInQue.DeQue<int32_t>();
+        }
+        int32_t chunk_start = cs, chunk_count = cc, load_count = lc;
+        bool has_preloaded = false;
+        bool preloaded_next_row = false;
+
+        while (!found_global_max) {
+            // Launch next chunk preload (MTE2, overlaps V).
+            // On the last chunk: preload the NEXT ROW instead.
+            int32_t next_cs = chunk_start + SAFE_CHUNK;
+            bool has_next = (next_cs < search_limit);
+            if (has_next) {
+                int32_t next_cc = (next_cs + SAFE_CHUNK <= search_limit)
+                                ? SAFE_CHUNK : (search_limit - next_cs);
+                int32_t next_lc = next_cc + max_n_val;
+                if (next_cs + next_lc > nt) next_lc = nt - next_cs;
+                auto tn = tokenInQue.AllocTensor<int32_t>();
+                COPY_GM_TO_UB(tn, tokenGm, gmRow + next_cs, next_lc, int32_t);
+                tokenInQue.EnQue(tn);
+                has_preloaded = true;
+            } else if (has_next_row) {
+                // Last chunk of this row: preload next row's first data
+                uint32_t next_gr = static_cast<uint32_t>(next_global_row);
+                if (next_is_short) {
+                    auto tn = tokenInQue.AllocTensor<int32_t>();
+                    uint64_t nr = static_cast<uint64_t>(next_gr) *
+                                  static_cast<uint32_t>(max_seq_len);
+                    COPY_GM_TO_UB(tn, tokenGm, nr, next_nt, int32_t);
+                    tokenInQue.EnQue(tn);
+                } else {
+                    int32_t ld = SAFE_CHUNK + max_n_val;
+                    if (ld > next_nt) ld = next_nt;
+                    auto tn = tokenInQue.AllocTensor<int32_t>();
+                    uint64_t nr = static_cast<uint64_t>(next_gr) *
+                                  static_cast<uint32_t>(max_seq_len);
+                    COPY_GM_TO_UB(tn, tokenGm, nr, ld, int32_t);
+                    tokenInQue.EnQue(tn);
+                }
+                preloaded_next_row = true;
+                preloaded_row_out = 1;  // signal to caller that next row is preloaded
+            }
+
+            // Compute current chunk (V)
+            for (int32_t n = 1; n <= max_n_val; ++n) {
+                int32_t valid_len = load_count - n;
+                if (valid_len <= 0) break;
+                if (n > 1) {
+                    AscendC::Gather<int32_t>(ngramTemp, ngramResult,
+                        ngramGather.ReinterpretCast<uint32_t>(), 0, valid_len);
+                }
+                AscendC::Adds<int32_t>(ngramResult, tokenLocal,
+                    -suffixLocal.GetValue(static_cast<uint32_t>(suffix_load - n)),
+                    valid_len);
+                if (n > 1) {
+                    AscendC::Or<uint16_t>(ngramResult.ReinterpretCast<uint16_t>(),
+                        ngramResult.ReinterpretCast<uint16_t>(),
+                        ngramTemp.ReinterpretCast<uint16_t>(),
+                        static_cast<uint32_t>(valid_len * 2));
+                }
+                if (n < min_n_val) continue;
+                int32_t cc2 = (chunk_start + chunk_count <= nt - n)
+                            ? chunk_count : (nt - n - chunk_start);
+                if (cc2 <= 0) break;
+                AscendC::Cast<float, int32_t>(ngramTempF, ngramResult,
+                    AscendC::RoundMode::CAST_CEIL, cc2);
+                AscendC::Abs<float>(ngramTempF, ngramTempF, cc2);
+                AscendC::ReduceMin<float>(ngramReduce, ngramTempF, ngramReduce,
+                    static_cast<uint32_t>(cc2), true);
+                float min_val_f = ngramReduce.GetValue(0);
+                if (min_val_f == 0.0f) {
+                    if (n > best_ngram_len) {
+                        float min_idx_f = ngramReduce.GetValue(1);
+                        uint32_t pos_u = *reinterpret_cast<uint32_t*>(&min_idx_f);
+                        best_match_pos = chunk_start + static_cast<int32_t>(pos_u);
+                        best_ngram_len = n;
+                        if (n == max_n_val) { found_global_max = true; break; }
+                    }
+                } else { break; }
+            }
+
+            if (found_global_max || !has_next) break;
+
+            // Swap: free current, DeQue next (blocks until MTE2 done)
+            tokenInQue.FreeTensor(tokenLocal);
+            tokenLocal = tokenInQue.DeQue<int32_t>();
+            has_preloaded = false;
+            chunk_start = next_cs;
+            chunk_count = (chunk_start + SAFE_CHUNK <= search_limit)
+                        ? SAFE_CHUNK : (search_limit - chunk_start);
+            load_count = chunk_count + max_n_val;
+            if (chunk_start + load_count > nt) load_count = nt - chunk_start;
         }
 
-        auto numValidLocal = numValidBuf.Get<int32_t>();
-        AscendC::DataCopyPad(numValidGm[start_row], numValidLocal, nextParams);
+        // Drain unused preloaded chunk (skip next-row preload — leave in queue)
+        if (has_preloaded && !preloaded_next_row) {
+            auto extra = tokenInQue.DeQue<int32_t>();
+            tokenInQue.FreeTensor(extra);
+        }
+        tokenInQue.FreeTensor(tokenLocal);
+        suffixInQue.FreeTensor(suffixLocal);
+    }
+
+    // ---------------------------------------------------------------
+    // Helper: estimate ReduceMin temp buffer size
+    // ---------------------------------------------------------------
+    __aicore__ inline uint32_t CalcReduceMinTmpSize(uint32_t count, uint32_t typeSize)
+    {
+        uint32_t elementsPerBlock  = 32 / typeSize;
+        uint32_t elementsPerRepeat = 256 / typeSize;
+
+        auto RoundUp = [](uint32_t x, uint32_t unit) -> uint32_t {
+            return (x + unit - 1) / unit;
+        };
+
+        uint32_t firstMaxRepeat   = RoundUp(count, elementsPerRepeat);
+        uint32_t iter1OutputCount = firstMaxRepeat * 2;
+        uint32_t iter2AlignStart  = RoundUp(iter1OutputCount, elementsPerBlock) * elementsPerBlock;
+        uint32_t iter2OutputCount = RoundUp(iter1OutputCount, elementsPerRepeat) * 2;
+        uint32_t iter3AlignStart  = RoundUp(iter2OutputCount, elementsPerBlock) * elementsPerBlock;
+        uint32_t iter3OutputCount = RoundUp(iter2OutputCount, elementsPerRepeat) * 2;
+        uint32_t iter3AlignEnd    = RoundUp(iter3OutputCount, elementsPerBlock) * elementsPerBlock;
+
+        return iter2AlignStart + iter3AlignStart + iter3AlignEnd;
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> tokenTileBuf;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> sampledTileBuf;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> numTokensBuf;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> discardTileBuf;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> nextTokenBuf;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> draftBuf;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> numValidBuf;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> suffixBuf;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> maskBuf;
 
+    // VECIN input queues
+    AscendC::TQue<AscendC::TPosition::VECIN, 2> tokenInQue;  // depth=2 double buffer
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> sampledInQue;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> numTokensInQue;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> discardInQue;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> suffixInQue;
+
+    // VECOUT output queues
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> nextOutQue;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> draftOutQue;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> numValidOutQue;
+
+    // VECCALC scratch
+    AscendC::TBuf<AscendC::TPosition::VECCALC> ngramCalcBuf;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> ngramTempBuf;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> ngramGatherBuf;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> ngramReduceBuf;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> maskCalcBuf;
+
+    // Global tensors
     AscendC::GlobalTensor<int32_t> tokenGm;
     AscendC::GlobalTensor<int32_t> numTokensGm;
     AscendC::GlobalTensor<int32_t> sampledGm;
@@ -624,6 +720,7 @@ private:
     AscendC::GlobalTensor<int32_t> draftTokensGm;
     AscendC::GlobalTensor<int32_t> numValidGm;
 
+    // Tiling parameters
     int32_t batch_size;
     int32_t max_seq_len;
     int32_t max_seq_len_align;
@@ -640,7 +737,6 @@ private:
     int32_t block_rows;
     uint32_t my_rows;
     uint32_t row_offset;
-    bool is_large_row;
 };
 
 extern "C" __global__ __aicore__ void ngram_spec_decode(
