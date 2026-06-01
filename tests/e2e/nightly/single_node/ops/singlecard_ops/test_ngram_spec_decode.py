@@ -59,8 +59,8 @@ def golden_ngram_spec_decode(
             elif val != -1 and val < vocab_size:
                 valid_count += 1
             else:
-                for k in range(j, sampled_token_ids.shape[1]):
-                    sampled_token_ids[i, k] = -1
+                for tail_idx in range(j, sampled_token_ids.shape[1]):
+                    sampled_token_ids[i, tail_idx] = -1
                 break
 
         avail_space = M - seq_len
