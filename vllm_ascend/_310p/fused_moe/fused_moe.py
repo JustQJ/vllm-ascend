@@ -23,9 +23,14 @@ from vllm.model_executor.layers.fused_moe.layer import FusedMoE, UnquantizedFuse
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.ops.fused_moe.experts_selector import zero_experts_compute
-from vllm_ascend.ops.fused_moe.moe_comm_method import FusedExpertsResult, _MoECommMethods
+from vllm_ascend.ops.fused_moe.moe_comm_method import (
+    AllGatherCommImpl,
+    FusedExpertsResult,
+    _MoECommMethods,
+)
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 from vllm_ascend.quantization.quant_type import QuantType
+from vllm_ascend.utils import maybe_trans_nz
 
 from .experts_selector import select_experts
 from .moe_comm_method import AllGatherCommImpl310
@@ -49,9 +54,11 @@ class AscendUnquantizedFusedMoEMethod310(UnquantizedFusedMoEMethod):
 
         # Fused gate_up_proj (column parallel)
         w13_data = self._maybe_pad_weight(layer.w13_weight.data).transpose(1, 2).contiguous()
+        w13_data = maybe_trans_nz(w13_data)
         layer.w13_weight = torch.nn.Parameter(w13_data, requires_grad=False)
         # down_proj (row parallel)
         w2_data = self._maybe_pad_weight(layer.w2_weight.data).transpose(1, 2).contiguous()
+        w2_data = maybe_trans_nz(w2_data)
         layer.w2_weight = torch.nn.Parameter(w2_data, requires_grad=False)
 
     def apply(
@@ -147,12 +154,8 @@ class AscendFusedMoE310(FusedMoE):
         self.global_expert_map = None
         self.local_expert_map = None
         if self.moe_config.ep_size > 1:
-            self.global_expert_map, self.local_expert_map = self.init_experts_map(self.moe_config)
-        self.local_num_experts = (
-            torch.sum(self.local_expert_map != -1).item()
-            if self.local_expert_map is not None
-            else self.global_num_experts
-        )
+            raise RuntimeError("Expert Parallel is not supported on 310P. Please remove --enable-expert-parallel.")
+        self.local_num_experts = self.global_num_experts
 
         self.moe_config.num_experts = self.global_num_experts
         self.moe_config.num_local_experts = self.local_num_experts
@@ -181,7 +184,6 @@ class AscendFusedMoE310(FusedMoE):
             kwargs.pop("gate", None),
             kwargs.pop("shared_experts", None),
             self.quant_method,
-            self.reduce_results,
             self.vllm_config.parallel_config.enable_dbo,
         )
 
@@ -269,7 +271,7 @@ class AscendFusedMoE310(FusedMoE):
 
         routed_out = _EXTRA_CTX.moe_comm_method.finalize(
             hidden_states=fused_experts_results.routed_out,
-            reduce_results=self.reduce_results,
+            reduce_results=isinstance(_EXTRA_CTX.moe_comm_method, AllGatherCommImpl),
             padded_hidden_states_shape=padded_hidden_states_shape,
         )
 

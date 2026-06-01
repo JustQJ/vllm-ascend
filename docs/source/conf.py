@@ -25,12 +25,10 @@
 #
 import json
 import os
+import sys
+from pathlib import Path
 
-from docutils.parsers.rst import directives
-from sphinx.directives.code import CodeBlock
-
-# import sys
-# sys.path.insert(0, os.path.abspath('.'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 # -- Project information -----------------------------------------------------
 
@@ -60,6 +58,7 @@ extensions = [
     "sphinx_design",
     "sphinx_togglebutton",
     "sphinx_substitution_extensions",
+    "tools.docs_codegen.sphinx_extension",
 ]
 
 myst_enable_extensions = ["colon_fence", "amsmath", "dollarmath", "substitution"]
@@ -79,19 +78,19 @@ myst_substitutions = {
     "pip_vllm_ascend_version": "0.19.1rc1",
     "pip_vllm_version": "0.19.1",
     # CANN image tag
-    "cann_image_tag": "8.5.1-910b-ubuntu22.04-py3.11",
+    "cann_image_tag": "9.0.0-910b-ubuntu22.04-py3.11",
     # vLLM commit hash for main branch
-    "main_vllm_commit": "4d51588e2381018348f1022dfa3a7698899805b7",
+    "main_vllm_commit": "39910f2b25aacc09f5e7f166cdf0030b19f8b9e8",
     # vLLM tag for main branch
-    "main_vllm_tag": "v0.19.1",
+    "main_vllm_tag": "v0.20.2",
     # Python version for main branch
     "main_python_version": ">= 3.10, < 3.12",
     # CANN version for main branch
-    "main_cann_version": "8.5.0",
+    "main_cann_version": "9.0.0",
     # PyTorch/torch_npu version for main branch
-    "main_pytorch_torch_npu_version": "2.9.0 / 2.9.0",
+    "main_pytorch_torch_npu_version": "2.10.0 / 2.10.0",
     # Triton Ascend version for main branch
-    "main_triton_ascend_version": "3.2.0",
+    "main_triton_ascend_version": "3.2.1",
 }
 
 # For cross-file header anchors
@@ -171,21 +170,6 @@ if READTHEDOCS_VERSION_TYPE == "tag":
     # (readthedocs build both HTML and PDF versions separately)
     if os.path.exists(header_file):
         os.remove(header_file)
-
-
-class SyncMetadataCodeBlock(CodeBlock):
-    """Code block supporting docs-to-YAML sync metadata."""
-
-    option_spec = CodeBlock.option_spec | {
-        "sync-yaml": directives.unchanged_required,
-        "sync-target": directives.unchanged_required,
-        "sync-class": directives.unchanged_required,
-    }
-
-
-def setup(app):
-    app.add_directive("test", SyncMetadataCodeBlock)
-
 
 if __name__ == "__main__":
     print(json.dumps(myst_substitutions))
