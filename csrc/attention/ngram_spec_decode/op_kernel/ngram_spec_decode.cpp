@@ -11,7 +11,9 @@
 #include "kernel_operator.h"
 #include "ngram_spec_decode.h"
 
-const uint32_t ELEM_SIZE = 4;  // int32
+constexpr uint32_t ELEM_SIZE = 4;  // int32
+constexpr uint32_t ALIGN_BYTES = 32u;
+constexpr uint32_t ALIGN_ELEMS = ALIGN_BYTES / ELEM_SIZE;
 constexpr uint32_t SAFE_CHUNK = 8192u;
 
 // ----------------------------------------------------------------------------
@@ -21,7 +23,7 @@ constexpr uint32_t SAFE_CHUNK = 8192u;
 #define COPY_GM_TO_UB(dst, src, src_offset, count, T)                          \
     do {                                                                      \
         if ((count) > 0) {                                                    \
-            constexpr uint32_t __align_elem = 8u;                             \
+            constexpr uint32_t __align_elem = ALIGN_ELEMS;                    \
             uint32_t __c = static_cast<uint32_t>(count);                    \
             uint32_t __aligned = ((__c + __align_elem - 1u) / __align_elem) \
                                  * __align_elem;                              \
@@ -68,6 +70,7 @@ public:
     {
         REGISTER_TILING_DEFAULT(NgramSpecDecodeTilingData);
         GET_TILING_DATA_WITH_STRUCT(NgramSpecDecodeTilingData, tilingData, tiling);
+        (void)workspace;
 
         // --------------------------------------------------------------------
         // Extract tiling parameters
@@ -85,7 +88,7 @@ public:
         // --------------------------------------------------------------------
         // Compute alignment paddings (32-byte aligned for vector engine)
         // --------------------------------------------------------------------
-        int32_t align_elems = 32 / ELEM_SIZE;
+        constexpr int32_t align_elems = static_cast<int32_t>(ALIGN_ELEMS);
         this->max_seq_len_align    = ((this->max_seq_len    + align_elems - 1) / align_elems) * align_elems;
         this->max_new_tokens_align = ((this->max_new_tokens + align_elems - 1) / align_elems) * align_elems;
         this->k_align              = ((this->k_val          + align_elems - 1) / align_elems) * align_elems;
@@ -127,10 +130,10 @@ public:
         // --------------------------------------------------------------------
         uint32_t mnta_aligned = static_cast<uint32_t>(this->max_new_tokens_align);
         uint32_t k_aligned    = static_cast<uint32_t>(this->k_align);
-        uint32_t my_rows_aligned = ((this->my_row_count + 7u) / 8u) * 8u;
+        uint32_t my_rows_aligned = AlignUp(this->my_row_count, ALIGN_ELEMS);
 
         uint32_t chunk_ub       = SAFE_CHUNK + static_cast<uint32_t>(this->max_n_val);
-        uint32_t chunk_ub_align = ((chunk_ub + 7u) / 8u) * 8u;
+        uint32_t chunk_ub_align = AlignUp(chunk_ub, ALIGN_ELEMS);
         uint32_t token_buf_size = chunk_ub_align * ELEM_SIZE;
 
         // --------------------------------------------------------------------
@@ -157,7 +160,7 @@ public:
         // ReduceMin requires extra scratch space for multi-iteration reduction
         uint32_t reduce_count    = SAFE_CHUNK;
         uint32_t reduce_tmp_elems = CalcReduceMinTmpSize(reduce_count, ELEM_SIZE);
-        uint32_t reduce_tmp_bytes = ((reduce_tmp_elems * ELEM_SIZE + 31) / 32) * 32;
+        uint32_t reduce_tmp_bytes = AlignUp(reduce_tmp_elems * ELEM_SIZE, ALIGN_BYTES);
         pipe.InitBuffer(ngramReduceBuf, reduce_tmp_bytes);
 
     }
@@ -169,7 +172,8 @@ public:
     {
         // Initialize gather indices for n-gram recurrence (byte offsets)
         auto gatherLocal = ngramGatherBuf.Get<int32_t>();
-        const uint32_t gather_size = (((SAFE_CHUNK + static_cast<uint32_t>(this->max_n_val)) + 7u) / 8u) * 8u;
+        const uint32_t gather_size = AlignUp(
+            SAFE_CHUNK + static_cast<uint32_t>(this->max_n_val), ALIGN_ELEMS);
         AscendC::Arange<int32_t>(gatherLocal,
                                 static_cast<int32_t>(sizeof(int32_t)),
                                 static_cast<int32_t>(sizeof(int32_t)),
@@ -248,13 +252,9 @@ public:
                 }
 
                 // Preload next row into the second buffer slot
-                if (r + 1 < this->my_row_count && next_valid_count > 0 && next_total_len >= this->min_n_val) {
+                if (r + 1 < this->my_row_count && CanPreloadRow(next_valid_count, next_total_len)) {
                     uint32_t next_global_row = this->my_row_offset + r + 1;
-                    if (next_total_len <= static_cast<int32_t>(SAFE_CHUNK)) {
-                        LaunchPreloadNextRow(next_global_row, next_total_len);
-                    } else {
-                        LaunchPreloadNextLongFirstChunk(next_global_row, next_total_len);
-                    }
+                    LaunchPreloadRowFirstBlock(next_global_row, next_total_len);
                     preloaded_row = static_cast<int32_t>(r + 1);
                 }
 
@@ -275,11 +275,11 @@ public:
                 int32_t next_global_row = (r + 1 < this->my_row_count)
                                         ? static_cast<int32_t>(this->my_row_offset + r + 1)
                                         : -1;
-                int32_t preloaded_out = -1;
+                bool preloaded_next_row = false;
                 NgramMatchRowLong(global_row, total_len, this_row_preloaded,
                                 next_global_row, next_total_len, next_valid_count,
-                                preloaded_out, best_match_pos, best_ngram_len);
-                if (preloaded_out >= 0) {
+                                preloaded_next_row, best_match_pos, best_ngram_len);
+                if (preloaded_next_row) {
                     preloaded_row = static_cast<int32_t>(r + 1);
                 }
 
@@ -287,8 +287,7 @@ public:
                     int32_t avail = total_len - (best_match_pos + best_ngram_len);
                     draft_load = (avail < this->k_val) ? avail : this->k_val;
                     if (draft_load > 0) {
-                        uint64_t gm_row_offset = static_cast<uint64_t>(global_row)
-                                                 * static_cast<uint32_t>(this->max_seq_len);
+                        uint64_t gm_row_offset = RowTokenOffset(global_row);
                         COPY_GM_TO_UB(draftLocal[draft_offset], tokenGm,
                                     gm_row_offset + best_match_pos + best_ngram_len,
                                     draft_load, int32_t);
@@ -318,6 +317,34 @@ public:
     }
 
 private:
+    __aicore__ inline uint32_t AlignUp(uint32_t value, uint32_t unit)
+    {
+        return ((value + unit - 1u) / unit) * unit;
+    }
+
+    __aicore__ inline uint64_t RowTokenOffset(uint32_t global_row)
+    {
+        return static_cast<uint64_t>(global_row)
+               * static_cast<uint32_t>(this->max_seq_len);
+    }
+
+    __aicore__ inline bool CanPreloadRow(int32_t valid_count, int32_t total_len)
+    {
+        return valid_count > 0 && total_len >= this->min_n_val;
+    }
+
+    __aicore__ inline int32_t FirstBlockLoadCount(int32_t total_len)
+    {
+        int32_t load_count = total_len;
+        if (total_len > static_cast<int32_t>(SAFE_CHUNK)) {
+            load_count = static_cast<int32_t>(SAFE_CHUNK) + this->max_n_val;
+            if (load_count > total_len) {
+                load_count = total_len;
+            }
+        }
+        return load_count;
+    }
+
     // ------------------------------------------------------------------------
     // Load metadata tensors from GM into UB input queues
     // ------------------------------------------------------------------------
@@ -367,9 +394,9 @@ private:
 
         // Draft tokens: write k_val elements per row (each row has k_align stride in UB)
         uint32_t k_aligned = static_cast<uint32_t>(this->k_align);
+        uint32_t k_bytes = static_cast<uint32_t>(this->k_val) * ELEM_SIZE;
+        AscendC::DataCopyExtParams rowParams{1, k_bytes, 0, 0, 0};
         for (uint32_t r = 0; r < this->my_row_count; ++r) {
-            uint32_t k_bytes = static_cast<uint32_t>(this->k_val) * ELEM_SIZE;
-            AscendC::DataCopyExtParams rowParams{1, k_bytes, 0, 0, 0};
             AscendC::DataCopyPad(
                 draftTokensGm[static_cast<uint64_t>(this->my_row_offset + r) * this->k_val],
                 draftLocal[r * k_aligned], rowParams);
@@ -382,7 +409,7 @@ private:
 
     // ------------------------------------------------------------------------
     // Validate sampled tokens for one row.
-    // - If discard flag is set, invalidate all sampled tokens.
+    // - If discard flag is set, reject all sampled tokens.
     // - Clamp valid_count to available sequence space.
     // - Write the "next" token (last valid sampled, or last context token).
     // - Append valid sampled tokens back to the context token GM buffer.
@@ -394,25 +421,18 @@ private:
         AscendC::LocalTensor<int32_t>& discardLocal,
         AscendC::LocalTensor<int32_t>& nextLocal)
     {
-        uint32_t msl          = static_cast<uint32_t>(this->max_seq_len);
         uint32_t mnta_aligned = static_cast<uint32_t>(this->max_new_tokens_align);
-        uint64_t gm_row       = static_cast<uint64_t>(global_row) * msl;
+        uint64_t gm_row       = RowTokenOffset(global_row);
         uint32_t sampled_off  = local_idx * mnta_aligned;
 
         int32_t seq_len   = numTokensLocal.GetValue(local_idx);
         int32_t discard   = discardLocal.GetValue(local_idx);
         int32_t valid_count = 0;
 
-        if (discard != 0) {
-            AscendC::Duplicate(sampledLocal[sampled_off], -1, mnta_aligned);
-        } else {
+        if (discard == 0) {
             for (int32_t j = 0; j < this->max_new_tokens; ++j) {
                 int32_t val = sampledLocal.GetValue(sampled_off + j);
                 if (val == -1 || val >= this->vocab_size_val) {
-                    // Invalidate remainder on first invalid token
-                    for (int32_t k = j; k < this->max_new_tokens; ++k) {
-                        sampledLocal.SetValue(sampled_off + k, -1);
-                    }
                     break;
                 }
                 valid_count++;
@@ -444,41 +464,33 @@ private:
     }
 
     // ------------------------------------------------------------------------
+    // Enqueue one token block from GM to UB.
+    // ------------------------------------------------------------------------
+    __aicore__ inline void EnqueueTokenBlock(
+        uint32_t global_row, int32_t start_pos, int32_t count)
+    {
+        auto tensor = tokenInQue.AllocTensor<int32_t>();
+        uint64_t gm_offset = RowTokenOffset(global_row) + static_cast<uint32_t>(start_pos);
+        COPY_GM_TO_UB(tensor, tokenGm, gm_offset, count, int32_t);
+        tokenInQue.EnQue(tensor);
+    }
+
+    // ------------------------------------------------------------------------
     // Load one full row of context tokens from GM to UB (short sequences).
     // ------------------------------------------------------------------------
     __aicore__ inline AscendC::LocalTensor<int32_t> LoadOneRowToken(
         uint32_t global_row, int32_t count)
     {
-        auto tensor = tokenInQue.AllocTensor<int32_t>();
-        uint64_t gm_row = static_cast<uint64_t>(global_row) * static_cast<uint32_t>(this->max_seq_len);
-        COPY_GM_TO_UB(tensor, tokenGm, gm_row, count, int32_t);
-        tokenInQue.EnQue(tensor);
+        EnqueueTokenBlock(global_row, 0, count);
         return tokenInQue.DeQue<int32_t>();
     }
 
     // ------------------------------------------------------------------------
-    // Preload an entire short row into tokenInQue for double buffering.
+    // Preload a short row, or the first chunk of a long row, into tokenInQue.
     // ------------------------------------------------------------------------
-    __aicore__ inline void LaunchPreloadNextRow(uint32_t global_row, int32_t count)
+    __aicore__ inline void LaunchPreloadRowFirstBlock(uint32_t global_row, int32_t total_len)
     {
-        auto tensor = tokenInQue.AllocTensor<int32_t>();
-        uint64_t gm_row = static_cast<uint64_t>(global_row) * static_cast<uint32_t>(this->max_seq_len);
-        COPY_GM_TO_UB(tensor, tokenGm, gm_row, count, int32_t);
-        tokenInQue.EnQue(tensor);
-    }
-
-    // ------------------------------------------------------------------------
-    // Preload only the first chunk of a long row (SAFE_CHUNK + max_n_val).
-    // ------------------------------------------------------------------------
-    __aicore__ inline void LaunchPreloadNextLongFirstChunk(uint32_t global_row, int32_t total_len)
-    {
-        int32_t load_count = SAFE_CHUNK + this->max_n_val;
-        if (load_count > total_len) load_count = total_len;
-
-        auto tensor = tokenInQue.AllocTensor<int32_t>();
-        uint64_t gm_row = static_cast<uint64_t>(global_row) * static_cast<uint32_t>(this->max_seq_len);
-        COPY_GM_TO_UB(tensor, tokenGm, gm_row, load_count, int32_t);
-        tokenInQue.EnQue(tensor);
+        EnqueueTokenBlock(global_row, 0, FirstBlockLoadCount(total_len));
     }
 
     // ------------------------------------------------------------------------
@@ -559,13 +571,13 @@ private:
         int32_t next_global_row,
         int32_t next_total_len,
         int32_t next_valid_count,
-        int32_t& preloaded_row_out,
+        bool& preloaded_next_row_out,
         int32_t& best_match_pos,
         int32_t& best_ngram_len)
     {
         best_match_pos   = -1;
         best_ngram_len   = 0;
-        preloaded_row_out = -1;
+        preloaded_next_row_out = false;
 
         // Load suffix: the trailing max_n_val tokens of the sequence
         int32_t suffix_gm_start = total_len - this->max_n_val;
@@ -575,8 +587,7 @@ private:
             suffix_load = total_len - suffix_gm_start;
         }
 
-        uint64_t gm_row_offset = static_cast<uint64_t>(global_row)
-                                 * static_cast<uint32_t>(this->max_seq_len);
+        uint64_t gm_row_offset = RowTokenOffset(global_row);
         auto suffixTensor = suffixInQue.AllocTensor<int32_t>();
         COPY_GM_TO_UB(suffixTensor, tokenGm, gm_row_offset + suffix_gm_start,
                     suffix_load, int32_t);
@@ -591,8 +602,7 @@ private:
         auto ngramReduce = ngramReduceBuf.Get<float>();
 
         // Determine if next row is eligible for preloading
-        bool has_next_row  = (next_total_len >= this->min_n_val) && (next_valid_count > 0);
-        bool next_is_short = (next_total_len > 0 && next_total_len <= static_cast<int32_t>(SAFE_CHUNK));
+        bool can_preload_next_row = CanPreloadRow(next_valid_count, next_total_len);
         bool found_global_max = false;
         int32_t search_limit = total_len - this->min_n_val;  // Last valid n-gram start index
 
@@ -608,14 +618,11 @@ private:
         if (first_chunk_preloaded) {
             tokenLocal = tokenInQue.DeQue<int32_t>();
         } else {
-            auto t0 = tokenInQue.AllocTensor<int32_t>();
-            COPY_GM_TO_UB(t0, tokenGm, gm_row_offset + chunk_start, load_count, int32_t);
-            tokenInQue.EnQue(t0);
+            EnqueueTokenBlock(global_row, chunk_start, load_count);
             tokenLocal = tokenInQue.DeQue<int32_t>();
         }
 
-        bool has_preloaded    = false;   // Next chunk tensor is waiting in tokenInQue
-        bool preloaded_next_row = false; // The waiting tensor belongs to the next row
+        bool has_preloaded_chunk = false;  // Next current-row chunk is waiting in tokenInQue
 
         // Chunked matching loop
         while (!found_global_max) {
@@ -631,20 +638,11 @@ private:
                 if (next_chunk_start + next_load_count > total_len) {
                     next_load_count = total_len - next_chunk_start;
                 }
-                auto tn = tokenInQue.AllocTensor<int32_t>();
-                COPY_GM_TO_UB(tn, tokenGm, gm_row_offset + next_chunk_start,
-                            next_load_count, int32_t);
-                tokenInQue.EnQue(tn);
-                has_preloaded = true;
-            } else if (has_next_row) {
-                uint32_t next_gr = static_cast<uint32_t>(next_global_row);
-                if (next_is_short) {
-                    LaunchPreloadNextRow(next_gr, next_total_len);
-                } else {
-                    LaunchPreloadNextLongFirstChunk(next_gr, next_total_len);
-                }
-                preloaded_next_row = true;
-                preloaded_row_out  = 1;  // Signal caller that next row is ready
+                EnqueueTokenBlock(global_row, next_chunk_start, next_load_count);
+                has_preloaded_chunk = true;
+            } else if (can_preload_next_row) {
+                LaunchPreloadRowFirstBlock(static_cast<uint32_t>(next_global_row), next_total_len);
+                preloaded_next_row_out = true;
             }
 
             // Evaluate n-gram lengths 1..max_n_val on current chunk
@@ -709,7 +707,7 @@ private:
             // Advance to next chunk, consuming the preloaded tensor
             tokenInQue.FreeTensor(tokenLocal);
             tokenLocal   = tokenInQue.DeQue<int32_t>();
-            has_preloaded = false;
+            has_preloaded_chunk = false;
 
             chunk_start = next_chunk_start;
             chunk_count = (chunk_start + SAFE_CHUNK <= search_limit)
@@ -721,8 +719,8 @@ private:
             }
         }
 
-        // Clean up unconsumed preloaded chunk (if it was a chunk, not next row)
-        if (has_preloaded && !preloaded_next_row) {
+        // Clean up an unconsumed current-row chunk if matching stopped early.
+        if (has_preloaded_chunk) {
             auto extra = tokenInQue.DeQue<int32_t>();
             tokenInQue.FreeTensor(extra);
         }
