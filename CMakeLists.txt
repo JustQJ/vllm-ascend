@@ -99,6 +99,8 @@ include_directories(
   ${TORCH_INCLUDE_DIRS}
   ${TORCH_NPU_PATH}/include
   ${ASCEND_HOME_PATH}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/csrc
+  ${CMAKE_CURRENT_SOURCE_DIR}/csrc/utils/inc
   ${CMAKE_CURRENT_SOURCE_DIR}/csrc/batch_matmul_transpose/op_host
 )
 

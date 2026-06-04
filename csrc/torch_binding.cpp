@@ -37,6 +37,7 @@
 #endif
 #include "mc2/dispatch_ffn_combine/dispatch_ffn_combine_torch_adpt.h"
 #include "mc2/dispatch_gmm_combine_decode/dispatch_gmm_combine_decode_torch_adpt.h"
+#include "mc2/mega_moe/mega_moe_torch_adpt.h"
 #include "mc2/dispatch_layout/dispatch_layout_torch_adpt.h"
 #include "gmm/grouped_matmul_swiglu_quant_weight_nz_tensor_list/grouped_matmul_swiglu_quant_torch_adpt.h"
 #include "gmm/grouped_matmul_swiglu_quant_v2/grouped_matmul_swiglu_quant_v2_torch_adpt.h"
@@ -2481,6 +2482,19 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                     int max_output_size, Tensor! out, Tensor! expert_token_nums, Tensor? x_active_mask=None, float swiglu_limit=1000000.0) -> (Tensor out, Tensor expert_token_nums)"
     );
     ops.impl("dispatch_ffn_combine", torch::kPrivateUse1, &vllm_ascend::dispatch_ffn_combine);
+
+    // MegaMoe operator: fused MoE Dispatch + GMM1 + SwiGLU/MX-Quant + GMM2 + Combine
+    ops.def(
+        "npu_mega_moe(Tensor x, Tensor topk_ids, Tensor topk_weights,"
+        "             Tensor[] weight1, Tensor[] weight2,"
+        "             str group_ep, int moe_expert_num,"
+        "             Tensor[]? weight_scales1=None, Tensor[]? weight_scales2=None,"
+        "             Tensor? x_active_mask=None, Tensor? scales=None,"
+        "             int max_recv_token_num=0, int dispatch_quant_mode=4,"
+        "             int dispatch_quant_out_type=24, int combine_quant_mode=0,"
+        "             str comm_alg=\"\", int global_bs=0"
+        ") -> (Tensor, Tensor)");
+    ops.impl("npu_mega_moe", torch::kPrivateUse1, &vllm_ascend::npu_mega_moe);
 
     ops.def("matmul_allreduce_add_rmsnorm(Tensor x1, Tensor x2, Tensor residual, Tensor gamma, \
         str groupTp, int tpRankSize, int tpRankId, float epsilon, bool isTransB, bool isGatherAddOut) -> (Tensor output, Tensor add_out)");

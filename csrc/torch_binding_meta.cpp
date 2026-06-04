@@ -241,6 +241,50 @@ std::tuple<at::Tensor&, at::Tensor&> dispatch_ffn_combine_meta(
     return {out, expert_token_nums};
 }
 
+std::tuple<at::Tensor, at::Tensor> npu_mega_moe_meta(
+    const at::Tensor& x,
+    const at::Tensor& topk_ids,
+    const at::Tensor& topk_weights,
+    const at::TensorList& weight1,
+    const at::TensorList& weight2,
+    c10::string_view group_ep,
+    int64_t moe_expert_num,
+    c10::optional<at::TensorList> weight_scales1,
+    c10::optional<at::TensorList> weight_scales2,
+    c10::optional<at::Tensor> x_active_mask,
+    c10::optional<at::Tensor> scales,
+    int64_t max_recv_token_num,
+    int64_t dispatch_quant_mode,
+    int64_t dispatch_quant_out_type,
+    int64_t combine_quant_mode,
+    c10::string_view comm_alg,
+    int64_t global_bs)
+{
+    (void)topk_weights;
+    (void)weight2;
+    (void)group_ep;
+    (void)moe_expert_num;
+    (void)weight_scales1;
+    (void)weight_scales2;
+    (void)x_active_mask;
+    (void)scales;
+    (void)max_recv_token_num;
+    (void)dispatch_quant_mode;
+    (void)dispatch_quant_out_type;
+    (void)combine_quant_mode;
+    (void)comm_alg;
+    (void)global_bs;
+
+    at::Tensor y = at::empty(x.sizes(), x.options().device(at::kMeta));
+    int64_t local_expert_num = weight1.size() > 0 && weight1[0].dim() > 0
+        ? weight1[0].size(0)
+        : 0;
+    at::Tensor expert_token_nums = at::empty(
+        {local_expert_num},
+        topk_ids.options().dtype(at::kInt).device(at::kMeta));
+    return {y, expert_token_nums};
+}
+
 at::Tensor npu_lightning_indexer_meta(
     const at::Tensor &query, const at::Tensor &key, const at::Tensor &weights,
     const c10::optional<at::Tensor> &actual_seq_lengths_query,
@@ -1611,6 +1655,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_sparse_flash_attention", &vllm_ascend::meta::npu_sparse_flash_attention_meta);
     // MoE dispatch-ffn-combine
     ops.impl("dispatch_ffn_combine", &vllm_ascend::meta::dispatch_ffn_combine_meta);
+    // MegaMoe
+    ops.impl("npu_mega_moe", &vllm_ascend::meta::npu_mega_moe_meta);
     // matmul allreduce add rmsnorm
     ops.impl("matmul_allreduce_add_rmsnorm", &vllm_ascend::meta::matmul_allreduce_add_rmsnorm_meta);
     // moe_init_routing_custom
