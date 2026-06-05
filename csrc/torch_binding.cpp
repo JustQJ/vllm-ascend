@@ -48,6 +48,7 @@
 #include "attention/sparse_flash_attention/sparse_flash_attention_torch_adpt.h"
 #include "attention/lightning_indexer_quant/lightning_indexer_quant_torch_adpt.h"
 #include "attention/ngram_spec_decode/ngram_spec_decode_torch_adpt.h"
+#include "attention/scatter_pa_kv_cache/scatter_pa_kv_cache_torch_adpt.h"
 #include "moe/causal_conv1d_v310/causal_conv1d_310_torch_adpt.h"
 #include "attention/recurrent_gated_delta_rule/recurrent_gated_delta_rule_torch_adpt.h"
 #include "attention/recurrent_gated_delta_rule_v310/recurrent_gated_delta_rule_310_torch_adpt.h"
@@ -2560,6 +2561,18 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 
     ops.def("npu_sign_bits_pack(Tensor input, int size) -> Tensor");
     ops.impl("npu_sign_bits_pack", torch::kPrivateUse1, &vllm_ascend::npu_sign_bits_pack);
+
+    ops.def(
+        "npu_scatter_pa_kv_cache("
+            "Tensor key, Tensor(a!) key_cache, Tensor slot_mapping, "
+            "Tensor value, Tensor(b!) value_cache, "
+            "Tensor? compress_lens=None, Tensor? compress_seq_offset=None, "
+            "Tensor? seq_lens=None, "
+            "str cache_mode='Norm', str scatter_mode='None', "
+            "int[]? strides=None, int[]? offsets=None"
+        ") -> ()"
+    );
+    ops.impl("npu_scatter_pa_kv_cache", torch::kPrivateUse1, &vllm_ascend::npu_scatter_pa_kv_cache);
 
     ops.def(
         "transpose_kv_cache_by_block(Tensor[] kCache, Tensor[] vCache, Tensor blockIDs, int blockSize, int headNum, int headDim, int splitNum, int layerNum) -> ()"

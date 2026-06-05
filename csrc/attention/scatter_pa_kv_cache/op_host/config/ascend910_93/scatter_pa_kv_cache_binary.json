@@ -1,0 +1,1812 @@
+{
+    "op_type": "ScatterPaKvCache",
+    "optional_input_mode": "gen_placeholder",
+    "op_list": [
+        {
+            "bin_filename": "ScatterPaKvCache_int8_int8_int32_nd_nz",
+            "inputs": [
+                {
+                    "name": "key",
+                    "index": 0,
+                    "dtype": "int8",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "key_cache",
+                    "index": 1,
+                    "dtype": "int8",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "slot_mapping",
+                    "index": 2,
+                    "dtype": "int32",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value",
+                    "index": 3,
+                    "dtype": "int8",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value_cache",
+                    "index": 4,
+                    "dtype": "int8",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "compress_lens",
+                    "index": 5,
+                    "dtype": "int32",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "compress_seq_offset",
+                    "index": 6,
+                    "dtype": "int32",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "seq_lens",
+                    "index": 7,
+                    "dtype": "int32",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                }
+            ],
+            "attrs": [
+                {
+                    "name": "cache_mode",
+                    "dtype": "string",
+                    "value": "Norm"
+                },
+                {
+                    "name": "scatter_mode",
+                    "dtype": "string",
+                    "value": "None"
+                },
+                {
+                    "name": "strides",
+                    "dtype": "list_int",
+                    "value": [1, 1]
+                },
+                {
+                    "name": "offsets",
+                    "dtype": "list_int",
+                    "value": [0, 0]
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "key_cache",
+                    "index": 0,
+                    "dtype": "int8",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value_cache",
+                    "index": 1,
+                    "dtype": "int8",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                }
+            ]
+        },
+        {
+            "bin_filename": "ScatterPaKvCache_int8_bfloat16_int32_nd_nz",
+            "inputs": [
+                {
+                    "name": "key",
+                    "index": 0,
+                    "dtype": "int8",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "key_cache",
+                    "index": 1,
+                    "dtype": "int8",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "slot_mapping",
+                    "index": 2,
+                    "dtype": "int32",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value",
+                    "index": 3,
+                    "dtype": "bfloat16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value_cache",
+                    "index": 4,
+                    "dtype": "bfloat16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "compress_lens",
+                    "index": 5,
+                    "dtype": "int32",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "compress_seq_offset",
+                    "index": 6,
+                    "dtype": "int32",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "seq_lens",
+                    "index": 7,
+                    "dtype": "int32",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                }
+            ],
+            "attrs": [
+                {
+                    "name": "cache_mode",
+                    "dtype": "string",
+                    "value": "Norm"
+                },
+                {
+                    "name": "scatter_mode",
+                    "dtype": "string",
+                    "value": "None"
+                },
+                {
+                    "name": "strides",
+                    "dtype": "list_int",
+                    "value": [1, 1]
+                },
+                {
+                    "name": "offsets",
+                    "dtype": "list_int",
+                    "value": [0, 0]
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "key_cache",
+                    "index": 0,
+                    "dtype": "int8",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value_cache",
+                    "index": 1,
+                    "dtype": "bfloat16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                }
+            ]
+        },
+        {
+            "bin_filename": "ScatterPaKvCache_float16_float16_int32_nd_nz",
+            "inputs": [
+                {
+                    "name": "key",
+                    "index": 0,
+                    "dtype": "float16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "key_cache",
+                    "index": 1,
+                    "dtype": "float16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "slot_mapping",
+                    "index": 2,
+                    "dtype": "int32",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value",
+                    "index": 3,
+                    "dtype": "float16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value_cache",
+                    "index": 4,
+                    "dtype": "float16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "compress_lens",
+                    "index": 5,
+                    "dtype": "int32",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "compress_seq_offset",
+                    "index": 6,
+                    "dtype": "int32",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "seq_lens",
+                    "index": 7,
+                    "dtype": "int32",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                }
+            ],
+            "attrs": [
+                {
+                    "name": "cache_mode",
+                    "dtype": "string",
+                    "value": "Norm"
+                },
+                {
+                    "name": "scatter_mode",
+                    "dtype": "string",
+                    "value": "None"
+                },
+                {
+                    "name": "strides",
+                    "dtype": "list_int",
+                    "value": [1, 1]
+                },
+                {
+                    "name": "offsets",
+                    "dtype": "list_int",
+                    "value": [0, 0]
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "key_cache",
+                    "index": 0,
+                    "dtype": "float16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value_cache",
+                    "index": 1,
+                    "dtype": "float16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                }
+            ]
+        },
+        {
+            "bin_filename": "ScatterPaKvCache_float16_bfloat16_int32_nd_nz",
+            "inputs": [
+                {
+                    "name": "key",
+                    "index": 0,
+                    "dtype": "float16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "key_cache",
+                    "index": 1,
+                    "dtype": "float16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "slot_mapping",
+                    "index": 2,
+                    "dtype": "int32",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value",
+                    "index": 3,
+                    "dtype": "bfloat16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value_cache",
+                    "index": 4,
+                    "dtype": "bfloat16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "compress_lens",
+                    "index": 5,
+                    "dtype": "int32",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "compress_seq_offset",
+                    "index": 6,
+                    "dtype": "int32",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "seq_lens",
+                    "index": 7,
+                    "dtype": "int32",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                }
+            ],
+            "attrs": [
+                {
+                    "name": "cache_mode",
+                    "dtype": "string",
+                    "value": "Norm"
+                },
+                {
+                    "name": "scatter_mode",
+                    "dtype": "string",
+                    "value": "None"
+                },
+                {
+                    "name": "strides",
+                    "dtype": "list_int",
+                    "value": [1, 1]
+                },
+                {
+                    "name": "offsets",
+                    "dtype": "list_int",
+                    "value": [0, 0]
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "key_cache",
+                    "index": 0,
+                    "dtype": "float16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value_cache",
+                    "index": 1,
+                    "dtype": "bfloat16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                }
+            ]
+        },
+        {
+            "bin_filename": "ScatterPaKvCache_bfloat16_float16_int32_nd_nz",
+            "inputs": [
+                {
+                    "name": "key",
+                    "index": 0,
+                    "dtype": "bfloat16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "key_cache",
+                    "index": 1,
+                    "dtype": "bfloat16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "slot_mapping",
+                    "index": 2,
+                    "dtype": "int32",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value",
+                    "index": 3,
+                    "dtype": "float16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value_cache",
+                    "index": 4,
+                    "dtype": "float16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "compress_lens",
+                    "index": 5,
+                    "dtype": "int32",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "compress_seq_offset",
+                    "index": 6,
+                    "dtype": "int32",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "seq_lens",
+                    "index": 7,
+                    "dtype": "int32",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                }
+            ],
+            "attrs": [
+                {
+                    "name": "cache_mode",
+                    "dtype": "string",
+                    "value": "Norm"
+                },
+                {
+                    "name": "scatter_mode",
+                    "dtype": "string",
+                    "value": "None"
+                },
+                {
+                    "name": "strides",
+                    "dtype": "list_int",
+                    "value": [1, 1]
+                },
+                {
+                    "name": "offsets",
+                    "dtype": "list_int",
+                    "value": [0, 0]
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "key_cache",
+                    "index": 0,
+                    "dtype": "bfloat16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value_cache",
+                    "index": 1,
+                    "dtype": "float16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                }
+            ]
+        },
+        {
+            "bin_filename": "ScatterPaKvCache_bfloat16_bfloat16_int32_nd_nz",
+            "inputs": [
+                {
+                    "name": "key",
+                    "index": 0,
+                    "dtype": "bfloat16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "key_cache",
+                    "index": 1,
+                    "dtype": "bfloat16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "slot_mapping",
+                    "index": 2,
+                    "dtype": "int32",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value",
+                    "index": 3,
+                    "dtype": "bfloat16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value_cache",
+                    "index": 4,
+                    "dtype": "bfloat16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "compress_lens",
+                    "index": 5,
+                    "dtype": "int32",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "compress_seq_offset",
+                    "index": 6,
+                    "dtype": "int32",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "seq_lens",
+                    "index": 7,
+                    "dtype": "int32",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                }
+            ],
+            "attrs": [
+                {
+                    "name": "cache_mode",
+                    "dtype": "string",
+                    "value": "Norm"
+                },
+                {
+                    "name": "scatter_mode",
+                    "dtype": "string",
+                    "value": "None"
+                },
+                {
+                    "name": "strides",
+                    "dtype": "list_int",
+                    "value": [1, 1]
+                },
+                {
+                    "name": "offsets",
+                    "dtype": "list_int",
+                    "value": [0, 0]
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "key_cache",
+                    "index": 0,
+                    "dtype": "bfloat16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value_cache",
+                    "index": 1,
+                    "dtype": "bfloat16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                }
+            ]
+        },
+        {
+            "bin_filename": "ScatterPaKvCache_int8_float16_int64_nd_nz",
+            "inputs": [
+                {
+                    "name": "key",
+                    "index": 0,
+                    "dtype": "int8",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "key_cache",
+                    "index": 1,
+                    "dtype": "int8",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "slot_mapping",
+                    "index": 2,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value",
+                    "index": 3,
+                    "dtype": "float16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value_cache",
+                    "index": 4,
+                    "dtype": "float16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "compress_lens",
+                    "index": 5,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "compress_seq_offset",
+                    "index": 6,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "seq_lens",
+                    "index": 7,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                }
+            ],
+            "attrs": [
+                {
+                    "name": "cache_mode",
+                    "dtype": "string",
+                    "value": "Norm"
+                },
+                {
+                    "name": "scatter_mode",
+                    "dtype": "string",
+                    "value": "None"
+                },
+                {
+                    "name": "strides",
+                    "dtype": "list_int",
+                    "value": [1, 1]
+                },
+                {
+                    "name": "offsets",
+                    "dtype": "list_int",
+                    "value": [0, 0]
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "key_cache",
+                    "index": 0,
+                    "dtype": "int8",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value_cache",
+                    "index": 1,
+                    "dtype": "float16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                }
+            ]
+        },
+        {
+            "bin_filename": "ScatterPaKvCache_int8_float16_int32_nd_nz",
+            "inputs": [
+                {
+                    "name": "key",
+                    "index": 0,
+                    "dtype": "int8",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "key_cache",
+                    "index": 1,
+                    "dtype": "int8",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "slot_mapping",
+                    "index": 2,
+                    "dtype": "int32",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value",
+                    "index": 3,
+                    "dtype": "float16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value_cache",
+                    "index": 4,
+                    "dtype": "float16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "compress_lens",
+                    "index": 5,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "compress_seq_offset",
+                    "index": 6,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "seq_lens",
+                    "index": 7,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                }
+            ],
+            "attrs": [
+                {
+                    "name": "cache_mode",
+                    "dtype": "string",
+                    "value": "Norm"
+                },
+                {
+                    "name": "scatter_mode",
+                    "dtype": "string",
+                    "value": "None"
+                },
+                {
+                    "name": "strides",
+                    "dtype": "list_int",
+                    "value": [1, 1]
+                },
+                {
+                    "name": "offsets",
+                    "dtype": "list_int",
+                    "value": [0, 0]
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "key_cache",
+                    "index": 0,
+                    "dtype": "int8",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value_cache",
+                    "index": 1,
+                    "dtype": "float16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                }
+            ]
+        },
+        {
+            "bin_filename": "ScatterPaKvCache_int8_int8_int64_nd_nz",
+            "inputs": [
+                {
+                    "name": "key",
+                    "index": 0,
+                    "dtype": "int8",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "key_cache",
+                    "index": 1,
+                    "dtype": "int8",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "slot_mapping",
+                    "index": 2,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value",
+                    "index": 3,
+                    "dtype": "int8",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value_cache",
+                    "index": 4,
+                    "dtype": "int8",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "compress_lens",
+                    "index": 5,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "compress_seq_offset",
+                    "index": 6,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "seq_lens",
+                    "index": 7,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                }
+            ],
+            "attrs": [
+                {
+                    "name": "cache_mode",
+                    "dtype": "string",
+                    "value": "Norm"
+                },
+                {
+                    "name": "scatter_mode",
+                    "dtype": "string",
+                    "value": "None"
+                },
+                {
+                    "name": "strides",
+                    "dtype": "list_int",
+                    "value": [1, 1]
+                },
+                {
+                    "name": "offsets",
+                    "dtype": "list_int",
+                    "value": [0, 0]
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "key_cache",
+                    "index": 0,
+                    "dtype": "int8",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value_cache",
+                    "index": 1,
+                    "dtype": "int8",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                }
+            ]
+        },
+        {
+            "bin_filename": "ScatterPaKvCache_int8_bfloat16_int64_nd_nz",
+            "inputs": [
+                {
+                    "name": "key",
+                    "index": 0,
+                    "dtype": "int8",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "key_cache",
+                    "index": 1,
+                    "dtype": "int8",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "slot_mapping",
+                    "index": 2,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value",
+                    "index": 3,
+                    "dtype": "bfloat16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value_cache",
+                    "index": 4,
+                    "dtype": "bfloat16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "compress_lens",
+                    "index": 5,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "compress_seq_offset",
+                    "index": 6,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "seq_lens",
+                    "index": 7,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                }
+            ],
+            "attrs": [
+                {
+                    "name": "cache_mode",
+                    "dtype": "string",
+                    "value": "Norm"
+                },
+                {
+                    "name": "scatter_mode",
+                    "dtype": "string",
+                    "value": "None"
+                },
+                {
+                    "name": "strides",
+                    "dtype": "list_int",
+                    "value": [1, 1]
+                },
+                {
+                    "name": "offsets",
+                    "dtype": "list_int",
+                    "value": [0, 0]
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "key_cache",
+                    "index": 0,
+                    "dtype": "int8",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value_cache",
+                    "index": 1,
+                    "dtype": "bfloat16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                }
+            ]
+        },
+        {
+            "bin_filename": "ScatterPaKvCache_float16_float16_int64_nd_nz",
+            "inputs": [
+                {
+                    "name": "key",
+                    "index": 0,
+                    "dtype": "float16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "key_cache",
+                    "index": 1,
+                    "dtype": "float16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "slot_mapping",
+                    "index": 2,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value",
+                    "index": 3,
+                    "dtype": "float16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value_cache",
+                    "index": 4,
+                    "dtype": "float16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "compress_lens",
+                    "index": 5,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "compress_seq_offset",
+                    "index": 6,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "seq_lens",
+                    "index": 7,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                }
+            ],
+            "attrs": [
+                {
+                    "name": "cache_mode",
+                    "dtype": "string",
+                    "value": "Norm"
+                },
+                {
+                    "name": "scatter_mode",
+                    "dtype": "string",
+                    "value": "None"
+                },
+                {
+                    "name": "strides",
+                    "dtype": "list_int",
+                    "value": [1, 1]
+                },
+                {
+                    "name": "offsets",
+                    "dtype": "list_int",
+                    "value": [0, 0]
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "key_cache",
+                    "index": 0,
+                    "dtype": "float16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value_cache",
+                    "index": 1,
+                    "dtype": "float16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                }
+            ]
+        },
+        {
+            "bin_filename": "ScatterPaKvCache_float16_bfloat16_int64_nd_nz",
+            "inputs": [
+                {
+                    "name": "key",
+                    "index": 0,
+                    "dtype": "float16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "key_cache",
+                    "index": 1,
+                    "dtype": "float16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "slot_mapping",
+                    "index": 2,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value",
+                    "index": 3,
+                    "dtype": "bfloat16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value_cache",
+                    "index": 4,
+                    "dtype": "bfloat16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "compress_lens",
+                    "index": 5,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "compress_seq_offset",
+                    "index": 6,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "seq_lens",
+                    "index": 7,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                }
+            ],
+            "attrs": [
+                {
+                    "name": "cache_mode",
+                    "dtype": "string",
+                    "value": "Norm"
+                },
+                {
+                    "name": "scatter_mode",
+                    "dtype": "string",
+                    "value": "None"
+                },
+                {
+                    "name": "strides",
+                    "dtype": "list_int",
+                    "value": [1, 1]
+                },
+                {
+                    "name": "offsets",
+                    "dtype": "list_int",
+                    "value": [0, 0]
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "key_cache",
+                    "index": 0,
+                    "dtype": "float16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value_cache",
+                    "index": 1,
+                    "dtype": "bfloat16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                }
+            ]
+        },
+        {
+            "bin_filename": "ScatterPaKvCache_bfloat16_float16_int64_nd_nz",
+            "inputs": [
+                {
+                    "name": "key",
+                    "index": 0,
+                    "dtype": "bfloat16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "key_cache",
+                    "index": 1,
+                    "dtype": "bfloat16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "slot_mapping",
+                    "index": 2,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value",
+                    "index": 3,
+                    "dtype": "float16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value_cache",
+                    "index": 4,
+                    "dtype": "float16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "compress_lens",
+                    "index": 5,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "compress_seq_offset",
+                    "index": 6,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "seq_lens",
+                    "index": 7,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                }
+            ],
+            "attrs": [
+                {
+                    "name": "cache_mode",
+                    "dtype": "string",
+                    "value": "Norm"
+                },
+                {
+                    "name": "scatter_mode",
+                    "dtype": "string",
+                    "value": "None"
+                },
+                {
+                    "name": "strides",
+                    "dtype": "list_int",
+                    "value": [1, 1]
+                },
+                {
+                    "name": "offsets",
+                    "dtype": "list_int",
+                    "value": [0, 0]
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "key_cache",
+                    "index": 0,
+                    "dtype": "bfloat16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value_cache",
+                    "index": 1,
+                    "dtype": "float16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                }
+            ]
+        },
+        {
+            "bin_filename": "ScatterPaKvCache_bfloat16_bfloat16_int64_nd_nz",
+            "inputs": [
+                {
+                    "name": "key",
+                    "index": 0,
+                    "dtype": "bfloat16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "key_cache",
+                    "index": 1,
+                    "dtype": "bfloat16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "slot_mapping",
+                    "index": 2,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value",
+                    "index": 3,
+                    "dtype": "bfloat16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value_cache",
+                    "index": 4,
+                    "dtype": "bfloat16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "compress_lens",
+                    "index": 5,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "compress_seq_offset",
+                    "index": 6,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "seq_lens",
+                    "index": 7,
+                    "dtype": "int64",
+                    "format": "ND",
+                    "paramType": "optional",
+                    "shape": [
+                        -2
+                    ]
+                }
+            ],
+            "attrs": [
+                {
+                    "name": "cache_mode",
+                    "dtype": "string",
+                    "value": "Norm"
+                },
+                {
+                    "name": "scatter_mode",
+                    "dtype": "string",
+                    "value": "None"
+                },
+                {
+                    "name": "strides",
+                    "dtype": "list_int",
+                    "value": [1, 1]
+                },
+                {
+                    "name": "offsets",
+                    "dtype": "list_int",
+                    "value": [0, 0]
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "key_cache",
+                    "index": 0,
+                    "dtype": "bfloat16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                },
+                {
+                    "name": "value_cache",
+                    "index": 1,
+                    "dtype": "bfloat16",
+                    "format": "ND",
+                    "paramType": "required",
+                    "shape": [
+                        -2
+                    ]
+                }
+            ]
+        }
+    ]
+}

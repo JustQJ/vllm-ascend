@@ -1457,6 +1457,23 @@ void npu_scatter_nd_update_v2_meta(
     return;
 }
 
+void npu_scatter_pa_kv_cache_meta(
+    const at::Tensor& key,
+    at::Tensor& key_cache,
+    const at::Tensor& slot_mapping,
+    const at::Tensor& value,
+    at::Tensor& value_cache,
+    const c10::optional<at::Tensor>& compress_lens,
+    const c10::optional<at::Tensor>& compress_seq_offset,
+    const c10::optional<at::Tensor>& seq_lens,
+    c10::string_view cache_mode,
+    c10::string_view scatter_mode,
+    c10::optional<at::IntArrayRef> strides,
+    c10::optional<at::IntArrayRef> offsets)
+{
+    return;
+}
+
 // N-gram spec decode meta
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> npu_ngram_spec_decode_meta(
     at::Tensor &token_ids,
@@ -1656,6 +1673,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("indexer_compress_epilog_v2", &vllm_ascend::meta::indexer_compress_epilog_v2_meta);
     ops.impl("npu_dequant_swiglu_quant", &vllm_ascend::meta::npu_dequant_swiglu_quant_meta);
     ops.impl("npu_scatter_nd_update_v2", &vllm_ascend::meta::npu_scatter_nd_update_v2_meta);
+    // scatter_pa_kv_cache
+    ops.impl("npu_scatter_pa_kv_cache", &vllm_ascend::meta::npu_scatter_pa_kv_cache_meta);
     // Lightning indexer quant
     ops.impl("npu_lightning_indexer_quant", &vllm_ascend::meta::npu_lightning_indexer_quant_meta);
     // N-gram spec decode
