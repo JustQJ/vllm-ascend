@@ -8,6 +8,15 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
+set(_MEGA_MOE_INC_OPTS)
+if (EXISTS ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/ascendc/include)
+    list(APPEND _MEGA_MOE_INC_OPTS -I${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/ascendc/include)
+elseif (EXISTS ${ASCEND_CANN_PACKAGE_PATH}/arm64-linux/ascendc/include)
+    list(APPEND _MEGA_MOE_INC_OPTS -I${ASCEND_CANN_PACKAGE_PATH}/arm64-linux/ascendc/include)
+elseif (EXISTS ${ASCEND_CANN_PACKAGE_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/ascendc/include)
+    list(APPEND _MEGA_MOE_INC_OPTS -I${ASCEND_CANN_PACKAGE_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/ascendc/include)
+endif()
+
 if (BUILD_OPEN_PROJECT)  # custom
     add_op_to_compiled_list()
     target_sources(op_host_aclnnInner PRIVATE
@@ -32,6 +41,7 @@ if (BUILD_OPEN_PROJECT)  # custom
         add_ops_compile_options(
             OP_NAME MegaMoe
             OPTIONS --cce-auto-sync=off
+            OPTIONS ${_MEGA_MOE_INC_OPTS}
             OPTIONS -I${OPTENSOR_INCLUDE_ROOT}
             OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../common_utils
             OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel
@@ -44,6 +54,7 @@ if (BUILD_OPEN_PROJECT)  # custom
         add_ops_compile_options(
             OP_NAME MegaMoe
             OPTIONS --cce-auto-sync=off
+            OPTIONS ${_MEGA_MOE_INC_OPTS}
             OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../common_utils
             OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel
             OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel/arch22
