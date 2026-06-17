@@ -21,7 +21,19 @@
 #include "aclnn_util.h"
 #include "../common_utils/mc2_3rd_matmul_util.h"
 #include "aclnn_kernels/common/op_error_check.h"
-#include "aclnnInner_mega_moe.h"
+extern aclnnStatus aclnnInnerMegaMoeGetWorkspaceSize(
+    const aclTensor* context, const aclTensor* x, const aclTensor* topkIds, const aclTensor* topkWeights,
+    const aclTensorList* weight1, const aclTensorList* weight2, const aclTensorList* weightScales1Optional,
+    const aclTensorList* weightScales2Optional, const aclTensorList* bias1Optional,
+    const aclTensorList* bias2Optional, const aclTensor* xActiveMaskOptional, const aclTensor* scalesOptional,
+    int64_t moeExpertNum, int64_t epWorldSize, int64_t cclBufferSize, int64_t maxRecvTokenNum,
+    int64_t dispatchQuantMode, int64_t dispatchQuantOutDtype, int64_t combineQuantMode, char* commAlg,
+    int64_t numMaxTokensPerRank, char* activation, float activationClamp, int activationOutDtype,
+    bool transposeWeight1, bool transposeWeight2, int64_t weight1Interleave, aclTensor* yOut,
+    aclTensor* expertTokenNumsOut, uint64_t* workspaceSize, aclOpExecutor** executor);
+
+extern aclnnStatus aclnnInnerMegaMoe(void* workspace, uint64_t workspaceSize,
+    aclOpExecutor* executor, aclrtStream stream);
 
 using namespace Ops::Transformer;
 using namespace op;
