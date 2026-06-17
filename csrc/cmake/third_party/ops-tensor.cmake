@@ -76,3 +76,5 @@ else()
 endif()
 
 set(OPTENSOR_INCLUDE_ROOT ${OPTENSOR_SOURCE_PATH}/include)
+set(TENSOR_API_INCLUDE_ROOT ${OPTENSOR_SOURCE_PATH}/include/tensor_api/include)
+set(TENSOR_API_IMPL_INCLUDE_ROOT ${OPTENSOR_SOURCE_PATH}/include/tensor_api)

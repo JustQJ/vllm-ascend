@@ -43,7 +43,8 @@ if (BUILD_OPEN_PROJECT)  # custom
             OPTIONS --cce-auto-sync=off
             OPTIONS ${_MEGA_MOE_INC_OPTS}
             OPTIONS -I${OPTENSOR_INCLUDE_ROOT}
-            OPTIONS -I${OPTENSOR_SOURCE_PATH}
+            OPTIONS -I${TENSOR_API_INCLUDE_ROOT}
+            OPTIONS -I${TENSOR_API_IMPL_INCLUDE_ROOT}
             OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../common_utils
             OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel
             OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel/arch35
