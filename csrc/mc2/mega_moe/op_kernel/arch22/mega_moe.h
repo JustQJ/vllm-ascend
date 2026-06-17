@@ -57,7 +57,7 @@ using namespace AscendC;
 #include "utils/select_helper.hpp"
 #include "utils/const_args.hpp"
 #include "utils/dispatch_policy_custom.hpp"
-#include "mc2_moe_context.h"
+#include "../../common_utils/mc2_moe_context.h"
 #include "utils/block_epilogue_pertoken_v2.hpp"
 #include "mega_moe_kernel_a3.hpp"
 #include "moe_init_routing_quant_v2/moe_init_routing_quant_v2_tiling.h"

@@ -44,7 +44,7 @@ using namespace AscendC;
 #include "utils/select_helper.hpp"
 #include "utils/const_args.hpp"
 #include "utils/dispatch_policy_custom.hpp"
-#include "mc2_moe_context.h"
+#include "../../common_utils/mc2_moe_context.h"
 
 // A2 epilogue utils (V2 variants for CombineV2, SwiGLU variants for GMM1 epilogue)
 #include "utilsA2/block_epilogue_pertoken_v2_int8_a2.hpp"

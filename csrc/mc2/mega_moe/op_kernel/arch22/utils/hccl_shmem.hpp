@@ -24,7 +24,7 @@
 
 #include "kernel_operator.h"
 #include "const_args.hpp"
-#include "mc2_moe_context.h"
+#include "../../../common_utils/mc2_moe_context.h"
 
 #include "../../../common_utils/moe_distribute_base.h"
 
