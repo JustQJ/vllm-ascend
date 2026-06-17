@@ -26,7 +26,7 @@
 #include "const_args.hpp"
 #include "mc2_moe_context.h"
 
-#include "../../../../common/op_kernel/moe_distribute_base.h"
+#include "../../../common_utils/moe_distribute_base.h"
 
 #define FORCE_INLINE_AICORE inline __attribute__((always_inline)) __aicore__
 constexpr int32_t MAX_RANK_SIZE = 32;

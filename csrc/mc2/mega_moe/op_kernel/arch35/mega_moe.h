@@ -18,7 +18,7 @@
 
 #include "kernel_operator.h"
 #include "kernel_tiling/kernel_tiling.h"
-#include "../../common/op_kernel/mc2_kernel_utils.h"
+#include "../../common_utils/mc2_kernel_utils.h"
 #include "kernel_operator_list_tensor_intf.h"
 #include "mega_moe_base.h"
 #include "mega_moe_workspace_info.h"

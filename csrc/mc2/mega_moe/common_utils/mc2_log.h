@@ -21,7 +21,7 @@
 
 #include "mc2_common_log.h"
 
-#include "../op_kernel/mc2_tiling_struct.h"
+#include "mc2_tiling_struct.h"
 #include "tiling/tiling_api.h"
 // Not used by mega_moe — commented out to remove 3rd dependency:
 // #include "quant_batch_matmul_v3/op_kernel/arch35/quant_batch_matmul_v3_tiling_data.h"

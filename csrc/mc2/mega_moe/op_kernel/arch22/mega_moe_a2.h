@@ -22,7 +22,7 @@ using namespace AscendC;
 
 #include "kernel_operator.h"
 
-#include "../../common/op_kernel/moe_distribute_base.h"
+#include "../../common_utils/moe_distribute_base.h"
 
 #include "mega_moe_tiling_a2a3.h"
 #include "moe_init_routing_v2/moe_init_routing_v2_tiling.h"

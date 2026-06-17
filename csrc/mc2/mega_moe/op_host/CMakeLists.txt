@@ -9,6 +9,7 @@
 # -----------------------------------------------------------------------------------------------------------
 
 if (BUILD_OPEN_PROJECT)  # custom
+    add_op_to_compiled_list()
     target_sources(op_host_aclnnInner PRIVATE
         mega_moe_def.cpp
     )
@@ -19,7 +20,13 @@ if (BUILD_OPEN_PROJECT)  # custom
         OPTYPE mega_moe ACLNNTYPE aclnn_inner)
     set(SUB_MC2_COMPILE TRUE PARENT_SCOPE)
     set(MC2_OPT ON PARENT_SCOPE)
-    set(mega_moe_depends mc2/common PARENT_SCOPE)
+
+    # mc2/common sources now live under mega_moe/common_utils/
+    add_tiling_modules()
+    target_sources(${OPHOST_NAME}_tiling_obj PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../common_utils/mc2_log.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../common_utils/mc2_hcom_topo_info.cpp
+    )
 
     set(CONDITION_UNIT ${ASCEND_COMPUTE_UNIT})
     if ("${CONDITION_UNIT}" STREQUAL "ascend950")
@@ -27,6 +34,7 @@ if (BUILD_OPEN_PROJECT)  # custom
             OP_NAME MegaMoe
             OPTIONS --cce-auto-sync=off
             OPTIONS -I${OPTENSOR_INCLUDE_ROOT}
+            OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../common_utils
             OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel
             OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel/arch35
             OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel/arch35/tensor_api/include
@@ -37,8 +45,7 @@ if (BUILD_OPEN_PROJECT)  # custom
         add_ops_compile_options(
             OP_NAME MegaMoe
             OPTIONS --cce-auto-sync=off
-            OPTIONS -I${CMAKE_SOURCE_DIR}/mc2/common/op_kernel
-            OPTIONS -I${CMAKE_SOURCE_DIR}/mc2/common/inc/kernel
+            OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../common_utils
             OPTIONS -DHCCL_COMM
         )
     endif()
