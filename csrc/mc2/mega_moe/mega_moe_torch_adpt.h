@@ -44,42 +44,117 @@ std::tuple<at::Tensor, at::Tensor> npu_mega_moe(
     c10::optional<int64_t> weight1_type,
     c10::optional<int64_t> weight2_type)
 {
-    auto x_shape = x.sizes();
-    int bs = x_shape[0];
-    int h = x_shape[1];
+    // Input validation
+    TORCH_CHECK((ep_world_size > 0),
+        "The ep_world_size should be greater than 0, current is: ", ep_world_size);
+    TORCH_CHECK((x.dim() == 2) && (topk_ids.dim() == 2),
+        "The x and topk_ids should be 2D");
+    TORCH_CHECK(((x.scalar_type() == at::kBFloat16) || (x.scalar_type() == at::kHalf)) &&
+                (topk_ids.scalar_type() == at::kInt),
+        "dtype of x should be bfloat16, float16, dtype of topk_ids should be int.");
 
+    // Resolve optional tensor lists into concrete references
+    at::TensorList weight_scales1_ref;
+    if (weight_scales1.has_value()) {
+        weight_scales1_ref = weight_scales1.value();
+    } else {
+        weight_scales1_ref = at::TensorList();
+    }
+    at::TensorList weight_scales2_ref;
+    if (weight_scales2.has_value()) {
+        weight_scales2_ref = weight_scales2.value();
+    } else {
+        weight_scales2_ref = at::TensorList();
+    }
+    at::TensorList bias1_ref;
+    if (bias1.has_value()) {
+        bias1_ref = bias1.value();
+    } else {
+        bias1_ref = at::TensorList();
+    }
+    at::TensorList bias2_ref;
+    if (bias2.has_value()) {
+        bias2_ref = bias2.value();
+    } else {
+        bias2_ref = at::TensorList();
+    }
+
+    // Determine ACL data types for weights.
+    // weight1_type / weight2_type override inference from tensor scalar type.
+    aclDataType weight1_ref_dtype = weight1_type.has_value()
+        ? static_cast<aclDataType>(weight1_type.value())
+        : ConvertType(weight1[0].scalar_type());
+    aclDataType weight_scales1_dtype;
+    if (weight1_ref_dtype == aclDataType::ACL_FLOAT8_E5M2 ||
+        weight1_ref_dtype == aclDataType::ACL_FLOAT8_E4M3FN ||
+        weight1_ref_dtype == aclDataType::ACL_FLOAT4_E2M1) {
+        weight_scales1_dtype = aclDataType::ACL_FLOAT8_E8M0;
+    } else {
+        weight_scales1_dtype = aclDataType::ACL_UINT64;
+    }
+
+    aclDataType weight2_ref_dtype = weight2_type.has_value()
+        ? static_cast<aclDataType>(weight2_type.value())
+        : ConvertType(weight2[0].scalar_type());
+    aclDataType weight_scales2_dtype;
+    if (weight2_ref_dtype == aclDataType::ACL_FLOAT8_E5M2 ||
+        weight2_ref_dtype == aclDataType::ACL_FLOAT8_E4M3FN ||
+        weight2_ref_dtype == aclDataType::ACL_FLOAT4_E2M1) {
+        weight_scales2_dtype = aclDataType::ACL_FLOAT8_E8M0;
+    } else {
+        weight_scales2_dtype = aclDataType::ACL_UINT64;
+    }
+
+    // Compute output shapes
+    auto x_shape = x.sizes();
+    int64_t bs = x_shape[0];
+    int64_t h = x_shape[1];
+    int64_t num_local_experts = moe_expert_num / ep_world_size;
+
+    // Validate dispatch_quant_out_dtype for FLOAT4_E2M1
+    if ((dispatch_quant_out_dtype.has_value()) &&
+        (dispatch_quant_out_dtype.value() == static_cast<int64_t>(aclDataType::ACL_FLOAT4_E2M1))) {
+        TORCH_CHECK(h % 2 == 0,
+            "The last dim input shape must be divisible by 2 if "
+            "dispatch quant output type is float4_e2m1");
+    }
+
+    // Allocate outputs
     at::Tensor y_out = at::empty({bs, h}, x.options());
     auto opts = x.options().dtype(at::kInt);
-    int64_t num_local_experts = moe_expert_num / ep_world_size;
     at::Tensor expert_token_nums_out = at::empty({num_local_experts}, opts);
 
-    // Resolve optional params to concrete values for the ACLNN API.
+    // Resolve dispatch_quant_result_type
+    int64_t dispatch_quant_result_type = dispatch_quant_out_dtype.has_value()
+        ? static_cast<int64_t>(static_cast<aclDataType>(dispatch_quant_out_dtype.value()))
+        : 28;  // ge::DT_UNDEFINED
+
+    // Resolve float and string params
     float activation_clamp_f = activation_clamp.has_value()
         ? activation_clamp.value()
         : std::numeric_limits<float>::max();
-    int64_t dispatch_quant_out_dtype_val = dispatch_quant_out_dtype.has_value()
-        ? dispatch_quant_out_dtype.value()
-        : static_cast<int64_t>(28);  // ge::DT_UNDEFINED
 
     std::string comm_alg_str(comm_alg);
     char *comm_alg_ptr = comm_alg_str.data();
     std::string activation_str(activation);
     char *activation_ptr = activation_str.data();
 
-    // Note: weight1_type and weight2_type are accepted for API compatibility
-    // with ops-transformer but are not passed to aclnnMegaMoe — the ACLNN
-    // operator derives tensor data types from the input tensors directly.
-    (void)weight1_type;
-    (void)weight2_type;
+    // Wrap tensor lists with explicit ACL dtypes for the ACLNN operator
+    TensorListWrapper weight1_wrapper = {weight1, weight1_ref_dtype};
+    TensorListWrapper weight2_wrapper = {weight2, weight2_ref_dtype};
+    TensorListWrapper weight_scales1_wrapper = {weight_scales1_ref, weight_scales1_dtype};
+    TensorListWrapper weight_scales2_wrapper = {weight_scales2_ref, weight_scales2_dtype};
+    TensorListWrapper bias1_wrapper = {bias1_ref, aclDataType::ACL_FLOAT};
+    TensorListWrapper bias2_wrapper = {bias2_ref, aclDataType::ACL_FLOAT};
 
     EXEC_NPU_CMD(aclnnMegaMoe,
         context, x, topk_ids, topk_weights,
-        weight1, weight2,
-        weight_scales1, weight_scales2,
-        bias1, bias2,
+        weight1_wrapper, weight2_wrapper,
+        weight_scales1_wrapper, weight_scales2_wrapper,
+        bias1_wrapper, bias2_wrapper,
         x_active_mask,
         moe_expert_num, ep_world_size, ccl_buffer_size,
-        max_recv_token_num, dispatch_quant_mode, dispatch_quant_out_dtype_val,
+        max_recv_token_num, dispatch_quant_mode, dispatch_quant_result_type,
         combine_quant_mode, comm_alg_ptr,
         num_max_tokens_per_rank, activation_ptr, activation_clamp_f,
         y_out, expert_token_nums_out);
@@ -87,5 +162,5 @@ std::tuple<at::Tensor, at::Tensor> npu_mega_moe(
     return {y_out, expert_token_nums_out};
 }
 
-}
+}  // namespace vllm_ascend
 #endif
