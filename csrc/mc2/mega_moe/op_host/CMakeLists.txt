@@ -46,6 +46,7 @@ if (BUILD_OPEN_PROJECT)  # custom
             OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../common_utils
             OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel
             OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel/arch35
+            OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel/arch35/tensor_api
             OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel/arch35/tensor_api/include
             OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel/arch35/tensor_api/impl
             OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../../
