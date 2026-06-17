@@ -45,6 +45,8 @@ if (BUILD_OPEN_PROJECT)  # custom
             OP_NAME MegaMoe
             OPTIONS --cce-auto-sync=off
             OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../common_utils
+            OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel
+            OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel/arch22
             OPTIONS -DHCCL_COMM
         )
     endif()
