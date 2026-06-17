@@ -18,7 +18,7 @@
 
 #include "lib/std/tuple.h"
 #include "mega_moe_tiling.h"
-#include "util/math_util.h"
+#include "kernel_math_util.h"
 #include "mega_moe_workspace_info.h"
 
 struct Mc2MoeContext {
