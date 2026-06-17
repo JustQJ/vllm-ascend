@@ -9,9 +9,9 @@
 # -----------------------------------------------------------------------------------------------------------
 
 if (BUILD_OPEN_PROJECT)
-    file(GLOB OPTILING_SRCS
-        utils/mc2_hcom_topo_info.cpp
-        utils/mc2_log.cpp
+    set(OPTILING_SRCS
+        ${CMAKE_CURRENT_SOURCE_DIR}/utils/mc2_hcom_topo_info.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/utils/mc2_log.cpp
     )
 
     if(OPTILING_SRCS)

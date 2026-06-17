@@ -19,7 +19,7 @@ if (BUILD_OPEN_PROJECT)  # custom
         OPTYPE mega_moe ACLNNTYPE aclnn_inner)
     set(SUB_MC2_COMPILE TRUE PARENT_SCOPE)
     set(MC2_OPT ON PARENT_SCOPE)
-    set(mega_moe_depends mc2/common mc2/3rd PARENT_SCOPE)
+    set(mega_moe_depends mc2/common PARENT_SCOPE)
 
     set(CONDITION_UNIT ${ASCEND_COMPUTE_UNIT})
     if ("${CONDITION_UNIT}" STREQUAL "ascend950")
@@ -31,7 +31,6 @@ if (BUILD_OPEN_PROJECT)  # custom
             OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel/arch35
             OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel/arch35/tensor_api/include
             OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel/arch35/tensor_api/impl
-            OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../../3rd
             OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../../
         )
     else()
@@ -40,7 +39,6 @@ if (BUILD_OPEN_PROJECT)  # custom
             OPTIONS --cce-auto-sync=off
             OPTIONS -I${CMAKE_SOURCE_DIR}/mc2/common/op_kernel
             OPTIONS -I${CMAKE_SOURCE_DIR}/mc2/common/inc/kernel
-            OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../../3rd
             OPTIONS -DHCCL_COMM
         )
     endif()
