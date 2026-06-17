@@ -25,7 +25,6 @@ if (BUILD_OPEN_PROJECT)  # custom
     add_tiling_modules()
     target_sources(${OPHOST_NAME}_tiling_obj PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../common_utils/mc2_log.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../common_utils/mc2_hcom_topo_info.cpp
     )
 
     set(CONDITION_UNIT ${ASCEND_COMPUTE_UNIT})
