@@ -20,7 +20,7 @@
 #include "tiling/tiling_api.h"
 #include "graph/utils/type_utils.h"
 #include "register/tilingdata_base.h"
-#include "op_host/tiling_base.h"
+#include "tiling/tiling_base.h"
 
 namespace optiling {
 

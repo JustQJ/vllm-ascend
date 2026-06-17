@@ -15,6 +15,8 @@
 
 #include "mc2_log.h"
 
+// Not used by mega_moe — commented out to remove 3rd dependency.
+#if 0
 namespace Mc2Log {
 using namespace Mc2Tiling;
 static void PrintTCubeTilingDataSecondPart(const std::string &opName, ::TCubeTiling &tiling)
@@ -234,3 +236,4 @@ void PrintMMV3TilingData(const std::string &opName, Mc2MatMulV3TilingData &tilin
 }
 
 }  // namespace Mc2Log
+#endif  // #if 0 — Print* functions not needed by mega_moe

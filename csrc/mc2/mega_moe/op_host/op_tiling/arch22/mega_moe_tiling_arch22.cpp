@@ -24,16 +24,24 @@
 #include "register/op_def_registry.h"
 #include "mc2_log.h"
 #include "mc2_hcom_topo_info.h"
-#include "mc2_tiling_utils.h"
 #include "../../../op_kernel/arch22/mega_moe_tiling_a2a3.h"
 #include "../../../op_kernel/arch22/mega_moe_tiling_key.h"
 #include "../../../op_kernel/arch22/moe_init_routing_quant_v2/moe_init_routing_quant_v2_tiling.h"
 
 using namespace AscendC;
 using namespace ge;
-using namespace mc2tiling;
 
 namespace MegaMoeA2A3Tiling {
+
+// Local copy from mc2_tiling_utils.h — avoids pulling in 3rd party deps.
+inline std::string GetSocVersion(const gert::TilingContext *context)
+{
+    fe::PlatFormInfos *platformInfoPtr = context->GetPlatformInfo();
+    fe::PlatFormInfos &platformInfo = *platformInfoPtr;
+    std::string socVersion;
+    (void)platformInfo.GetPlatformResWithLock("version", "Short_SoC_version", socVersion);
+    return socVersion;
+}
     const char *K_INNER_DEBUG = "MegaMoeA2A3 Tiling Debug";
 
     // 算子属性索引
@@ -1173,7 +1181,7 @@ static ge::graphStatus MegaMoeA2A3TilingFuncImpl(gert::TilingContext *context)
             OP_LOGE(K_INNER_DEBUG, "dispatch_quant_out_type must be INT8 in quant mode, got %u",
                     quantOutType), return ge::GRAPH_FAILED);
     }
-    std::string socVersion = mc2tiling::GetSocVersion(context);
+    std::string socVersion = GetSocVersion(context);
     uint32_t archCode = socVersion == "Ascend910B" ? SOC_ASCEND910B : SOC_ASCEND910_93;
 
     uint64_t tilingKey = GET_TPL_TILING_KEY(

@@ -10,8 +10,6 @@
 
 if (BUILD_OPEN_PROJECT)
     file(GLOB OPTILING_SRCS
-        op_host/op_tiling/mc2_tiling_utils.cpp
-        op_host/op_tiling/matmul_formulaic_tiling.cpp
         utils/mc2_hcom_topo_info.cpp
         utils/mc2_log.cpp
     )
