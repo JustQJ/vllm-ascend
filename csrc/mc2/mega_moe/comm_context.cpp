@@ -14,10 +14,11 @@
  * limitations under the License.
  */
 
-#include "comm_context.h"
-#include "hccl_common.h"
+
 #include <torch/extension.h>
 #include <torch_npu/csrc/framework/utils/OpAdapter.h>
+#include "comm_context.h"
+#include "hccl_common.h"
 #include <unordered_map>
 #include <vector>
 #include <cstring>
