@@ -1,13 +1,13 @@
 import random
+import traceback
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch_npu
-from torch.distributed.distributed_c10d import _get_default_group
 
 from vllm_ascend.ops.mega_moe import get_symm_buffer_for_mega_moe, mega_moe
-from vllm_ascend.utils import enable_custom_op, bootstrap_custom_op_env
+from vllm_ascend.utils import bootstrap_custom_op_env, enable_custom_op
 
 enable_custom_op()
 
@@ -20,7 +20,7 @@ try:
 
     # register the meta implementation for custom kernel if necessary
     import vllm_ascend.meta_registration  # type: ignore  # noqa: F401
-except ImportError as e:
+except ImportError:
     pass
 
 
@@ -28,18 +28,31 @@ def _ceil(a, b):
     return (a + b - 1) // b
 
 
+def _get_float8_e8m0_dtype():
+    for module, name in (
+        (torch, "float8_e8m0fnu"),
+        (torch, "float8_e8m0"),
+        (torch_npu, "float8_e8m0fnu"),
+        (torch_npu, "float8_e8m0"),
+    ):
+        if hasattr(module, name):
+            return getattr(module, name)
+    raise RuntimeError("float8_e8m0 dtype is not available")
+
+
 class TestMegaMoe:
+
     def __init__(self, rank, world_size, port):
         self.rank = rank
         self.world_size = world_size
         self.master_ip = "127.0.0.1"
         self.port = port
+        self.ep_group = None
 
     def get_hcomm(self, comm_group):
         if torch.__version__ > "2.0.1":
             return comm_group._get_backend(torch.device("npu")).get_hccl_comm_name(self.rank)
-        else:
-            return comm_group.get_hccl_comm_name(self.rank)
+        return comm_group.get_hccl_comm_name(self.rank)
 
     def generate_hcom(self):
         torch_npu.npu.set_device(self.rank)
@@ -49,27 +62,85 @@ class TestMegaMoe:
             world_size=self.world_size,
             init_method=f"tcp://127.0.0.1:{self.port}",
         )
-        if dist.is_available():
-            default_pg = _get_default_group()
-        self.hcomm_info = self.get_hcomm(default_pg)
         self.ep_group = dist.new_group(
             backend="hccl",
             ranks=list(range(self.world_size)),
         )
+        self.hcomm_info = self.get_hcomm(self.ep_group)
+        assert self.hcomm_info, "HCCL comm name is empty"
 
-    # ------------------------------------------------------------------
-    # non-quantized (float32 weights, no scales, no bias)
-    # ------------------------------------------------------------------
-    def run_no_quant_num_experts(self, num_experts: int, num_topk: int,
-                                  bs: int, hidden: int, intermediate: int) -> bool:
-        torch_npu.npu.set_device(self.rank)
-        e = num_experts // self.world_size
+    @staticmethod
+    def check_output(y, expert_token_nums, x, local_expert_num) -> bool:
+        torch_npu.npu.synchronize()
+        return (
+            y.shape == x.shape
+            and y.dtype == x.dtype
+            and expert_token_nums.shape == (local_expert_num,)
+            and expert_token_nums.dtype == torch.int32
+        )
+
+    def _make_quant_inputs(self, weight_dtype):
+        bs, hidden, num_topk, local_expert_num, intermediate = 256, 4096, 6, 4, 1024
+        num_experts = local_expert_num * self.world_size
+        intermediate_per_gate = intermediate // 2
 
         x = torch.randn(bs, hidden, dtype=torch.bfloat16).npu()
-        topk_ids = torch.randint(0, num_experts, (bs, num_topk), dtype=torch.int32).npu()
+        topk_ids = torch.stack([
+            torch.randperm(num_experts)[:num_topk] for _ in range(bs)
+        ]).to(torch.int32).npu()
         topk_weights = torch.randn(bs, num_topk, dtype=torch.bfloat16).npu()
-        w1 = torch.randn(e, intermediate, hidden, dtype=torch.float32).npu()
-        w2 = torch.randn(e, hidden, intermediate * 2, dtype=torch.float32).npu()
+
+        weight1 = torch.randn(
+            local_expert_num, intermediate, hidden, dtype=torch.float32
+        ).to(weight_dtype).npu()
+        weight2 = torch.randn(
+            local_expert_num, hidden, intermediate_per_gate, dtype=torch.float32
+        ).to(weight_dtype).npu()
+
+        fp8_e8m0 = _get_float8_e8m0_dtype()
+        w1_scale_shape = (local_expert_num, intermediate, _ceil(hidden, 64), 2)
+        w2_scale_shape = (
+            local_expert_num,
+            hidden,
+            _ceil(intermediate_per_gate, 64),
+            2,
+        )
+        w1_scales = torch.randint(
+            125, 130, w1_scale_shape, dtype=torch.uint8
+        ).view(fp8_e8m0).npu()
+        w2_scales = torch.randint(
+            125, 130, w2_scale_shape, dtype=torch.uint8
+        ).view(fp8_e8m0).npu()
+
+        return (
+            x,
+            topk_ids,
+            topk_weights,
+            [weight1],
+            [weight2],
+            [w1_scales],
+            [w2_scales],
+            num_experts,
+            num_topk,
+            hidden,
+            local_expert_num,
+        )
+
+    def run_quant(self, weight_dtype, dispatch_quant_out_dtype) -> bool:
+        torch_npu.npu.set_device(self.rank)
+        (
+            x,
+            topk_ids,
+            topk_weights,
+            l1_weights,
+            l2_weights,
+            l1_weights_sf,
+            l2_weights_sf,
+            num_experts,
+            num_topk,
+            hidden,
+            local_expert_num,
+        ) = self._make_quant_inputs(weight_dtype)
 
         sym_buffer = get_symm_buffer_for_mega_moe(
             self.ep_group,
@@ -77,105 +148,79 @@ class TestMegaMoe:
             num_max_tokens_per_rank=0,
             num_topk=num_topk,
             hidden=hidden,
-            intermediate_hidden=intermediate,
-            dispatch_quant_mode=0,
+            intermediate_hidden=0,
+            dispatch_quant_mode=4,
+            dispatch_quant_out_dtype=dispatch_quant_out_dtype,
         )
-        mega_moe(
+        y, expert_token_nums = mega_moe(
             sym_buffer=sym_buffer,
             x=x,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
-            l1_weights=[w1],
-            l2_weights=[w2],
+            l1_weights=l1_weights,
+            l2_weights=l2_weights,
+            l1_weights_sf=l1_weights_sf,
+            l2_weights_sf=l2_weights_sf,
         )
-        return True
+        return self.check_output(y, expert_token_nums, x, local_expert_num)
 
-    def run_no_quant(self) -> bool:
-        return self.run_no_quant_num_experts(
-            num_experts=8, num_topk=6, bs=256, hidden=4096, intermediate=1024)
-
-    # ------------------------------------------------------------------
-    # MXFP quantized (float8_e5m2 weights + float8_e8m0 scales)
-    # ------------------------------------------------------------------
-    def run_quant(self) -> bool:
+    def run_quant_e5m2(self) -> bool:
         if not hasattr(torch, "float8_e5m2"):
             return True
+        return self.run_quant(torch.float8_e5m2, 23)
 
-        torch_npu.npu.set_device(self.rank)
-        num_experts = 8
-        num_topk = 6
-        bs = 256
-        hidden = 4096
-        intermediate = 1024
-        e = num_experts // self.world_size
-
-        x = torch.randn(bs, hidden, dtype=torch.bfloat16).npu()
-        topk_ids = torch.randint(0, num_experts, (bs, num_topk), dtype=torch.int32).npu()
-        topk_weights = torch.randn(bs, num_topk, dtype=torch.bfloat16).npu()
-
-        w1 = torch.randn(e, intermediate, hidden, dtype=torch.float32).to(torch.float8_e5m2).npu()
-        w1_scale_shape = (e, intermediate, _ceil(hidden, 64), 2)
-        w1_scales = (
-            torch.randint(125, 130, w1_scale_shape, dtype=torch.uint8)
-            .view(torch.float8_e8m0fnu).npu()
-        )
-
-        w2 = torch.randn(e, hidden, intermediate * 2, dtype=torch.float32).to(torch.float8_e5m2).npu()
-        w2_scale_shape = (e, hidden, _ceil(intermediate * 2, 64), 2)
-        w2_scales = (
-            torch.randint(125, 130, w2_scale_shape, dtype=torch.uint8)
-            .view(torch.float8_e8m0fnu).npu()
-        )
-
-        sym_buffer = get_symm_buffer_for_mega_moe(
-            self.ep_group,
-            num_experts=num_experts,
-            num_max_tokens_per_rank=0,
-            num_topk=num_topk,
-            hidden=hidden,
-            intermediate_hidden=intermediate,
-            dispatch_quant_mode=4,
-            dispatch_quant_out_dtype=23,  # FLOAT8_E5M2
-        )
-        mega_moe(
-            sym_buffer=sym_buffer,
-            x=x,
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
-            l1_weights=[w1],
-            l2_weights=[w2],
-            l1_weights_sf=[w1_scales],
-            l2_weights_sf=[w2_scales],
-        )
-        return True
+    def run_quant_e4m3(self) -> bool:
+        if not hasattr(torch, "float8_e4m3fn"):
+            return True
+        return self.run_quant(torch.float8_e4m3fn, 24)
 
 
-def worker(rank: int, world_size: int, port: int, q: mp.SimpleQueue):
-    op = TestMegaMoe(rank, world_size, port)
-    op.generate_hcom()
-    out1 = op.run_no_quant()
-    q.put(out1)
-    out2 = op.run_quant()
-    q.put(out2)
+def _worker(rank: int, world_size: int, port: int, q: mp.SimpleQueue, dtype_name: str):
+    try:
+        op = TestMegaMoe(rank, world_size, port)
+        op.generate_hcom()
+        if dtype_name == "e5m2":
+            result = op.run_quant_e5m2()
+        elif dtype_name == "e4m3":
+            result = op.run_quant_e4m3()
+        else:
+            raise ValueError(f"Unsupported mega_moe dtype case: {dtype_name}")
+        q.put((rank, True, result, ""))
+    except Exception:
+        q.put((rank, False, False, traceback.format_exc()))
+        raise
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
-@torch.inference_mode()
-def test_mega_moe_kernel():
+def _run_mega_moe_case(dtype_name: str):
     world_size = 2
-    mp.set_start_method("fork", force=True)
-
-    q = mp.SimpleQueue()
+    ctx = mp.get_context("spawn")
+    q = ctx.SimpleQueue()
     p_list = []
     port = 29501 + random.randint(0, 10000)
 
     for rank in range(world_size):
-        p = mp.Process(target=worker, args=(rank, world_size, port, q))
+        p = ctx.Process(target=_worker, args=(rank, world_size, port, q, dtype_name))
         p.start()
         p_list.append(p)
 
-    results = [q.get() for _ in range(world_size * 2)]
+    results = [q.get() for _ in range(world_size)]
 
     for p in p_list:
         p.join()
 
-    assert all(results)
+    errors = [msg for msg in results if not msg[1] or not msg[2]]
+    assert not errors, errors
+    assert all(p.exitcode == 0 for p in p_list)
+
+
+@torch.inference_mode()
+def test_mega_moe_fp8_e5m2():
+    _run_mega_moe_case("e5m2")
+
+
+@torch.inference_mode()
+def test_mega_moe_fp8_e4m3():
+    _run_mega_moe_case("e4m3")
