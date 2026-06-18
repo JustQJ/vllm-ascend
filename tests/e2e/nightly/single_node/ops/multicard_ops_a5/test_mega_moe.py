@@ -132,8 +132,8 @@ class TestMegaMoe:
             topk_weights=topk_weights,
             l1_weights=[w1],
             l2_weights=[w2],
-            l1_scales=[w1_scales],
-            l2_scales=[w2_scales],
+            l1_weights_sf=[w1_scales],
+            l2_weights_sf=[w2_scales],
         )
         return True
 

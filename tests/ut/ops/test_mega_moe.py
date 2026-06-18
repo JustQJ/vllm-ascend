@@ -56,11 +56,11 @@ class TestMegaMoeSignature:
     def test_ccl_buffer_size_no_quant(self):
         """CCL buffer size works with default (non-quantized) params."""
         size = npu_get_mega_moe_ccl_buffer_size(
-            ep_world_size=1,
+            ep_world_size=2,
             moe_expert_num=4,
-            num_max_tokens_per_rank=0,
+            num_max_tokens_per_rank=1,
             num_topk=2,
-            hidden=512,
+            hidden=1024,
         )
         assert isinstance(size, int)
         assert size > 0
