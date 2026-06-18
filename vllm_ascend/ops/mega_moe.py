@@ -103,6 +103,25 @@ def _resolve_backend() -> str:
     return "kfc"
 
 
+def _get_hccl_comm_name(group: dist.ProcessGroup, rank_id: int) -> str:
+    backend = group._get_backend(torch.device("npu"))
+    get_comm_name = backend.get_hccl_comm_name
+    try:
+        group_name = get_comm_name(rank_id, init_comm=False)
+    except TypeError:
+        group_name = get_comm_name(rank_id)
+    if group_name:
+        return group_name
+
+    try:
+        group_name = get_comm_name(rank_id, init_comm=True)
+    except TypeError:
+        group_name = get_comm_name(rank_id)
+    if not group_name:
+        raise RuntimeError("Failed to get a non-empty HCCL comm name for mega_moe EP group.")
+    return group_name
+
+
 def npu_get_mega_moe_ccl_buffer_size(
     ep_world_size: int,
     moe_expert_num: int,
@@ -223,9 +242,7 @@ class SymmBuffer:
         # --- Communication metadata ---
         self.group = group
         self.rank_id = dist.get_rank(group)
-        self.group_name = group._get_backend(torch.device("npu")).get_hccl_comm_name(
-            self.rank_id, init_comm=False
-        )
+        self.group_name = _get_hccl_comm_name(group, self.rank_id)
         self.ep_world_size = dist.get_world_size(group)
 
         # --- Create HCCL communication context ---
