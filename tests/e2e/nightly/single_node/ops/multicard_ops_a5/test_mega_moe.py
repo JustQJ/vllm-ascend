@@ -5,7 +5,6 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch_npu
-from torch.distributed.distributed_c10d import _get_default_group
 
 from vllm_ascend.ops.mega_moe import get_symm_buffer_for_mega_moe, mega_moe
 from vllm_ascend.utils import bootstrap_custom_op_env, enable_custom_op
@@ -58,7 +57,11 @@ class MegaMoeRunner:
             world_size=self.world_size,
             init_method=f"tcp://127.0.0.1:{self.port}",
         )
-        self.ep_group = _get_default_group()
+        self.ep_group = dist.new_group(backend="hccl", ranks=list(range(self.world_size)))
+
+        hcoom_info = self.ep_group._get_backend(torch.device("npu")).get_hccl_comm_name(self.rank)
+
+        assert hcoom_info, "Failed to get a valid HCCL comm name for mega_moe EP group."
 
     @staticmethod
     def check_output(y, expert_token_nums, x, local_expert_num) -> bool:
