@@ -19,7 +19,7 @@ try:
     import vllm_ascend.vllm_ascend_C  # type: ignore  # noqa: F401
 
     # register the meta implementation for custom kernel if necessary
-    import vllm_ascend.meta_registration  # type: ignore  # noqa: F401
+    # import vllm_ascend.meta_registration  # type: ignore  # noqa: F401
 except ImportError:
     pass
 
