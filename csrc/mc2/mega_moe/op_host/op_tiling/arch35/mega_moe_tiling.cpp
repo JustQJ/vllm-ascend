@@ -224,28 +224,28 @@ static ge::graphStatus CheckAttrParams(const gert::TilingContext *context, MegaM
 
     auto epWorldSizePtr = attrs->GetAttrPointer<int64_t>((config.attrEpWorldSizeIndex));
     int64_t epWorldSize = static_cast<int64_t>(*epWorldSizePtr);
-    OP_TILING_CHECK(epWorldSize < MIN_EP_WORLD_SIZE || epWorldSize > MAX_EP_WORLD_SIZE,
-        OP_LOGE_FOR_INVALID_VALUE(nodeName, "epWorldSize",
-            std::to_string(epWorldSize).c_str(),
-            (std::string("should in [") + std::to_string(MIN_EP_WORLD_SIZE) + ", " +
-             std::to_string(MAX_EP_WORLD_SIZE) + "]").c_str()),
-        return ge::GRAPH_FAILED);
+    // OP_TILING_CHECK(epWorldSize < MIN_EP_WORLD_SIZE || epWorldSize > MAX_EP_WORLD_SIZE,
+    //     OP_LOGE_FOR_INVALID_VALUE(nodeName, "epWorldSize",
+    //         std::to_string(epWorldSize).c_str(),
+    //         (std::string("should in [") + std::to_string(MIN_EP_WORLD_SIZE) + ", " +
+    //          std::to_string(MAX_EP_WORLD_SIZE) + "]").c_str()),
+    //     return ge::GRAPH_FAILED);
 
     auto moeExpertNumPtr = attrs->GetAttrPointer<int64_t>((config.attrMoeExpertNumIndex));
     int64_t moeExpertNum = static_cast<int64_t>(*moeExpertNumPtr);
-    OP_TILING_CHECK((moeExpertNum < epWorldSize || moeExpertNum > MAX_MOE_EXPERT_NUM) || (moeExpertNum % epWorldSize),
-        OP_LOGE_FOR_INVALID_VALUE(nodeName, "moeExpertNum",
-            std::to_string(moeExpertNum).c_str(),
-            (std::string("should in [") + std::to_string(epWorldSize) + ", " +
-             std::to_string(MAX_MOE_EXPERT_NUM) + "] and mod(..., epWorldSize(" +
-             std::to_string(epWorldSize) + ")) == 0").c_str()),
-        return ge::GRAPH_FAILED);
+    // OP_TILING_CHECK((moeExpertNum < epWorldSize || moeExpertNum > MAX_MOE_EXPERT_NUM) || (moeExpertNum % epWorldSize),
+    //     OP_LOGE_FOR_INVALID_VALUE(nodeName, "moeExpertNum",
+    //         std::to_string(moeExpertNum).c_str(),
+    //         (std::string("should in [") + std::to_string(epWorldSize) + ", " +
+    //          std::to_string(MAX_MOE_EXPERT_NUM) + "] and mod(..., epWorldSize(" +
+    //          std::to_string(epWorldSize) + ")) == 0").c_str()),
+    //     return ge::GRAPH_FAILED);
 
-    OP_TILING_CHECK(moeExpertNum != expertPerRank * epWorldSize,
-        OP_LOGE_FOR_INVALID_VALUE(nodeName, "moeExpertNum",
-            std::to_string(moeExpertNum).c_str(),
-            (std::string("should equal ") + std::to_string(expertPerRank * epWorldSize)).c_str()),
-        return ge::GRAPH_FAILED);
+    // OP_TILING_CHECK(moeExpertNum != expertPerRank * epWorldSize,
+    //     OP_LOGE_FOR_INVALID_VALUE(nodeName, "moeExpertNum",
+    //         std::to_string(moeExpertNum).c_str(),
+    //         (std::string("should equal ") + std::to_string(expertPerRank * epWorldSize)).c_str()),
+    //     return ge::GRAPH_FAILED);
 
     // maskRecv Size
     int64_t compareCount = ops::CeilAlign((int64_t)(bs * topK * sizeof(int32_t)), (int64_t)(ALIGN_256))
@@ -271,14 +271,14 @@ static ge::graphStatus CheckAttrParams(const gert::TilingContext *context, MegaM
         return ge::GRAPH_FAILED);
     OP_LOGD(nodeName, "cclBufferSize is %ld, leastCclBufferSize is %ld", cclBufferSize, leastCclBufferSize);
 
-    auto maxRecvTokenNumPtr = attrs->GetAttrPointer<int64_t>((config.attrMaxRecvTokenNumIndex));
-    int64_t maxRecvTokenNum = static_cast<int64_t>(*maxRecvTokenNumPtr);
-    OP_TILING_CHECK(maxRecvTokenNum < 0 || maxRecvTokenNum > bs * epWorldSize * std::min(topK, expertPerRank),
-        OP_LOGE_FOR_INVALID_VALUE(nodeName, "maxRecvTokenNum",
-            std::to_string(maxRecvTokenNum).c_str(),
-            (std::string("should in [0, ") +
-             std::to_string(bs * epWorldSize * std::min(topK, expertPerRank)) + "]").c_str()),
-        return ge::GRAPH_FAILED);
+    // auto maxRecvTokenNumPtr = attrs->GetAttrPointer<int64_t>((config.attrMaxRecvTokenNumIndex));
+    // int64_t maxRecvTokenNum = static_cast<int64_t>(*maxRecvTokenNumPtr);
+    // OP_TILING_CHECK(maxRecvTokenNum < 0 || maxRecvTokenNum > bs * epWorldSize * std::min(topK, expertPerRank),
+    //     OP_LOGE_FOR_INVALID_VALUE(nodeName, "maxRecvTokenNum",
+    //         std::to_string(maxRecvTokenNum).c_str(),
+    //         (std::string("should in [0, ") +
+    //          std::to_string(bs * epWorldSize * std::min(topK, expertPerRank)) + "]").c_str()),
+    //     return ge::GRAPH_FAILED);
 
     auto dispatchQuantModePtr = attrs->GetAttrPointer<int64_t>((config.attrDispatchQuantModeIndex));
     int64_t dispatchQuantMode = static_cast<int64_t>(*dispatchQuantModePtr);
@@ -862,35 +862,35 @@ static ge::graphStatus CheckInputParam(const gert::TilingContext *context, MegaM
              std::to_string(MAX_BS) + "]").c_str()),
         return ge::GRAPH_FAILED);
 
-    int64_t xDim1 = xStorageShape->GetStorageShape().GetDim(1);
-    OP_TILING_CHECK(xDim1 != 4LL * H_BASE && xDim1 != 5LL * H_BASE && xDim1 != 7LL * H_BASE,
-        OP_LOGE_FOR_INVALID_VALUE(nodeName, "H", std::to_string(xDim1).c_str(),
-            "only support 4k/5k/7k"),
-        return ge::GRAPH_FAILED);
+    // int64_t xDim1 = xStorageShape->GetStorageShape().GetDim(1);
+    // OP_TILING_CHECK(xDim1 != 4LL * H_BASE && xDim1 != 5LL * H_BASE && xDim1 != 7LL * H_BASE,
+    //     OP_LOGE_FOR_INVALID_VALUE(nodeName, "H", std::to_string(xDim1).c_str(),
+    //         "only support 4k/5k/7k"),
+    //     return ge::GRAPH_FAILED);
 
-    const gert::StorageShape *topkIdsStorageShape = context->GetInputShape(config.topkIdsIndex);
-    int64_t topkIdsDim1 = topkIdsStorageShape->GetStorageShape().GetDim(1);
-    OP_TILING_CHECK(topkIdsDim1 != 6LL && topkIdsDim1 != 8LL,
-        OP_LOGE_FOR_INVALID_VALUE(nodeName, "topK", std::to_string(topkIdsDim1).c_str(),
-            "only support 6/8"),
-        return ge::GRAPH_FAILED);
+    // const gert::StorageShape *topkIdsStorageShape = context->GetInputShape(config.topkIdsIndex);
+    // int64_t topkIdsDim1 = topkIdsStorageShape->GetStorageShape().GetDim(1);
+    // OP_TILING_CHECK(topkIdsDim1 != 6LL && topkIdsDim1 != 8LL,
+    //     OP_LOGE_FOR_INVALID_VALUE(nodeName, "topK", std::to_string(topkIdsDim1).c_str(),
+    //         "only support 6/8"),
+    //     return ge::GRAPH_FAILED);
 
-    auto weightOneStorageShape = context->GetDynamicInputShape(config.weight1Index, 0);
-    OP_CHECK_NULL_WITH_CONTEXT(context, weightOneStorageShape);
-    int64_t weightOneDim0 = weightOneStorageShape->GetStorageShape().GetDim(0);
-    OP_TILING_CHECK(weightOneDim0 < MIN_EXPERT_PER_RANK || weightOneDim0 > MAX_EXPERT_PER_RANK,
-        OP_LOGE_FOR_INVALID_VALUE(nodeName, "expertPerRank", std::to_string(weightOneDim0).c_str(),
-            (std::string("should in [") + std::to_string(MIN_EXPERT_PER_RANK) + ", " +
-             std::to_string(MAX_EXPERT_PER_RANK) + "]").c_str()),
-        return ge::GRAPH_FAILED);
+    // auto weightOneStorageShape = context->GetDynamicInputShape(config.weight1Index, 0);
+    // OP_CHECK_NULL_WITH_CONTEXT(context, weightOneStorageShape);
+    // int64_t weightOneDim0 = weightOneStorageShape->GetStorageShape().GetDim(0);
+    // OP_TILING_CHECK(weightOneDim0 < MIN_EXPERT_PER_RANK || weightOneDim0 > MAX_EXPERT_PER_RANK,
+    //     OP_LOGE_FOR_INVALID_VALUE(nodeName, "expertPerRank", std::to_string(weightOneDim0).c_str(),
+    //         (std::string("should in [") + std::to_string(MIN_EXPERT_PER_RANK) + ", " +
+    //          std::to_string(MAX_EXPERT_PER_RANK) + "]").c_str()),
+    //     return ge::GRAPH_FAILED);
 
-    int64_t weightOneDim1 = weightOneStorageShape->GetStorageShape().GetDim(1);
-    OP_TILING_CHECK(weightOneDim1 != 1LL * HIDDEN_DIM_BASE && weightOneDim1 != 2LL * HIDDEN_DIM_BASE &&
-                    weightOneDim1 != 3LL * HIDDEN_DIM_BASE && weightOneDim1 != 4LL * HIDDEN_DIM_BASE &&
-                    weightOneDim1 != 7LL * HIDDEN_DIM_BASE,
-        OP_LOGE_FOR_INVALID_VALUE(nodeName, "hiddenDim", std::to_string(weightOneDim1).c_str(),
-            "only support 1k/2k/3k/4k/7k"),
-        return ge::GRAPH_FAILED);
+    // int64_t weightOneDim1 = weightOneStorageShape->GetStorageShape().GetDim(1);
+    // OP_TILING_CHECK(weightOneDim1 != 1LL * HIDDEN_DIM_BASE && weightOneDim1 != 2LL * HIDDEN_DIM_BASE &&
+    //                 weightOneDim1 != 3LL * HIDDEN_DIM_BASE && weightOneDim1 != 4LL * HIDDEN_DIM_BASE &&
+    //                 weightOneDim1 != 7LL * HIDDEN_DIM_BASE,
+    //     OP_LOGE_FOR_INVALID_VALUE(nodeName, "hiddenDim", std::to_string(weightOneDim1).c_str(),
+    //         "only support 1k/2k/3k/4k/7k"),
+    //     return ge::GRAPH_FAILED);
     
     return ge::GRAPH_SUCCESS;
 }
