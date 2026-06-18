@@ -23,8 +23,6 @@ if (BUILD_OPEN_PROJECT)  # custom
         mega_moe_def.cpp
     )
     add_modules_sources_with_soc(
-        OP_API_INDEPENDENT ON
-        OP_API_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../op_api
         OP_MC2_ENABLE ON
         OPTYPE mega_moe ACLNNTYPE aclnn_inner)
     set(SUB_MC2_COMPILE TRUE PARENT_SCOPE)
