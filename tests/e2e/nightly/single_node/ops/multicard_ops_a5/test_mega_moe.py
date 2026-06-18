@@ -145,6 +145,7 @@ class MegaMoeRunner:
             intermediate_hidden=0,
             dispatch_quant_mode=4,
             dispatch_quant_out_dtype=dispatch_quant_out_dtype,
+            max_recv_token_num=1024*8,
         )
         y, expert_token_nums = mega_moe(
             sym_buffer=sym_buffer,
