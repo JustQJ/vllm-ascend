@@ -110,15 +110,11 @@ def _get_hccl_comm_name(group: dist.ProcessGroup, rank_id: int) -> str:
         group_name = get_comm_name(rank_id, init_comm=False)
     except TypeError:
         group_name = get_comm_name(rank_id)
-    if group_name:
-        return group_name
-
-    try:
-        group_name = get_comm_name(rank_id, init_comm=True)
-    except TypeError:
-        group_name = get_comm_name(rank_id)
     if not group_name:
-        raise RuntimeError("Failed to get a non-empty HCCL comm name for mega_moe EP group.")
+        raise RuntimeError(
+            "Failed to get a non-empty HCCL comm name for mega_moe EP group. "
+            "The group must be initialized before calling get_symm_buffer_for_mega_moe."
+        )
     return group_name
 
 
