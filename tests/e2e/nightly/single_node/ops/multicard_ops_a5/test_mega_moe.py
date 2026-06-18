@@ -7,12 +7,21 @@ import torch_npu
 from torch.distributed.distributed_c10d import _get_default_group
 
 from vllm_ascend.ops.mega_moe import get_symm_buffer_for_mega_moe, mega_moe
-from vllm_ascend.utils import enable_custom_op
+from vllm_ascend.utils import enable_custom_op, bootstrap_custom_op_env
 
 enable_custom_op()
 
-import vllm_ascend.vllm_ascend_C  # type: ignore  # noqa: F401
-import vllm_ascend.meta_registration  # type: ignore  # noqa: F401
+try:
+    if not torch.compiler.is_compiling():
+        bootstrap_custom_op_env()
+    # isort: off
+    # register custom ops into torch_library here
+    import vllm_ascend.vllm_ascend_C  # type: ignore  # noqa: F401
+
+    # register the meta implementation for custom kernel if necessary
+    import vllm_ascend.meta_registration  # type: ignore  # noqa: F401
+except ImportError as e:
+    pass
 
 
 def _ceil(a, b):
