@@ -20,18 +20,11 @@
 #include <dlfcn.h>
 #include <cstdio>
 #include <cstdlib>
-#include <ATen/Tensor.h>
-#include <acl/acl_base.h>
-#include <acl/acl_rt.h>
 #include <c10/util/Exception.h>
-#include "torch_npu/csrc/core/npu/NPUStream.h"
-#include "torch_npu/csrc/framework/OpCommand.h"
-#include "torch_npu/csrc/framework/interface/EnvVariables.h"
-#include "torch_npu/csrc/aten/NPUNativeFunctions.h"
-#include "torch_npu/csrc/core/npu/DeviceUtils.h"
-#include "hccl/hccl_res.h"
-#include "hccl/hcomm_res_defs.h"
-#include "hccl/hccl_rank_graph.h"
+#include <acl/acl_base.h>
+#include <hccl/hccl_res.h>
+#include <hccl/hcomm_res_defs.h>
+#include <hccl/hccl_rank_graph.h>
 
 namespace vllm_ascend {
 
