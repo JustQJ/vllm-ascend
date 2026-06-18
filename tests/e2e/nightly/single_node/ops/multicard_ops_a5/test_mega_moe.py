@@ -11,6 +11,9 @@ from vllm_ascend.utils import enable_custom_op
 
 enable_custom_op()
 
+import vllm_ascend.vllm_ascend_C  # type: ignore  # noqa: F401
+import vllm_ascend.meta_registration  # type: ignore  # noqa: F401
+
 
 def _ceil(a, b):
     return (a + b - 1) // b
