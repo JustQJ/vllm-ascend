@@ -110,6 +110,18 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Debug only. Use the slow PyTorch lightning_indexer implementation to
+    # collect pre-topk score. Default: disabled. Valid values: 0 or 1. Not
+    # sensitive. Do not enable in performance runs.
+    "VLLM_ASCEND_USE_PYTORCH_LIGHTNING_INDEXER": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_USE_PYTORCH_LIGHTNING_INDEXER", "0"))
+    ),
+    # Debug only. If set, the PyTorch lightning_indexer implementation saves
+    # pre-topk score tensors to this directory with torch.save. Default: None.
+    # Not sensitive, but the dumped tensors may contain model/runtime data.
+    "VLLM_ASCEND_LIGHTNING_INDEXER_SCORE_DUMP_DIR": lambda: os.getenv(
+        "VLLM_ASCEND_LIGHTNING_INDEXER_SCORE_DUMP_DIR", None
+    ),
 }
 
 # end-env-vars-definition

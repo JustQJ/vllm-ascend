@@ -22,6 +22,11 @@ import torch.nn.functional as F
 import torch_npu
 from vllm.triton_utils import HAS_TRITON
 
+from vllm_ascend import envs
+from vllm_ascend.attention.lightning_indexer_torch import (
+    pytorch_lightning_indexer,
+    pytorch_quant_lightning_indexer,
+)
 from vllm_ascend.device.mxfp_compat import (
     FLOAT8_E8M0FNU_DTYPE,
     QUANT_DTYPES,
@@ -389,48 +394,94 @@ class BaseDeviceAdaptor:
             assert q_li_scale is not None
             assert q_li_shape_ori is not None
             weights = weights.to(torch.float16)
-            topk_indices = torch.ops._C_ascend.npu_lightning_indexer_quant(
-                query=q_li.view(q_li_shape_ori),
-                key=kv_cache[2],
-                weights=weights,
-                query_dequant_scale=q_li_scale.view(q_li_shape_ori[:-1]),
-                key_dequant_scale=kv_cache[3].squeeze(2),  # B S N D -> B S D
-                actual_seq_lengths_query=actual_seq_lengths_query,
-                actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=attn_metadata.block_table,
-                query_quant_mode=0,
-                key_quant_mode=0,
-                layout_query="TND",
-                layout_key="PA_BSND",
-                sparse_count=2048,
-                sparse_mode=3,
-            )
+            if envs.VLLM_ASCEND_USE_PYTORCH_LIGHTNING_INDEXER:
+                topk_indices, _ = pytorch_quant_lightning_indexer(
+                    query=q_li.view(q_li_shape_ori),
+                    key=kv_cache[2],
+                    weights=weights,
+                    query_dequant_scale=q_li_scale.view(q_li_shape_ori[:-1]),
+                    key_dequant_scale=kv_cache[3].squeeze(2),  # B S N D -> B S D
+                    actual_seq_lengths_query=actual_seq_lengths_query,
+                    actual_seq_lengths_key=actual_seq_lengths_key,
+                    block_table=attn_metadata.block_table,
+                    query_quant_mode=0,
+                    key_quant_mode=0,
+                    layout_query="TND",
+                    layout_key="PA_BSND",
+                    sparse_count=2048,
+                    sparse_mode=3,
+                )
+            else:
+                topk_indices = torch.ops._C_ascend.npu_lightning_indexer_quant(
+                    query=q_li.view(q_li_shape_ori),
+                    key=kv_cache[2],
+                    weights=weights,
+                    query_dequant_scale=q_li_scale.view(q_li_shape_ori[:-1]),
+                    key_dequant_scale=kv_cache[3].squeeze(2),  # B S N D -> B S D
+                    actual_seq_lengths_query=actual_seq_lengths_query,
+                    actual_seq_lengths_key=actual_seq_lengths_key,
+                    block_table=attn_metadata.block_table,
+                    query_quant_mode=0,
+                    key_quant_mode=0,
+                    layout_query="TND",
+                    layout_key="PA_BSND",
+                    sparse_count=2048,
+                    sparse_mode=3,
+                )
         elif sfa_impl.use_torch_npu_lightning_indexer:
-            topk_indices, _ = torch_npu.npu_lightning_indexer(
-                query=q_li,
-                key=kv_cache[2],
-                weights=weights,
-                actual_seq_lengths_query=actual_seq_lengths_query,
-                actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=attn_metadata.block_table,
-                layout_query="TND",
-                layout_key="PA_BSND",
-                sparse_count=2048,
-                sparse_mode=3,
-            )
+            if envs.VLLM_ASCEND_USE_PYTORCH_LIGHTNING_INDEXER:
+                topk_indices, _ = pytorch_lightning_indexer(
+                    query=q_li,
+                    key=kv_cache[2],
+                    weights=weights,
+                    actual_seq_lengths_query=actual_seq_lengths_query,
+                    actual_seq_lengths_key=actual_seq_lengths_key,
+                    block_table=attn_metadata.block_table,
+                    layout_query="TND",
+                    layout_key="PA_BSND",
+                    sparse_count=2048,
+                    sparse_mode=3,
+                )
+            else:
+                topk_indices, _ = torch_npu.npu_lightning_indexer(
+                    query=q_li,
+                    key=kv_cache[2],
+                    weights=weights,
+                    actual_seq_lengths_query=actual_seq_lengths_query,
+                    actual_seq_lengths_key=actual_seq_lengths_key,
+                    block_table=attn_metadata.block_table,
+                    layout_query="TND",
+                    layout_key="PA_BSND",
+                    sparse_count=2048,
+                    sparse_mode=3,
+                )
         else:
-            topk_indices, _ = torch.ops._C_ascend.npu_lightning_indexer(
-                query=q_li,
-                key=kv_cache[2],
-                weights=weights,
-                actual_seq_lengths_query=actual_seq_lengths_query,
-                actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=attn_metadata.block_table,
-                layout_query="TND",
-                layout_key="PA_BSND",
-                sparse_count=2048,
-                sparse_mode=3,
-            )
+            if envs.VLLM_ASCEND_USE_PYTORCH_LIGHTNING_INDEXER:
+                topk_indices, _ = pytorch_lightning_indexer(
+                    query=q_li,
+                    key=kv_cache[2],
+                    weights=weights,
+                    actual_seq_lengths_query=actual_seq_lengths_query,
+                    actual_seq_lengths_key=actual_seq_lengths_key,
+                    block_table=attn_metadata.block_table,
+                    layout_query="TND",
+                    layout_key="PA_BSND",
+                    sparse_count=2048,
+                    sparse_mode=3,
+                )
+            else:
+                topk_indices, _ = torch.ops._C_ascend.npu_lightning_indexer(
+                    query=q_li,
+                    key=kv_cache[2],
+                    weights=weights,
+                    actual_seq_lengths_query=actual_seq_lengths_query,
+                    actual_seq_lengths_key=actual_seq_lengths_key,
+                    block_table=attn_metadata.block_table,
+                    layout_query="TND",
+                    layout_key="PA_BSND",
+                    sparse_count=2048,
+                    sparse_mode=3,
+                )
         return topk_indices
 
     @staticmethod
@@ -1459,17 +1510,76 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
                 q_li_scale = q_li_scale.view(q_li_shape_ori[:-1])
                 key_dequant_scale = kv_cache[2].squeeze(2)
 
-                topk_indices = torch_npu.npu_quant_lightning_indexer(
-                    query=q_li.view(q_li_shape_ori),
-                    key=kv_cache[1],
+                if envs.VLLM_ASCEND_USE_PYTORCH_LIGHTNING_INDEXER:
+                    topk_indices, _ = pytorch_quant_lightning_indexer(
+                        query=q_li.view(q_li_shape_ori),
+                        key=kv_cache[1],
+                        weights=weights,
+                        query_dequant_scale=q_li_scale,
+                        key_dequant_scale=key_dequant_scale,
+                        actual_seq_lengths_query=actual_seq_lengths_query,
+                        actual_seq_lengths_key=actual_seq_lengths_key,
+                        block_table=attn_metadata.block_table,
+                        query_quant_mode=0,
+                        key_quant_mode=0,
+                        layout_query="TND",
+                        layout_key="PA_BSND",
+                        sparse_count=2048,
+                        sparse_mode=3,
+                    )
+                else:
+                    topk_indices = torch_npu.npu_quant_lightning_indexer(
+                        query=q_li.view(q_li_shape_ori),
+                        key=kv_cache[1],
+                        weights=weights,
+                        query_dequant_scale=q_li_scale,
+                        key_dequant_scale=key_dequant_scale,
+                        actual_seq_lengths_query=actual_seq_lengths_query,
+                        actual_seq_lengths_key=actual_seq_lengths_key,
+                        block_table=attn_metadata.block_table,
+                        query_quant_mode=0,
+                        key_quant_mode=0,
+                        layout_query="TND",
+                        layout_key="PA_BSND",
+                        sparse_count=2048,
+                        sparse_mode=3,
+                    )
+            else:
+                if envs.VLLM_ASCEND_USE_PYTORCH_LIGHTNING_INDEXER:
+                    topk_indices, _ = pytorch_lightning_indexer(
+                        query=q_li.view(q_li_shape_ori),
+                        key=kv_cache[1],
+                        weights=weights,
+                        actual_seq_lengths_query=actual_seq_lengths_query,
+                        actual_seq_lengths_key=actual_seq_lengths_key,
+                        block_table=attn_metadata.block_table,
+                        layout_query="TND",
+                        layout_key="PA_BSND",
+                        sparse_count=2048,
+                        sparse_mode=3,
+                    )
+                else:
+                    topk_indices, _ = torch_npu.npu_lightning_indexer(
+                        query=q_li.view(q_li_shape_ori),
+                        key=kv_cache[1],
+                        weights=weights,
+                        actual_seq_lengths_query=actual_seq_lengths_query,
+                        actual_seq_lengths_key=actual_seq_lengths_key,
+                        block_table=attn_metadata.block_table,
+                        layout_query="TND",
+                        layout_key="PA_BSND",
+                        sparse_count=2048,
+                        sparse_mode=3,
+                    )
+        else:
+            if envs.VLLM_ASCEND_USE_PYTORCH_LIGHTNING_INDEXER:
+                topk_indices, _ = pytorch_lightning_indexer(
+                    query=q_li,
+                    key=kv_cache[2],
                     weights=weights,
-                    query_dequant_scale=q_li_scale,
-                    key_dequant_scale=key_dequant_scale,
                     actual_seq_lengths_query=actual_seq_lengths_query,
                     actual_seq_lengths_key=actual_seq_lengths_key,
                     block_table=attn_metadata.block_table,
-                    query_quant_mode=0,
-                    key_quant_mode=0,
                     layout_query="TND",
                     layout_key="PA_BSND",
                     sparse_count=2048,
@@ -1477,8 +1587,8 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
                 )
             else:
                 topk_indices, _ = torch_npu.npu_lightning_indexer(
-                    query=q_li.view(q_li_shape_ori),
-                    key=kv_cache[1],
+                    query=q_li,
+                    key=kv_cache[2],
                     weights=weights,
                     actual_seq_lengths_query=actual_seq_lengths_query,
                     actual_seq_lengths_key=actual_seq_lengths_key,
@@ -1488,19 +1598,6 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
                     sparse_count=2048,
                     sparse_mode=3,
                 )
-        else:
-            topk_indices, _ = torch_npu.npu_lightning_indexer(
-                query=q_li,
-                key=kv_cache[2],
-                weights=weights,
-                actual_seq_lengths_query=actual_seq_lengths_query,
-                actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=attn_metadata.block_table,
-                layout_query="TND",
-                layout_key="PA_BSND",
-                sparse_count=2048,
-                sparse_mode=3,
-            )
         return topk_indices
 
     @staticmethod
