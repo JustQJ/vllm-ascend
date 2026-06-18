@@ -21,6 +21,14 @@
 #include "aclnn_util.h"
 #include "../common_utils/mc2_3rd_matmul_util.h"
 #include "aclnn_kernels/common/op_error_check.h"
+
+
+using namespace op;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 extern aclnnStatus aclnnInnerMegaMoeGetWorkspaceSize(
     const aclTensor* context, const aclTensor* x, const aclTensor* topkIds, const aclTensor* topkWeights,
     const aclTensorList* weight1, const aclTensorList* weight2, const aclTensorList* weightScales1Optional,
@@ -34,13 +42,6 @@ extern aclnnStatus aclnnInnerMegaMoeGetWorkspaceSize(
 
 extern aclnnStatus aclnnInnerMegaMoe(void* workspace, uint64_t workspaceSize,
     aclOpExecutor* executor, aclrtStream stream);
-
-using namespace Ops::Transformer;
-using namespace op;
-
-#ifdef __cplusplus
-extern "C" {
-#endif
 
 // 将int4打包为int32输入的Tensor还原回int4
 aclTensorList *ConvertTensorListToInt4(const aclTensorList *input, aclOpExecutor *executor)

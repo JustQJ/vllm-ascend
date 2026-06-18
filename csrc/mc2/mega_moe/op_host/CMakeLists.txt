@@ -41,6 +41,7 @@ if (BUILD_OPEN_PROJECT)  # custom
         add_ops_compile_options(
             OP_NAME MegaMoe
             OPTIONS --cce-auto-sync=off
+                    -Wno-c++20-extensions
             OPTIONS ${_MEGA_MOE_INC_OPTS}
             OPTIONS -I${OPTENSOR_INCLUDE_ROOT}
             OPTIONS -I${TENSOR_API_INCLUDE_ROOT}
@@ -54,6 +55,7 @@ if (BUILD_OPEN_PROJECT)  # custom
         add_ops_compile_options(
             OP_NAME MegaMoe
             OPTIONS --cce-auto-sync=off
+                    -Wno-c++20-extensions
             OPTIONS ${_MEGA_MOE_INC_OPTS}
             OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../common_utils
             OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel
