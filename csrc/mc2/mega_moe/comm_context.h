@@ -20,6 +20,7 @@
 #include <string>
 #include <cstdint>
 #include <ATen/Tensor.h>
+#include <torch/custom_class.h>
 
 namespace vllm_ascend {
 
@@ -54,7 +55,7 @@ class HcclChannelContextBuilder;
 //   context_tensor = ctx_mgr.create_context()
 //   ccl_buf_size = ctx_mgr.ccl_buffer_size
 
-class CommContextManager {
+class CommContextManager : public torch::CustomClassHolder {
 public:
     CommContextManager(const std::string &group, int64_t worldSize,
                        const std::string &backend = "kfc");

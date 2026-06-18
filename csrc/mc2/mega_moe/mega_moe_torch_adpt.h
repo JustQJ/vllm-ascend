@@ -39,7 +39,7 @@ std::tuple<at::Tensor, at::Tensor> npu_mega_moe(
     c10::string_view comm_alg,
     int64_t num_max_tokens_per_rank,
     c10::string_view activation,
-    c10::optional<float> activation_clamp,
+    c10::optional<double> activation_clamp,
     c10::optional<int64_t> dispatch_quant_out_dtype,
     c10::optional<int64_t> weight1_type,
     c10::optional<int64_t> weight2_type)
@@ -131,7 +131,7 @@ std::tuple<at::Tensor, at::Tensor> npu_mega_moe(
 
     // Resolve float and string params
     float activation_clamp_f = activation_clamp.has_value()
-        ? activation_clamp.value()
+        ? static_cast<float>(activation_clamp.value())
         : std::numeric_limits<float>::max();
 
     std::string comm_alg_str(comm_alg);

@@ -2833,19 +2833,12 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                     Tensor dt_bias, "
         "                     float beta=1.0) -> (Tensor g, Tensor beta_output)");
     ops.impl("npu_fused_gdn_gating", torch::kPrivateUse1, &vllm_ascend::npu_fused_gdn_gating);
-}
-#endif
-
-// Register CommContextManager as a torch custom class for mega_moe.
-// Provides HCCL communication context tensor creation.
-// Python usage:
-//   ctx_mgr = torch.classes._C_ascend.CommContextManager(group_name, world_size, "channel")
-//   context_tensor = ctx_mgr.create_context()
-//   ccl_buf_size = ctx_mgr.ccl_buffer_size
-TORCH_LIBRARY(_C_ascend, m) {
+    /// Register CommContextManager as a torch custom class for mega_moe.
+    /// Provides HCCL communication context tensor creation.
     m.class_<vllm_ascend::CommContextManager>("CommContextManager")
         .def(torch::init<const std::string&, int64_t, const std::string&>())
         .def("create_context", &vllm_ascend::CommContextManager::create_context)
         .def("update_group", &vllm_ascend::CommContextManager::update_group)
         .def_property("ccl_buffer_size", &vllm_ascend::CommContextManager::ccl_buffer_size);
 }
+#endif
