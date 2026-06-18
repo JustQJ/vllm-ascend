@@ -40,7 +40,7 @@ def _get_float8_e8m0_dtype():
     raise RuntimeError("float8_e8m0 dtype is not available")
 
 
-class TestMegaMoe:
+class MegaMoeRunner:
 
     def __init__(self, rank, world_size, port):
         self.rank = rank
@@ -48,11 +48,6 @@ class TestMegaMoe:
         self.master_ip = "127.0.0.1"
         self.port = port
         self.ep_group = None
-
-    def get_hcomm(self, comm_group):
-        if torch.__version__ > "2.0.1":
-            return comm_group._get_backend(torch.device("npu")).get_hccl_comm_name(self.rank)
-        return comm_group.get_hccl_comm_name(self.rank)
 
     def generate_hcom(self):
         torch_npu.npu.set_device(self.rank)
@@ -66,8 +61,6 @@ class TestMegaMoe:
             backend="hccl",
             ranks=list(range(self.world_size)),
         )
-        self.hcomm_info = self.get_hcomm(self.ep_group)
-        assert self.hcomm_info, "HCCL comm name is empty"
 
     @staticmethod
     def check_output(y, expert_token_nums, x, local_expert_num) -> bool:
@@ -177,7 +170,7 @@ class TestMegaMoe:
 
 def _worker(rank: int, world_size: int, port: int, q: mp.SimpleQueue, dtype_name: str):
     try:
-        op = TestMegaMoe(rank, world_size, port)
+        op = MegaMoeRunner(rank, world_size, port)
         op.generate_hcom()
         if dtype_name == "e5m2":
             result = op.run_quant_e5m2()
