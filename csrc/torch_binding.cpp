@@ -2835,7 +2835,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.impl("npu_fused_gdn_gating", torch::kPrivateUse1, &vllm_ascend::npu_fused_gdn_gating);
     /// Register CommContextManager as a torch custom class for mega_moe.
     /// Provides HCCL communication context tensor creation.
-    m.class_<vllm_ascend::CommContextManager>("CommContextManager")
+    ops.class_<vllm_ascend::CommContextManager>("CommContextManager")
         .def(torch::init<const std::string&, int64_t, const std::string&>())
         .def("create_context", &vllm_ascend::CommContextManager::create_context)
         .def("update_group", &vllm_ascend::CommContextManager::update_group)
