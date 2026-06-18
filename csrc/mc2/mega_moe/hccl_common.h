@@ -18,13 +18,24 @@
 #define MEGA_MOE_HCCL_COMMON_H
 
 #include <dlfcn.h>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <c10/util/Exception.h>
-#include <acl/acl_base.h>
-#include <hccl/hccl_res.h>
-#include <hccl/hcomm_res_defs.h>
-#include <hccl/hccl_rank_graph.h>
+
+// Forward-declare HCCL types to avoid pulling CANN SDK ACL headers.
+// This header may be included alongside torch_npu headers which bundle
+// their own ACL version — the two conflict on enum definitions.
+typedef int HcclResult;
+#define HCCL_SUCCESS 0
+typedef struct HcclCommDef *HcclComm;
+typedef uint32_t CommEngine;
+typedef struct CommLinkInfo CommLink;
+typedef struct HcclChannelDescDef HcclChannelDesc;
+typedef void *ChannelHandle;
+enum CommProtocol : uint32_t { COMM_ENGINE_AIV = 4 };
+
+extern "C" void HcclChannelDescInit(HcclChannelDesc *desc, uint32_t channelNum);
 
 namespace vllm_ascend {
 
