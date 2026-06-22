@@ -21,15 +21,15 @@
 
 #include "register/tilingdata_base.h"
 #include "tiling/tiling_api.h"
-#include "../../common_utils/mc2_log.h"
+#include "../common_utils/mc2_log.h"
 #include "graph/utils/type_utils.h"
 #include "register/op_def_registry.h"
 #include "platform/platform_infos_def.h"
-#include "../../common_utils/mc2_hcom_topo_info.h"
-#include "../mega_moe.h"
-#include "../../../op_kernel/arch35/mega_moe_tiling.h"
-#include "../../../op_kernel/arch35/mega_moe_tiling_key.h"
-#include "../../../op_kernel/arch35/mega_moe_workspace_info.h"
+#include "../common_utils/mc2_hcom_topo_info.h"
+#include "mega_moe.h"
+#include "../op_kernel/arch35/mega_moe_tiling.h"
+#include "../op_kernel/arch35/mega_moe_tiling_key.h"
+#include "../op_kernel/arch35/mega_moe_workspace_info.h"
 
 using namespace Mc2Tiling;
 using namespace AscendC;
@@ -308,8 +308,8 @@ static ge::graphStatus CheckAttrParams(const gert::TilingContext *context, MegaM
     OP_TILING_CHECK((refWeightDataType != weightOneDesc->GetDataType()) &&
                     (weightOneDesc->GetDataType() != ge::DT_FLOAT4_E2M1),
         OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(nodeName, "weightOne",
-            Ops::Base::ToString(weightOneDesc->GetDataType()).c_str(),
-            (std::string("The dtype of weightOne must be ") + Ops::Base::ToString(refWeightDataType).c_str() +
+            ge::TypeUtils::DataTypeToSerialString(weightOneDesc->GetDataType()).c_str(),
+            (std::string("The dtype of weightOne must be ") + ge::TypeUtils::DataTypeToSerialString(refWeightDataType).c_str() +
              " or DT_FLOAT4_E2M1.").c_str()),
         return ge::GRAPH_FAILED);
 
@@ -699,24 +699,24 @@ static ge::graphStatus CheckTensorDataType(const gert::TilingContext *context,
 
     OP_TILING_CHECK(contextDesc->GetDataType() != ge::DT_INT32,
         OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(nodeName, "context",
-            Ops::Base::ToString(contextDesc->GetDataType()).c_str(), "The dtype of context must be DT_INT32."),
+            ge::TypeUtils::DataTypeToSerialString(contextDesc->GetDataType()).c_str(), "The dtype of context must be DT_INT32."),
         return ge::GRAPH_FAILED);
 
     OP_TILING_CHECK(xDesc->GetDataType() != ge::DT_BF16,
         OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(nodeName, "x",
-            Ops::Base::ToString(xDesc->GetDataType()).c_str(), "The dtype of x must be DT_BF16."),
+            ge::TypeUtils::DataTypeToSerialString(xDesc->GetDataType()).c_str(), "The dtype of x must be DT_BF16."),
         return ge::GRAPH_FAILED);
 
     OP_TILING_CHECK(topkIdsDesc->GetDataType() != ge::DT_INT32,
         OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(nodeName, "topkIds",
-            Ops::Base::ToString(topkIdsDesc->GetDataType()).c_str(), "The dtype of topkIds must be DT_INT32."),
+            ge::TypeUtils::DataTypeToSerialString(topkIdsDesc->GetDataType()).c_str(), "The dtype of topkIds must be DT_INT32."),
         return ge::GRAPH_FAILED);
 
     OP_TILING_CHECK((
         (topkWeightsDesc->GetDataType() != ge::DT_BF16) &&
         (topkWeightsDesc->GetDataType() != ge::DT_FLOAT)),
         OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(nodeName, "topkWeights",
-            Ops::Base::ToString(topkWeightsDesc->GetDataType()).c_str(),
+            ge::TypeUtils::DataTypeToSerialString(topkWeightsDesc->GetDataType()).c_str(),
             "The dtype of topkWeights must be DT_FLOAT or DT_BF16."), return ge::GRAPH_FAILED);
 
     OP_TILING_CHECK((
@@ -724,7 +724,7 @@ static ge::graphStatus CheckTensorDataType(const gert::TilingContext *context,
         (weightOneDesc->GetDataType() != ge::DT_FLOAT8_E4M3FN) &&
         (weightOneDesc->GetDataType() != ge::DT_FLOAT4_E2M1)),
         OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(nodeName, "weightOne",
-            Ops::Base::ToString(weightOneDesc->GetDataType()).c_str(),
+            ge::TypeUtils::DataTypeToSerialString(weightOneDesc->GetDataType()).c_str(),
             "The dtype of weightOne must be within the range DT_FLOAT8_E5M2, DT_FLOAT8_E4M3FN or DT_FLOAT4_E2M1."),
         return ge::GRAPH_FAILED);
 
@@ -733,35 +733,35 @@ static ge::graphStatus CheckTensorDataType(const gert::TilingContext *context,
         (weightTwoDesc->GetDataType() != ge::DT_FLOAT8_E4M3FN) &&
         (weightTwoDesc->GetDataType() != ge::DT_FLOAT4_E2M1)),
         OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(nodeName, "weightTwo",
-            Ops::Base::ToString(weightTwoDesc->GetDataType()).c_str(),
+            ge::TypeUtils::DataTypeToSerialString(weightTwoDesc->GetDataType()).c_str(),
             "The dtype of weightTwo must be within the range DT_FLOAT8_E5M2, DT_FLOAT8_E4M3FN or DT_FLOAT4_E2M1."),
         return ge::GRAPH_FAILED);
 
     OP_TILING_CHECK(weightOneDesc->GetDataType() != weightTwoDesc->GetDataType(),
         OP_LOGE_FOR_INVALID_DTYPES_WITH_REASON(nodeName, "weightOne, weightTwo",
-            (std::string("[") + Ops::Base::ToString(weightOneDesc->GetDataType()) + ", " +
-             Ops::Base::ToString(weightTwoDesc->GetDataType()) + "]").c_str(),
+            (std::string("[") + ge::TypeUtils::DataTypeToSerialString(weightOneDesc->GetDataType()) + ", " +
+             ge::TypeUtils::DataTypeToSerialString(weightTwoDesc->GetDataType()) + "]").c_str(),
             "The dtypes of weightOne and weightTwo must be the same."),
         return ge::GRAPH_FAILED);
 
     OP_TILING_CHECK(weightScalesOneDesc->GetDataType() != ge::DT_FLOAT8_E8M0,
         OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(nodeName, "weightScalesOne",
-            Ops::Base::ToString(weightScalesOneDesc->GetDataType()).c_str(),
+            ge::TypeUtils::DataTypeToSerialString(weightScalesOneDesc->GetDataType()).c_str(),
             "The dtype of weightScalesOne must be DT_FLOAT8_E8M0."), return ge::GRAPH_FAILED);
 
     OP_TILING_CHECK(weightScalesTwoDesc->GetDataType() != ge::DT_FLOAT8_E8M0,
         OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(nodeName, "weightScalesTwo",
-            Ops::Base::ToString(weightScalesTwoDesc->GetDataType()).c_str(),
+            ge::TypeUtils::DataTypeToSerialString(weightScalesTwoDesc->GetDataType()).c_str(),
             "The dtype of weightScalesTwo must be DT_FLOAT8_E8M0."), return ge::GRAPH_FAILED);
 
     OP_TILING_CHECK(yDesc->GetDataType() != ge::DT_BF16,
         OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(nodeName, "y",
-            Ops::Base::ToString(yDesc->GetDataType()).c_str(), "The dtype of y must be DT_BF16."),
+            ge::TypeUtils::DataTypeToSerialString(yDesc->GetDataType()).c_str(), "The dtype of y must be DT_BF16."),
         return ge::GRAPH_FAILED);
 
     OP_TILING_CHECK(expertTokenNumsDesc->GetDataType() != ge::DT_INT32,
         OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(nodeName, "expertTokenNums",
-            Ops::Base::ToString(expertTokenNumsDesc->GetDataType()).c_str(), "The dtype of expertTokenNums must be DT_INT32."),
+            ge::TypeUtils::DataTypeToSerialString(expertTokenNumsDesc->GetDataType()).c_str(), "The dtype of expertTokenNums must be DT_INT32."),
         return ge::GRAPH_FAILED);
 
     return ge::GRAPH_SUCCESS;
