@@ -16,28 +16,25 @@
 #ifndef CANN_OPS_TRANSFORMER_HCCL_COMMON_H
 #define CANN_OPS_TRANSFORMER_HCCL_COMMON_H
 
-#include "aclnn_common.h"
-#include <torch_npu/csrc/framework/utils/OpAdapter.h>
 #include <dlfcn.h>
-#include <vector>
-#include <functional>
-#include <type_traits>
+#include <cstdio>
+#include <cstdlib>
 #include <ATen/Tensor.h>
 #include <acl/acl_base.h>
 #include <acl/acl_rt.h>
 #include <c10/util/Exception.h>
-#include "torch_npu/csrc/core/npu/NPUStream.h"
-#include "torch_npu/csrc/framework/OpCommand.h"
-#include "torch_npu/csrc/framework/interface/EnvVariables.h"
-#include "torch_npu/csrc/aten/NPUNativeFunctions.h"
-#include "torch_npu/csrc/core/npu/DeviceUtils.h"
 #include "hccl/hccl_res.h"
 #include "hccl/hcomm_res_defs.h"
 #include "hccl/hccl_rank_graph.h"
-#if __has_include("torch_npu/csrc/flopcount/FlopCount.h")
-    #include "torch_npu/csrc/flopcount/FlopCount.h"
+
+#ifndef ASCEND_LOGW
+#define ASCEND_LOGW(fmt, ...) \
+    fprintf(stderr, "[WARN] " fmt "\n", ##__VA_ARGS__)
 #endif
-#define NPU_NAME_SPACE at_npu::native
+#ifndef ASCEND_LOGI
+#define ASCEND_LOGI(fmt, ...) \
+    fprintf(stderr, "[INFO] " fmt "\n", ##__VA_ARGS__)
+#endif
 
 using _HcclKfcAllocOpArgs = HcclResult (*)(void **);                                        // 通信配置对象创建
 using _HcclKfcOpArgsSetAlgConfig = HcclResult (*)(void *, char *);                          // 设置通信类型
@@ -104,12 +101,29 @@ inline const char *GetHcclFwkLibName(void)
     return "libhccl_fwk.so";
 }
 
+inline void *GetOpApiFuncAddrInLib(void *handler, const char *libName, const char *apiName)
+{
+    auto funcAddr = dlsym(handler, apiName);
+    if (funcAddr == nullptr) {
+        ASCEND_LOGW("dlsym %s from %s failed, error:%s", apiName, libName, dlerror());
+    }
+    return funcAddr;
+}
+
+inline void *GetOpApiLibHandler(const char *libName)
+{
+    auto handler = dlopen(libName, RTLD_LAZY);
+    if (handler == nullptr) {
+        ASCEND_LOGW("dlopen %s failed, error:%s", libName, dlerror());
+    }
+    return handler;
+}
+
 template <typename T>
 inline T GetFuncAddr(void * opApiHandler, const char *libName, const char *apiName)
 {
-    auto funcAddr = GetOpApiFuncAddrInLib(opApiHandler, GetHcclLibName(), apiName);
+    auto funcAddr = GetOpApiFuncAddrInLib(opApiHandler, libName, apiName);
     if (funcAddr == nullptr) {
-        ASCEND_LOGW("dlsym %s from %s failed, error:%s", apiName, GetHcclLibName(), dlerror());
         return nullptr;
     }
     T func = reinterpret_cast<T>(funcAddr);
