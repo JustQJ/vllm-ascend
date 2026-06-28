@@ -18,6 +18,31 @@
 
 namespace vllm_ascend {
 
+aclDataType ConvertToAclDataType(const at::ScalarType &data_type)
+{
+    int64_t dtype_index = static_cast<int64_t>(data_type);
+    TORCH_CHECK(dtype_index >= 0 && dtype_index < static_cast<int64_t>(at::ScalarType::NumOptions) + 1,
+                "data_type enum value (",
+                dtype_index,
+                ") is out of range: [0, ",
+                static_cast<int64_t>(at::ScalarType::NumOptions),
+                "]");
+    auto acl_dtype = kATenScalarTypeToAclDataTypeTable[dtype_index];
+    TORCH_CHECK(acl_dtype != ACL_DT_UNDEFINED,
+                std::string(c10::toString(data_type)) + " has not been supported");
+    return acl_dtype;
+}
+
+inline aclDataType GetAclDataType(int64_t t)
+{
+    const int g_toAclOffset = 256;
+    if (t >= g_toAclOffset) {
+        return static_cast<aclDataType>(t - g_toAclOffset);
+    }
+    return ConvertToAclDataType(
+        static_cast<at::ScalarType>(t));
+}
+
 std::tuple<at::Tensor, at::Tensor> npu_mega_moe(
     const at::Tensor &context,
     const at::Tensor &x,
@@ -126,7 +151,7 @@ std::tuple<at::Tensor, at::Tensor> npu_mega_moe(
 
     // Resolve dispatch_quant_result_type
     int64_t dispatch_quant_result_type = dispatch_quant_out_dtype.has_value()
-        ? static_cast<int64_t>(static_cast<aclDataType>(dispatch_quant_out_dtype.value()))
+        ? static_cast<int64_t>(GetAclDataType(dispatch_quant_out_dtype.value()))
         : 28;  // ge::DT_UNDEFINED
 
     // Resolve float and string params

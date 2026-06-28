@@ -7,100 +7,10 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-import subprocess
 from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-import torch_npu
-
-from vllm_ascend import envs as ascend_envs
-
-
-def _get_value_from_lines(lines: list[str], key: str) -> str:
-    for line in lines:
-        line = " ".join(line.split())
-        if key in line:
-            return line.split(":")[-1].strip()
-    return ""
-
-
-def _get_chip_type_from_npu_smi() -> str:
-    try:
-        npu_info_lines = subprocess.check_output(["npu-smi", "info", "-l"]).decode().strip().split("\n")
-        npu_id = int(_get_value_from_lines(npu_info_lines, "NPU ID"))
-
-        board_info_lines = (
-            subprocess.check_output(["npu-smi", "info", "-t", "board", "-i", str(npu_id)])
-            .decode()
-            .strip()
-            .split("\n")
-        )
-        chip_name = _get_value_from_lines(board_info_lines, "Chip Name")
-
-        if not chip_name:
-            chip_info_lines = (
-                subprocess.check_output(["npu-smi", "info", "-t", "board", "-i", str(npu_id), "-c", "0"])
-                .decode()
-                .strip()
-                .split("\n")
-            )
-        else:
-            chip_info_lines = board_info_lines
-
-        chip_name = _get_value_from_lines(chip_info_lines, "Chip Name")
-        chip_type = _get_value_from_lines(chip_info_lines, "Chip Type")
-        npu_name = _get_value_from_lines(chip_info_lines, "NPU Name")
-
-        if "310" in chip_name:
-            return (chip_type + chip_name).lower()
-        if "910" in chip_name:
-            if chip_type:
-                return (chip_type + chip_name).lower()
-            return (chip_name + "_" + npu_name).lower()
-        if "950" in chip_name:
-            return (chip_name + "_" + npu_name).lower()
-    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
-        return ""
-    return ""
-
-
-def _get_soc_name() -> str:
-    """Get the current NPU SoC name (e.g. 'Ascend950', 'Ascend910B')."""
-    if ascend_envs.SOC_VERSION:
-        return ascend_envs.SOC_VERSION
-
-    soc_name = _get_chip_type_from_npu_smi()
-    if soc_name:
-        return soc_name
-
-    for device in (None, 0):
-        try:
-            device_id = torch_npu.npu.current_device() if device is None else device
-            return torch_npu.npu.get_device_properties(device_id).name
-        except Exception:
-            pass
-
-    get_device_name = getattr(torch_npu.npu, "get_device_name", None)
-    if callable(get_device_name):
-        try:
-            return get_device_name(torch_npu.npu.current_device())
-        except Exception:
-            pass
-
-    return "ascend950"
-
-
-def _resolve_backend() -> str:
-    """Determine the HCCL backend mode based on the SoC name.
-
-    Returns 'channel' for Ascend950, 'kfc' for Ascend910B/Ascend910_93.
-    """
-    soc = _get_soc_name().lower()
-    if "ascend950" in soc:
-        return "channel"
-    # Ascend910B, Ascend910_93, and other legacy SoCs use KFC mode
-    return "kfc"
 
 
 def _get_hccl_comm_name(group: dist.ProcessGroup, rank_id: int) -> str:
@@ -242,9 +152,8 @@ class SymmBuffer:
         self.ep_world_size = dist.get_world_size(group)
 
         # --- Create HCCL communication context ---
-        backend = _resolve_backend()
         self._ctx_manager = torch.classes._C_ascend.CommContextManager(
-            self.group_name, self.ep_world_size, backend
+            self.group_name, self.ep_world_size, "auto"
         )
         self.context = self._ctx_manager.create_context()
         self.ccl_buffer_size = self._ctx_manager.ccl_buffer_size

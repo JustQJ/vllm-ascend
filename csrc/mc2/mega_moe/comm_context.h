@@ -46,19 +46,20 @@ class HcclChannelContextBuilder;
 
 // ======================== CommContextManager ========================
 // Creates and manages HCCL communication context tensors for MC2 operators.
-// Supports two backends:
+// Supports automatic backend resolution and explicit backend override:
+//   - "auto"    : Resolve from aclrtGetSocName()
 //   - "kfc"     : KFC mode (Ascend910B / Ascend910_93)
 //   - "channel" : HCCL Channel mode (Ascend950)
 //
 // Python usage via torch::class_:
-//   ctx_mgr = torch.classes._C_ascend.CommContextManager(group_name, world_size, "channel")
+//   ctx_mgr = torch.classes._C_ascend.CommContextManager(group_name, world_size, "auto")
 //   context_tensor = ctx_mgr.create_context()
 //   ccl_buf_size = ctx_mgr.ccl_buffer_size
 
 class CommContextManager : public torch::CustomClassHolder {
 public:
     CommContextManager(const std::string &group, int64_t worldSize,
-                       const std::string &backend = "kfc");
+                       const std::string &backend = "auto");
 
     // Create the communication context tensor on NPU device.
     // Returns an int32 1D tensor containing the serialized CommContext struct.

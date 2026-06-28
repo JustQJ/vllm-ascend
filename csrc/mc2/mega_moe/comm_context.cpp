@@ -1,57 +1,77 @@
-/*
- * Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+/**
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
  */
 
+/*!
+ * \file comm_context.cpp
+ * \brief comm_context implementation supporting both KFC and HCCL Channel modes.
+ *
+ */
 
 #include <torch/extension.h>
-#include <torch_npu/csrc/framework/utils/OpAdapter.h>
+#include <acl/acl_rt.h>
+#include <cstring>
+#include <type_traits>
 #include "comm_context.h"
 #include "hccl_common.h"
-#include <unordered_map>
-#include <vector>
-#include <cstring>
 
 namespace vllm_ascend {
 
-// ======================== Constants ========================
+// ======================== Common constants ========================
+
 constexpr static uint8_t COMM_ENGINE_AIV = 4;
 constexpr uint32_t HCCL_COMM_LAYERS_MTE_CCU = 1;
 constexpr uint32_t HCCL_COMM_LAYERS_UB_MEM = 0;
 constexpr uint32_t GET_LOCAL_SERVER_RANK_SIZE_LAYER = 0;
 
-// ======================== SoC name detection ========================
 const char *GetSocName()
 {
     static const char *socName = aclrtGetSocName();
     return socName;
 }
 
-// ======================== Backend resolution ========================
 static BackendMode ResolveBackend(const std::string &backend)
 {
     if (backend == "channel") return BackendMode::CHANNEL;
     if (backend == "kfc")     return BackendMode::KFC;
-    TORCH_CHECK(false, "backend string must be 'kfc' or 'channel', got '", backend, "'");
+    if (backend == "auto") {
+        const char *socName = GetSocName();
+        TORCH_CHECK(socName != nullptr, "aclrtGetSocName returned nullptr");
+        if (std::strstr(socName, "Ascend950") != nullptr) {
+            return BackendMode::CHANNEL;
+        }
+        if (std::strstr(socName, "Ascend910B") != nullptr ||
+            std::strstr(socName, "Ascend910_93") != nullptr) {
+            return BackendMode::KFC;
+        }
+        TORCH_CHECK(false, "No mega_moe HCCL backend mapping for SoC: ", socName);
+    }
+    TORCH_CHECK(false, "backend string must be 'auto', 'kfc' or 'channel', got '", backend, "'");
 }
 
-// ======================== Context serialization ========================
 static void CopyContextToTensor(const CommContext &context, at::Tensor &tensor)
 {
     at::Tensor hostContext = at::from_blob(const_cast<CommContext *>(&context),
                                            {sizeof(CommContext) / sizeof(int32_t)}, at::kInt);
     tensor.copy_(hostContext);
+}
+
+template <typename Desc, typename ChannelNum>
+static void InitHcclChannelDescChecked(Desc *desc, ChannelNum channelNum)
+{
+    using InitRet = decltype(HcclChannelDescInit(desc, channelNum));
+    if constexpr (std::is_void_v<InitRet>) {
+        HcclChannelDescInit(desc, channelNum);
+    } else {
+        InitRet hcclRet = HcclChannelDescInit(desc, channelNum);
+        TORCH_CHECK(hcclRet == HCCL_SUCCESS, "HCCL channel init failed, ret: ", hcclRet);
+    }
 }
 
 // ======================== KFC Mode ========================
@@ -61,6 +81,7 @@ public:
     {
         CommContext mc2ContextHost;
         GetMc2Context(mc2ContextHost, worldSize, cclBufferSize, group.c_str());
+
         CopyContextToTensor(mc2ContextHost, contextTensor);
     }
 
@@ -129,7 +150,7 @@ private:
         const bool isMultiServer = worldSize > 8;
         const std::string algConfig =
             is910B && isMultiServer ? "BatchWrite=level1:hierarchy" : "AlltoAll=level0:fullmesh;level1:pairwise";
-        const uint32_t opType = is910B && isMultiServer ? 18 : 8;
+        const uint32_t opType = is910B && isMultiServer ? 18 : 8; // 18: BatchWrite, 8: AllToAll
         CreateHcclContext(commHandle, opArgs, worldSize, groupStr, algConfig, opType, mc2ContextHost);
         ret = static_cast<HcclResult>(HcclKfcFreeOpArgsFunc(opArgs));
         TORCH_CHECK(ret == 0, "getHcclKfcFreeOpArgs failed, ret:", ret);
@@ -160,7 +181,6 @@ public:
                     group.c_str(), cclBufferSize);
     }
 
-private:
     void AcquireHcclHandle(const std::string &group, HcclComm &hcclHandle)
     {
         auto aclnnRet = HcomGetCommHandleByGroupFunc(group.c_str(), &hcclHandle);
@@ -184,7 +204,7 @@ private:
         GetOrCreateContext(hcclHandle, mc2ContextTag, engine, protocol,
                            ctx, hcclBuffSize, commContextStruct);
 
-        cclBufferSize = static_cast<int64_t>(hcclBuffSize);
+        cclBufferSize = hcclBuffSize;
     }
 
     void GetCommProtocol(const HcclComm &commHandle, CommProtocol &protocol)
@@ -257,7 +277,7 @@ private:
                           const CommProtocol &protocol, std::vector<HcclChannelDesc> &channelDesc)
     {
         uint32_t channelNum = channelDesc.size();
-        HcclChannelDescInit(channelDesc.data(), channelNum);
+        InitHcclChannelDescChecked(channelDesc.data(), channelNum);
         ASCEND_LOGI("HCCL channel init success");
 
         uint32_t netLayerNum = 0;
@@ -486,12 +506,5 @@ void CommContextManager::DispatchBuild(at::Tensor &tensor)
             TORCH_CHECK(false, "Unknown backend mode: ", static_cast<int>(mode_));
     }
 }
-
-// Note: HcclChannelDescInit is a C API from HCCL headers.
-// It is declared as:
-//   void HcclChannelDescInit(HcclChannelDesc* desc, uint32_t num);
-// We need to call it directly (not through dlsym).
-// If the symbol is not available at link time, add it to the HCCL
-// function pointer loading in InitHcclEngineCtxFunctions().
 
 } // namespace vllm_ascend
