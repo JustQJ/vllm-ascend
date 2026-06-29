@@ -6,7 +6,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch_npu
 
-from vllm_ascend.ops.mega_moe import get_symm_buffer_for_mega_moe, mega_moe
 from vllm_ascend.utils import bootstrap_custom_op_env, enable_custom_op
 
 enable_custom_op()
@@ -23,7 +22,7 @@ try:
 except ImportError:
     pass
 
-
+from vllm_ascend.ops.mega_moe import get_symm_buffer_for_mega_moe, mega_moe
 def _ceil(a, b):
     return (a + b - 1) // b
 

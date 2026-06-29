@@ -56,7 +56,6 @@ struct MegaMoeConfig {
     uint32_t attrWeight1InterleaveIndex = 14U;
     bool isMc2Context = false;
 };
-using namespace Ops::Transformer::OpTiling;
 
 ge::graphStatus MegaMoeTilingFuncImplPublic(gert::TilingContext* context, MegaMoeConfig& config);
 
