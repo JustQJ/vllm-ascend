@@ -48,12 +48,13 @@ namespace {
     const static int64_t MIN_BS = 1LL;
     const static int64_t MAX_BS = 512LL;
     const static int64_t MIN_EXPERT_PER_RANK = 1LL;
-    const static int64_t MAX_EXPERT_PER_RANK = 16LL;
+    const static int64_t MAX_EXPERT_PER_RANK = 1024LL;
     const static int64_t H_BASE = 1024LL;
+    const static int64_t MAX_H = 8LL * 1024LL;  // 8K
     const static int64_t HIDDEN_DIM_BASE = 1024LL;
     const static int64_t MIN_EP_WORLD_SIZE = 2LL;
     const static int64_t MAX_EP_WORLD_SIZE = 768LL;
-    const static int64_t MAX_MOE_EXPERT_NUM = 1024LL;
+    const static int64_t MAX_MOE_EXPERT_NUM = 2048LL;
     const static int64_t INPUT_WEIGHT_SCALES_CEIL_ALIGN = 64LL;
     const static int64_t RESERVED_WORKSPACE_SIZE = 1024 * 1024 * 50LL;
 }
@@ -72,14 +73,9 @@ void PrintMegaMoeTilingData(const MegaMoeTilingData* tilingData, const char *nod
     OP_LOGD(nodeName, "topK is %u", tilingData->topK);
     OP_LOGD(nodeName, "aicNum is %u", tilingData->aicNum);
     OP_LOGD(nodeName, "expertPerRank is %u", tilingData->expertPerRank);
-    OP_LOGD(nodeName, "groupListType is %u", tilingData->groupListType);
 
     OP_LOGD(nodeName, "epWorldSize is %u", tilingData->epWorldSize);
     OP_LOGD(nodeName, "maxOutputSize is %u", tilingData->maxOutputSize);
-
-    OP_LOGD(nodeName, "transX is %s", (tilingData->transX ? "True" : "False"));
-    OP_LOGD(nodeName, "transW is %s", (tilingData->transW ? "True" : "False"));
-    OP_LOGD(nodeName, "transW2 is %s", (tilingData->transW2 ? "True" : "False"));
 }
 
 void printWorkspaceInfo(const struct WorkspaceInfo *info, const char *nodeName)
@@ -92,6 +88,7 @@ void printWorkspaceInfo(const struct WorkspaceInfo *info, const char *nodeName)
     OP_LOGD(nodeName, "tripleInfoPtr:              %ld\n", info->tripleInfoPtr);
     OP_LOGD(nodeName, "flagSwiGluToGmm2Ptr:        %ld\n", info->flagSwiGluToGmm2Ptr);
     OP_LOGD(nodeName, "flagDispatchToGmm1Ptr:      %ld\n", info->flagDispatchToGmm1Ptr);
+    OP_LOGD(nodeName, "flagSendCntToGmm1Ptr:       %ld\n", info->flagSendCntToGmm1Ptr);
 }
 
 void printPeermemInfo(const MegaMoeTilingData* tilingData, const char *nodeName)
@@ -150,6 +147,16 @@ static int64_t GetOpQuantModeByAttrDispatchOutType(const gert::TilingContext *co
     return opQuantMode;
 }
 
+static int64_t GetCombineQuantModeByAttr(const gert::TilingContext *context, MegaMoeConfig &config)
+{
+    auto attrs = context->GetAttrs();
+    auto combineQuantModePtr = attrs->GetAttrPointer<int64_t>((config.attrCombineQuantModeIndex));
+    if (combineQuantModePtr == nullptr) {
+        return COMBINE_QUANT_OUT_TYPE_NO_QUANT;
+    }
+    return static_cast<int64_t>(*combineQuantModePtr);
+}
+
 static uint64_t CalTilingKey(const gert::TilingContext *context, MegaMoeConfig &config,
     MegaMoeTilingData *tilingData, const char *nodeName)
 {
@@ -157,8 +164,9 @@ static uint64_t CalTilingKey(const gert::TilingContext *context, MegaMoeConfig &
 
     auto dispatchQuantModePtr = attrs->GetAttrPointer<int64_t>((config.attrDispatchQuantModeIndex));
     int64_t opQuantMode = GetOpQuantModeByAttrDispatchOutType(context, config);
+    int64_t combineQuantMode = GetCombineQuantModeByAttr(context, config);
 
-    return GET_TPL_TILING_KEY(static_cast<int64_t>(*dispatchQuantModePtr), opQuantMode);
+    return GET_TPL_TILING_KEY(static_cast<int64_t>(*dispatchQuantModePtr), opQuantMode, combineQuantMode);
 }
 
 static ge::graphStatus CheckAttrPtrNullptr(const gert::TilingContext *context,
@@ -224,28 +232,28 @@ static ge::graphStatus CheckAttrParams(const gert::TilingContext *context, MegaM
 
     auto epWorldSizePtr = attrs->GetAttrPointer<int64_t>((config.attrEpWorldSizeIndex));
     int64_t epWorldSize = static_cast<int64_t>(*epWorldSizePtr);
-    // OP_TILING_CHECK(epWorldSize < MIN_EP_WORLD_SIZE || epWorldSize > MAX_EP_WORLD_SIZE,
-    //     OP_LOGE_FOR_INVALID_VALUE(nodeName, "epWorldSize",
-    //         std::to_string(epWorldSize).c_str(),
-    //         (std::string("should in [") + std::to_string(MIN_EP_WORLD_SIZE) + ", " +
-    //          std::to_string(MAX_EP_WORLD_SIZE) + "]").c_str()),
-    //     return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(epWorldSize < MIN_EP_WORLD_SIZE || epWorldSize > MAX_EP_WORLD_SIZE,
+        OP_LOGE_FOR_INVALID_VALUE(nodeName, "epWorldSize",
+            std::to_string(epWorldSize).c_str(),
+            (std::string("should in [") + std::to_string(MIN_EP_WORLD_SIZE) + ", " +
+             std::to_string(MAX_EP_WORLD_SIZE) + "]").c_str()),
+        return ge::GRAPH_FAILED);
 
     auto moeExpertNumPtr = attrs->GetAttrPointer<int64_t>((config.attrMoeExpertNumIndex));
     int64_t moeExpertNum = static_cast<int64_t>(*moeExpertNumPtr);
-    // OP_TILING_CHECK((moeExpertNum < epWorldSize || moeExpertNum > MAX_MOE_EXPERT_NUM) || (moeExpertNum % epWorldSize),
-    //     OP_LOGE_FOR_INVALID_VALUE(nodeName, "moeExpertNum",
-    //         std::to_string(moeExpertNum).c_str(),
-    //         (std::string("should in [") + std::to_string(epWorldSize) + ", " +
-    //          std::to_string(MAX_MOE_EXPERT_NUM) + "] and mod(..., epWorldSize(" +
-    //          std::to_string(epWorldSize) + ")) == 0").c_str()),
-    //     return ge::GRAPH_FAILED);
+    OP_TILING_CHECK((moeExpertNum < epWorldSize || moeExpertNum > MAX_MOE_EXPERT_NUM) || (moeExpertNum % epWorldSize),
+        OP_LOGE_FOR_INVALID_VALUE(nodeName, "moeExpertNum",
+            std::to_string(moeExpertNum).c_str(),
+            (std::string("should in [") + std::to_string(epWorldSize) + ", " +
+             std::to_string(MAX_MOE_EXPERT_NUM) + "] and mod(..., epWorldSize(" +
+             std::to_string(epWorldSize) + ")) == 0").c_str()),
+        return ge::GRAPH_FAILED);
 
-    // OP_TILING_CHECK(moeExpertNum != expertPerRank * epWorldSize,
-    //     OP_LOGE_FOR_INVALID_VALUE(nodeName, "moeExpertNum",
-    //         std::to_string(moeExpertNum).c_str(),
-    //         (std::string("should equal ") + std::to_string(expertPerRank * epWorldSize)).c_str()),
-    //     return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(moeExpertNum != expertPerRank * epWorldSize,
+        OP_LOGE_FOR_INVALID_VALUE(nodeName, "moeExpertNum",
+            std::to_string(moeExpertNum).c_str(),
+            (std::string("should equal ") + std::to_string(expertPerRank * epWorldSize)).c_str()),
+        return ge::GRAPH_FAILED);
 
     // maskRecv Size
     int64_t compareCount = ops::CeilAlign((int64_t)(bs * topK * sizeof(int32_t)), (int64_t)(ALIGN_256))
@@ -271,14 +279,14 @@ static ge::graphStatus CheckAttrParams(const gert::TilingContext *context, MegaM
         return ge::GRAPH_FAILED);
     OP_LOGD(nodeName, "cclBufferSize is %ld, leastCclBufferSize is %ld", cclBufferSize, leastCclBufferSize);
 
-    // auto maxRecvTokenNumPtr = attrs->GetAttrPointer<int64_t>((config.attrMaxRecvTokenNumIndex));
-    // int64_t maxRecvTokenNum = static_cast<int64_t>(*maxRecvTokenNumPtr);
-    // OP_TILING_CHECK(maxRecvTokenNum < 0 || maxRecvTokenNum > bs * epWorldSize * std::min(topK, expertPerRank),
-    //     OP_LOGE_FOR_INVALID_VALUE(nodeName, "maxRecvTokenNum",
-    //         std::to_string(maxRecvTokenNum).c_str(),
-    //         (std::string("should in [0, ") +
-    //          std::to_string(bs * epWorldSize * std::min(topK, expertPerRank)) + "]").c_str()),
-    //     return ge::GRAPH_FAILED);
+    auto maxRecvTokenNumPtr = attrs->GetAttrPointer<int64_t>((config.attrMaxRecvTokenNumIndex));
+    int64_t maxRecvTokenNum = static_cast<int64_t>(*maxRecvTokenNumPtr);
+    OP_TILING_CHECK(maxRecvTokenNum < 0 || maxRecvTokenNum > bs * epWorldSize * std::min(topK, expertPerRank),
+        OP_LOGE_FOR_INVALID_VALUE(nodeName, "maxRecvTokenNum",
+            std::to_string(maxRecvTokenNum).c_str(),
+            (std::string("should in [0, ") +
+             std::to_string(bs * epWorldSize * std::min(topK, expertPerRank)) + "]").c_str()),
+        return ge::GRAPH_FAILED);
 
     auto dispatchQuantModePtr = attrs->GetAttrPointer<int64_t>((config.attrDispatchQuantModeIndex));
     int64_t dispatchQuantMode = static_cast<int64_t>(*dispatchQuantModePtr);
@@ -305,18 +313,37 @@ static ge::graphStatus CheckAttrParams(const gert::TilingContext *context, MegaM
         OP_LOGE(nodeName,
             "unsupported dispatchQuantMode(%ld), leading out data type to being DT_UNDEFINED.", dispatchQuantMode),
         return ge::GRAPH_FAILED);
-    OP_TILING_CHECK((refWeightDataType != weightOneDesc->GetDataType()) &&
-                    (weightOneDesc->GetDataType() != ge::DT_FLOAT4_E2M1),
-        OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(nodeName, "weightOne",
-            ge::TypeUtils::DataTypeToSerialString(weightOneDesc->GetDataType()).c_str(),
-            (std::string("The dtype of weightOne must be ") + ge::TypeUtils::DataTypeToSerialString(refWeightDataType).c_str() +
-             " or DT_FLOAT4_E2M1.").c_str()),
-        return ge::GRAPH_FAILED);
+    // weight1 must match dispatch quant dtype; the only allowed mismatch is A8W4 (fp4_e2m1 + fp8_e4m3fn).
+    if (refWeightDataType != weightOneDesc->GetDataType()) {
+        std::string weightDtypeErrMsg = std::string("The dtype of weightOne (") +
+            ge::TypeUtils::DataTypeToSerialString(weightOneDesc->GetDataType())
+            + ") must match dispatch quant dtype ("
+            + ge::TypeUtils::DataTypeToSerialString(refWeightDataType)
+            + "), or be fp4_e2m1 with fp8_e4m3fn dispatch quant.";
+        OP_TILING_CHECK(weightOneDesc->GetDataType() != ge::DT_FLOAT4_E2M1 ||
+                        opQuantMode != DISPATCH_QUANT_OUT_DTYPE_E4M3FN,
+            OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(nodeName, "dispatchQuantOutDtype/weight1",
+                weightDtypeErrMsg.c_str(), "weight1 dtype mismatch."),
+            return ge::GRAPH_FAILED);
+    }
 
     auto combineQuantModePtr = attrs->GetAttrPointer<int64_t>((config.attrCombineQuantModeIndex));
-    OP_TILING_CHECK(*combineQuantModePtr != 0,
+    // A8W4 path: combine-quant is not yet supported.
+    if (weightOneDesc->GetDataType() == ge::DT_FLOAT4_E2M1 &&
+        opQuantMode == DISPATCH_QUANT_OUT_DTYPE_E4M3FN) {
+        OP_TILING_CHECK(*combineQuantModePtr != COMBINE_QUANT_OUT_TYPE_NO_QUANT,
+            OP_LOGE_FOR_INVALID_VALUE(nodeName, "combineQuantMode",
+                std::to_string(*combineQuantModePtr).c_str(),
+                "A8W4 path only supports combineQuantMode=no_quant(0) currently."),
+            return ge::GRAPH_FAILED);
+    }
+
+    OP_TILING_CHECK(*combineQuantModePtr != COMBINE_QUANT_OUT_TYPE_NO_QUANT &&
+                    *combineQuantModePtr != COMBINE_QUANT_OUT_TYPE_E5M2 &&
+                    *combineQuantModePtr != COMBINE_QUANT_OUT_TYPE_E4M3FN,
         OP_LOGE_FOR_INVALID_VALUE(nodeName, "combineQuantMode",
-            std::to_string(*combineQuantModePtr).c_str(), "0"),
+            std::to_string(*combineQuantModePtr).c_str(),
+            "only support no_quant(0), fp8_e5m2(3) and fp8_e4m3fn(4)"),
         return ge::GRAPH_FAILED);
 
     auto commAlgPtr = attrs->GetAttrPointer<char>(static_cast<int>(config.attrCommAlgIndex));
@@ -353,7 +380,25 @@ static ge::graphStatus SetAttrParams(const gert::TilingContext *context, MegaMoe
         tilingData->bs * tilingData->epWorldSize *
         std::min(tilingData->topK, tilingData->expertPerRank);
     tilingData->blockNumPerEP = std::max(static_cast<uint32_t>(1), aicNum / tilingData->epWorldSize);
-    tilingData->dispatchRows = 2;
+    tilingData->combineQuantMode = GetCombineQuantModeByAttr(context, config);
+
+    auto weightOneDesc = context->GetDynamicInputDesc(config.weight1Index, 0);
+    int64_t opQuantMode = GetOpQuantModeByAttrDispatchOutType(context, config);
+    if (weightOneDesc->GetDataType() == ge::DT_FLOAT4_E2M1 &&
+        opQuantMode == DISPATCH_QUANT_OUT_DTYPE_E4M3FN) {
+        // A8W4: fp4_e2m1 weight in NZ_C0_32, dispatched via separate template instantiation
+        tilingData->groupedMatmulMode = GROUPED_MATMUL_MODE_A8W4;
+    } else if ((opQuantMode == DISPATCH_QUANT_OUT_DTYPE_E5M2 ||
+                opQuantMode == DISPATCH_QUANT_OUT_DTYPE_E4M3FN) &&
+               weightOneDesc->GetDataType() == GetDataTypeByOpQuantMode(opQuantMode) &&
+               static_cast<ge::Format>(ge::GetPrimaryFormat(
+                   weightOneDesc->GetStorageFormat())) == ge::FORMAT_FRACTAL_NZ) {
+        // A8W8_NZ: fp8 activation × fp8 weight in NZ format, LayoutB = ZNLayoutPtn
+        tilingData->groupedMatmulMode = GROUPED_MATMUL_MODE_A8W8_NZ;
+    } else {
+        // Generic: fp8 activation × fp8 weight in ND format
+        tilingData->groupedMatmulMode = GROUPED_MATMUL_MODE_GENERAL;
+    }
 
     return ge::GRAPH_SUCCESS;
 }
@@ -797,16 +842,15 @@ static ge::graphStatus CheckTensorFormat(const gert::TilingContext *context,
         OP_LOGE(nodeName,
             "topkWeights format is invalid."), return ge::GRAPH_FAILED);
     
-    OP_TILING_CHECK(
-        static_cast<ge::Format>(ge::GetPrimaryFormat(weightOneDesc->GetStorageFormat())) == ge::FORMAT_FRACTAL_NZ,
-        OP_LOGE(nodeName,
-            "weightOne format is invalid."), return ge::GRAPH_FAILED);
-    
-    OP_TILING_CHECK(
-        static_cast<ge::Format>(ge::GetPrimaryFormat(weightTwoDesc->GetStorageFormat())) ==
-            ge::FORMAT_FRACTAL_NZ,
-        OP_LOGE(nodeName,
-            "weightTwo format is invalid."), return ge::GRAPH_FAILED);
+    // A8W4 path: weight1 must use NZ_C0_32 format now.
+    if (weightOneDesc->GetDataType() == ge::DT_FLOAT4_E2M1 &&
+        GetOpQuantModeByAttrDispatchOutType(context, config) == DISPATCH_QUANT_OUT_DTYPE_E4M3FN) {
+        OP_TILING_CHECK(weightOneDesc->GetStorageFormat() != ge::FORMAT_FRACTAL_NZ_C0_32,
+            OP_LOGE_FOR_INVALID_FORMAT(nodeName, "weight1",
+                ge::TypeUtils::FormatToSerialString(weightOneDesc->GetStorageFormat()).c_str(),
+                "FORMAT_FRACTAL_NZ_C0_32"),
+            return ge::GRAPH_FAILED);
+    }
     
     OP_TILING_CHECK(
         static_cast<ge::Format>(ge::GetPrimaryFormat(weightScalesOneDesc->GetStorageFormat())) ==
@@ -862,35 +906,43 @@ static ge::graphStatus CheckInputParam(const gert::TilingContext *context, MegaM
              std::to_string(MAX_BS) + "]").c_str()),
         return ge::GRAPH_FAILED);
 
-    // int64_t xDim1 = xStorageShape->GetStorageShape().GetDim(1);
-    // OP_TILING_CHECK(xDim1 != 4LL * H_BASE && xDim1 != 5LL * H_BASE && xDim1 != 7LL * H_BASE,
-    //     OP_LOGE_FOR_INVALID_VALUE(nodeName, "H", std::to_string(xDim1).c_str(),
-    //         "only support 4k/5k/7k"),
-    //     return ge::GRAPH_FAILED);
+    int64_t xDim1 = xStorageShape->GetStorageShape().GetDim(1);
+    // 检查 H 范围 [1K, 8K]
+    OP_TILING_CHECK(xDim1 < H_BASE || xDim1 > MAX_H,
+        OP_LOGE_FOR_INVALID_VALUE(nodeName, "H", std::to_string(xDim1).c_str(),
+            (std::string("should in [") + std::to_string(H_BASE) + ", " +
+             std::to_string(MAX_H) + "]").c_str()),
+        return ge::GRAPH_FAILED);
 
-    // const gert::StorageShape *topkIdsStorageShape = context->GetInputShape(config.topkIdsIndex);
-    // int64_t topkIdsDim1 = topkIdsStorageShape->GetStorageShape().GetDim(1);
-    // OP_TILING_CHECK(topkIdsDim1 != 6LL && topkIdsDim1 != 8LL,
-    //     OP_LOGE_FOR_INVALID_VALUE(nodeName, "topK", std::to_string(topkIdsDim1).c_str(),
-    //         "only support 6/8"),
-    //     return ge::GRAPH_FAILED);
+    // 检查 H 是否 1024 的倍数
+    OP_TILING_CHECK(xDim1 % H_BASE != 0,
+        OP_LOGE_FOR_INVALID_VALUE(nodeName, "H", std::to_string(xDim1).c_str(),
+            (std::string("multiple of ") + std::to_string(H_BASE)).c_str()),
+        return ge::GRAPH_FAILED);
 
-    // auto weightOneStorageShape = context->GetDynamicInputShape(config.weight1Index, 0);
-    // OP_CHECK_NULL_WITH_CONTEXT(context, weightOneStorageShape);
-    // int64_t weightOneDim0 = weightOneStorageShape->GetStorageShape().GetDim(0);
-    // OP_TILING_CHECK(weightOneDim0 < MIN_EXPERT_PER_RANK || weightOneDim0 > MAX_EXPERT_PER_RANK,
-    //     OP_LOGE_FOR_INVALID_VALUE(nodeName, "expertPerRank", std::to_string(weightOneDim0).c_str(),
-    //         (std::string("should in [") + std::to_string(MIN_EXPERT_PER_RANK) + ", " +
-    //          std::to_string(MAX_EXPERT_PER_RANK) + "]").c_str()),
-    //     return ge::GRAPH_FAILED);
+    const gert::StorageShape *topkIdsStorageShape = context->GetInputShape(config.topkIdsIndex);
+    int64_t topkIdsDim1 = topkIdsStorageShape->GetStorageShape().GetDim(1);
+    OP_TILING_CHECK(topkIdsDim1 != 6LL && topkIdsDim1 != 8LL,
+        OP_LOGE_FOR_INVALID_VALUE(nodeName, "topK", std::to_string(topkIdsDim1).c_str(),
+            "only support 6/8"),
+        return ge::GRAPH_FAILED);
 
-    // int64_t weightOneDim1 = weightOneStorageShape->GetStorageShape().GetDim(1);
-    // OP_TILING_CHECK(weightOneDim1 != 1LL * HIDDEN_DIM_BASE && weightOneDim1 != 2LL * HIDDEN_DIM_BASE &&
-    //                 weightOneDim1 != 3LL * HIDDEN_DIM_BASE && weightOneDim1 != 4LL * HIDDEN_DIM_BASE &&
-    //                 weightOneDim1 != 7LL * HIDDEN_DIM_BASE,
-    //     OP_LOGE_FOR_INVALID_VALUE(nodeName, "hiddenDim", std::to_string(weightOneDim1).c_str(),
-    //         "only support 1k/2k/3k/4k/7k"),
-    //     return ge::GRAPH_FAILED);
+    auto weightOneStorageShape = context->GetDynamicInputShape(config.weight1Index, 0);
+    OP_CHECK_NULL_WITH_CONTEXT(context, weightOneStorageShape);
+    int64_t weightOneDim0 = weightOneStorageShape->GetStorageShape().GetDim(0);
+    OP_TILING_CHECK(weightOneDim0 < MIN_EXPERT_PER_RANK || weightOneDim0 > MAX_EXPERT_PER_RANK,
+        OP_LOGE_FOR_INVALID_VALUE(nodeName, "expertPerRank", std::to_string(weightOneDim0).c_str(),
+            (std::string("should in [") + std::to_string(MIN_EXPERT_PER_RANK) + ", " +
+             std::to_string(MAX_EXPERT_PER_RANK) + "]").c_str()),
+        return ge::GRAPH_FAILED);
+
+    int64_t weightOneDim1 = weightOneStorageShape->GetStorageShape().GetDim(1);
+    OP_TILING_CHECK(weightOneDim1 != 1LL * HIDDEN_DIM_BASE && weightOneDim1 != 2LL * HIDDEN_DIM_BASE &&
+                    weightOneDim1 != 3LL * HIDDEN_DIM_BASE && weightOneDim1 != 4LL * HIDDEN_DIM_BASE &&
+                    weightOneDim1 != 7LL * HIDDEN_DIM_BASE,
+        OP_LOGE_FOR_INVALID_VALUE(nodeName, "hiddenDim", std::to_string(weightOneDim1).c_str(),
+            "only support 1k/2k/3k/4k/7k"),
+        return ge::GRAPH_FAILED);
     
     return ge::GRAPH_SUCCESS;
 }
@@ -915,11 +967,6 @@ static ge::graphStatus SetInputParam(const gert::TilingContext *context,
     tilingData->hiddenDim = static_cast<uint32_t>(hiddenDim);
     tilingData->topK = static_cast<uint32_t>(topK);
     tilingData->expertPerRank = static_cast<uint32_t>(expertPerRank);
-    tilingData->groupListType = 1;
-
-    tilingData->transX = false;
-    tilingData->transW = true;
-    tilingData->transW2 = true;
 
     return ge::GRAPH_SUCCESS;
 }
@@ -957,6 +1004,7 @@ ge::graphStatus MegaMoeTilingFuncImplPublic(gert::TilingContext *context, MegaMo
     uint32_t aivNum = ascendcPlatform.GetCoreNumAiv();
     uint32_t aicNum = ascendcPlatform.GetCoreNumAic();
     tilingData->aicNum = aicNum;
+    tilingData->blockAivNum = aivNum;
     OP_TILING_CHECK(aivNum <= 0 || aicNum <= 0,
         OP_LOGE_FOR_INVALID_VALUE(nodeName, "aivNum/aicNum",
             (std::to_string(aivNum) + ", " + std::to_string(aicNum)).c_str(),

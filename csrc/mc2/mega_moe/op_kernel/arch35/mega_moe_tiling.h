@@ -27,15 +27,12 @@ struct MegaMoeTilingData {
     uint32_t h;
     uint32_t hiddenDim;
     uint32_t epWorldSize;
-    uint32_t blockNumPerEP; // if blockNumPerEP < dispatchRows, then dispatchRows is invalid
+    uint32_t blockNumPerEP;
     uint32_t maxOutputSize;
-    uint32_t rankId;
     uint32_t topK;
     uint32_t aicNum;
-    int32_t dispatchRows;
-    uint8_t groupListType;
-    bool transX;
-    bool transW;
-    bool transW2;
+    uint32_t blockAivNum;
+    int64_t combineQuantMode;
+    uint8_t groupedMatmulMode;
 };
 #endif

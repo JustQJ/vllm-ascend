@@ -39,12 +39,12 @@ public:
     {
         if constexpr (SwizzleDirection == 0) {
             // m first
-            loopFirst_ = AscendC::Std::ceil_division(get<IDX_M_IDX>(problemShape_), get<IDX_M_IDX>(tileShape_));
-            loopSecond_ = AscendC::Std::ceil_division(get<IDX_N_IDX>(problemShape_), get<IDX_N_IDX>(tileShape_));
+            loopFirst_ = AscendC::Std::ceil_division(Get<IDX_M_IDX>(problemShape_), Get<IDX_M_IDX>(tileShape_));
+            loopSecond_ = AscendC::Std::ceil_division(Get<IDX_N_IDX>(problemShape_), Get<IDX_N_IDX>(tileShape_));
         } else if constexpr (SwizzleDirection == 1) {
             // n first
-            loopSecond_ = AscendC::Std::ceil_division(get<IDX_M_IDX>(problemShape_), get<IDX_M_IDX>(tileShape_));
-            loopFirst_ = AscendC::Std::ceil_division(get<IDX_N_IDX>(problemShape_), get<IDX_N_IDX>(tileShape_));
+            loopSecond_ = AscendC::Std::ceil_division(Get<IDX_M_IDX>(problemShape_), Get<IDX_M_IDX>(tileShape_));
+            loopFirst_ = AscendC::Std::ceil_division(Get<IDX_N_IDX>(problemShape_), Get<IDX_N_IDX>(tileShape_));
         }
     }
 
@@ -56,9 +56,9 @@ public:
     __aicore__ inline BlockShape GetBlockShape(const BlockCoord& blockCoord)
     {
         return {
-            min(get<IDX_M_IDX>(tileShape_), get<IDX_M_IDX>(problemShape_) - get<IDX_M_IDX>(blockCoord)),
-            min(get<IDX_N_IDX>(tileShape_), get<IDX_N_IDX>(problemShape_) - get<IDX_N_IDX>(blockCoord)),
-            get<IDX_K_IDX>(problemShape_)};
+            min(Get<IDX_M_IDX>(tileShape_), Get<IDX_M_IDX>(problemShape_) - Get<IDX_M_IDX>(blockCoord)),
+            min(Get<IDX_N_IDX>(tileShape_), Get<IDX_N_IDX>(problemShape_) - Get<IDX_N_IDX>(blockCoord)),
+            Get<IDX_K_IDX>(problemShape_)};
     }
 
     __aicore__ inline BlockCoord GetBlockCoord(int tileIdx)
@@ -69,7 +69,9 @@ public:
 
         int64_t firstValid = Min(loopFirst_ - blockIdx * SwizzleOffset, static_cast<int64_t>(SwizzleOffset));
         // Defensive: firstValid is always >= 1 by construction, this silences static analyzer divide-by-zero warnings.
-        if (firstValid == 0) { firstValid = 1; }
+        if (firstValid == 0) {
+            firstValid = 1;
+        }
         int64_t firstIdx = blockIdx * SwizzleOffset + inBlockIdx % firstValid;
         int64_t secondIdx = inBlockIdx / firstValid;
         if (blockIdx & 1) {
@@ -77,9 +79,9 @@ public:
         }
 
         if constexpr (SwizzleDirection == 0) {
-            return {firstIdx * get<IDX_M_IDX>(tileShape_), secondIdx * get<IDX_N_IDX>(tileShape_), 0};
+            return {firstIdx * Get<IDX_M_IDX>(tileShape_), secondIdx * Get<IDX_N_IDX>(tileShape_), 0};
         } else {
-            return {secondIdx * get<IDX_M_IDX>(tileShape_), firstIdx * get<IDX_N_IDX>(tileShape_), 0};
+            return {secondIdx * Get<IDX_M_IDX>(tileShape_), firstIdx * Get<IDX_N_IDX>(tileShape_), 0};
         }
     }
 

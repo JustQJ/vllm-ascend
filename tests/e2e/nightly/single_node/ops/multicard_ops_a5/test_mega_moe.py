@@ -73,6 +73,9 @@ class MegaMoeRunner:
         )
 
     def _make_quant_inputs(self, weight_dtype):
+        seed = 1234
+        torch.manual_seed(seed)
+        torch_npu.npu.manual_seed(seed)
         bs, hidden, num_topk, local_expert_num, intermediate = 256, 4096, 6, 4, 1024
         num_experts = local_expert_num * self.world_size
         intermediate_per_gate = intermediate // 2
@@ -134,7 +137,7 @@ class MegaMoeRunner:
             hidden,
             local_expert_num,
         ) = self._make_quant_inputs(weight_dtype)
-
+        bs = x.shape[0]
         sym_buffer = get_symm_buffer_for_mega_moe(
             self.ep_group,
             num_experts=num_experts,
@@ -144,7 +147,7 @@ class MegaMoeRunner:
             intermediate_hidden=0,
             dispatch_quant_mode=4,
             dispatch_quant_out_dtype=dispatch_quant_out_dtype,
-            max_recv_token_num=1024*8,
+            max_recv_token_num=bs * self.world_size * min(local_expert_num, num_topk),
         )
         y, expert_token_nums = mega_moe(
             sym_buffer=sym_buffer,
