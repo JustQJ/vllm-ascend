@@ -86,7 +86,9 @@ def _paged_attn_fwd_inner(
                 & (mask_k >= 0)
                 & (mask_k < mask_cols)
             )
-            mask_offsets = mask_q * stride_mask_q + mask_k * stride_mask_k
+            safe_mask_q = tl.where(mask_index_valid, mask_q, 0)
+            safe_mask_k = tl.where(mask_index_valid, mask_k, 0)
+            mask_offsets = safe_mask_q * stride_mask_q + safe_mask_k * stride_mask_k
             mask_value = tl.load(
                 atten_mask_ptr + mask_offsets,
                 mask=mask_index_valid,
@@ -171,13 +173,14 @@ def _paged_attn_fwd(
     q_idx = q_start + q_block_local * BLOCK_M + offs_m
     q_local = q_idx - q_start
     q_mask = q_idx < q_end
+    q_idx_safe = tl.where(q_mask, q_idx, q_start)
 
     context_len = tl.maximum(kv_len - q_len, 0)
     q_abs_pos = context_len + q_local
 
     offs_d = tl.arange(0, HEAD_DIM)
     q_offsets = (
-        q_idx[:, None] * stride_q_tok
+        q_idx_safe[:, None] * stride_q_tok
         + q_head_idx * stride_q_head
         + offs_d[None, :] * stride_q_dim
     )
@@ -222,7 +225,7 @@ def _paged_attn_fwd(
 
     acc = acc / l_i[:, None]
     o_offsets = (
-        q_idx[:, None] * stride_o_tok
+        q_idx_safe[:, None] * stride_o_tok
         + q_head_idx * stride_o_head
         + offs_d[None, :] * stride_o_dim
     )

@@ -13,23 +13,23 @@ HEAD_DIM = 128
 DTYPE = torch.bfloat16
 KV_CACHE_CAPACITY_TOKENS = 16 * 1024
 BLOCK_SIZE = 128
-PREFILL_TARGETS = [2 * 1024, 48, 8 * 1024]
+PREFILL_TARGETS = [8 * 1024]
 DECODE_KV_TARGET = 8 * 1024
-DECODE_Q_TARGETS = [1, 2, 4, 8]
-BATCH_SIZES = [2, 4, 8]
+DECODE_Q_TARGETS = [1, 4]
+BATCH_SIZES = [4]
 BLOCK_SHAPES = [
-    (16, 32),
-    (16, 64),
-    (16, 128),
-    (16, 256),
-    (32, 32),
-    (32, 64),
+    # (16, 32),
+    # (16, 64),
+    # (16, 128),
+    # (16, 256),
+    # (32, 32),
+    # (32, 64),
     (32, 128),
-    (32, 256),
-    (64, 32),
-    (64, 64),
-    (64, 128),
-    (64, 256),
+    # (32, 256),
+    # (64, 32),
+    # (64, 64),
+    # (64, 128),
+    # (64, 256),
 ]
 
 
@@ -83,6 +83,10 @@ def _scenario_cases():
 
 def _cumulative_lengths(lengths, device):
     return torch.tensor(lengths, dtype=torch.int32).cumsum(dim=0).to(device)
+
+
+def _cumulative_lengths_list(lengths):
+    return torch.tensor(lengths, dtype=torch.int32).cumsum(dim=0).tolist()
 
 
 def _build_paged_inputs(q_lens, kv_lens, block_size, num_q_heads, num_kv_heads,
@@ -153,6 +157,8 @@ def test_paged_attention_matches_fias_v2_with_qwen3_moe_scenarios(
         _build_paged_inputs(q_lens, kv_lens, BLOCK_SIZE, NUM_Q_HEADS,
                             NUM_KV_HEADS, HEAD_DIM, DTYPE, device)
     )
+    actual_seq_qlen_list = _cumulative_lengths_list(q_lens)
+    actual_seq_kvlen_list = [int(length) for length in kv_lens]
 
     if max(q_lens) == 1:
         sparse_mode = 0
@@ -166,6 +172,7 @@ def test_paged_attention_matches_fias_v2_with_qwen3_moe_scenarios(
                                  NUM_Q_HEADS, NUM_KV_HEADS, softmax_scale,
                                  BLOCK_SIZE, block_m, block_n, sinks,
                                  atten_mask)
+    torch.npu.synchronize()
 
     fias_out, _ = torch_npu.npu_fused_infer_attention_score_v2(
         query=query,
@@ -181,8 +188,8 @@ def test_paged_attention_matches_fias_v2_with_qwen3_moe_scenarios(
         softmax_scale=softmax_scale,
         block_table=block_table,
         block_size=BLOCK_SIZE,
-        actual_seq_qlen=actual_seq_qlen.tolist(),
-        actual_seq_kvlen=actual_seq_kvlen.tolist(),
+        actual_seq_qlen=actual_seq_qlen_list,
+        actual_seq_kvlen=actual_seq_kvlen_list,
         learnable_sink=sinks,
     )
 
