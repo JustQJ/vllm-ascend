@@ -198,7 +198,7 @@ def _attn_fwd_inner(acc_ptr, l_i, m_i, q,  # Accumulator, local l, local m, quer
         # Softmax weights p = exp(qk)
         p = tl.math.exp(qk)
 
-        p = to_mxfp4c7(p, BLOCK_M, BLOCK_N).to(tl.float16)
+        # p = to_mxfp4c7(p, BLOCK_M, BLOCK_N).to(tl.float16)
 
         # Convert softmax weight type depending on FP8 usage
         if fp8_v:
@@ -460,3 +460,7 @@ if __name__ == "__main__":
     # test_op(4, 32, 64, 64, causal=False, dtype=torch.float16, BM=32, BN=64)
     # test_op(4, 32, 1024, 64, causal=False, dtype=torch.bfloat16, BM=64, BN=128)
     # test_op(4, 32, 4096, 64, causal=False, dtype=torch.float16, BM=128, BN=128)
+
+    ## failed是因为ub buffer overflow，即HEAD_DIM，BM，BN 这三个参数组合过大导致，由于HEAD_DIM是模型决定的，所以
+    ## 我们一般调整BM，BN来避免ub buffer overflow。BM，BN越大，计算效率越高，但也更容易ub buffer overflow。BM，BN越小，计算效率越低，但更不容易ub buffer overflow。
+    ## 一般设置 BM=32, BN=128就可以了，在不考虑性能的情况下，不需要设置太大。如果(32, 128)还是太大，可以尝试(32, 64)或者(16, 64)。
