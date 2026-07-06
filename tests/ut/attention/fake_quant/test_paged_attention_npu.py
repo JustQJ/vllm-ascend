@@ -32,6 +32,12 @@ BLOCK_SHAPES = [
     (64, 256),
 ]
 
+
+def _make_sparse_causal_mask(device):
+    return torch.triu(torch.ones(2048, 2048), diagonal=1).to(
+        torch.int8).to(device).contiguous()
+
+
 def _varied_lengths(max_len, batch_size):
     if max_len == 1:
         return [1] * batch_size
@@ -115,15 +121,16 @@ def _build_paged_inputs(q_lens, kv_lens, block_size, num_q_heads, num_kv_heads,
 
     actual_seq_qlen = _cumulative_lengths(q_lens, device)
     actual_seq_kvlen = torch.tensor(kv_lens, dtype=torch.int32, device=device)
-    sinks = torch.randn(num_q_heads, dtype=torch.float32) * 0.1
+    sinks = (torch.randn(num_q_heads, dtype=torch.float32) * 0.1).to(
+        dtype=dtype)
     return (
-        query.to(device),
-        key_cache.to(device),
-        value_cache.to(device),
-        block_table_cpu.to(device),
+        query.to(device).contiguous(),
+        key_cache.to(device).contiguous(),
+        value_cache.to(device).contiguous(),
+        block_table_cpu.to(device).contiguous(),
         actual_seq_qlen,
         actual_seq_kvlen,
-        sinks.to(device),
+        sinks.to(device).contiguous(),
     )
 
 
@@ -133,7 +140,8 @@ def _build_paged_inputs(q_lens, kv_lens, block_size, num_q_heads, num_kv_heads,
 )
 def test_paged_attention_matches_fias_v2_with_qwen3_moe_scenarios(
         scenario, batch_size, q_lens, kv_lens, block_m, block_n):
-    del scenario, batch_size
+    del scenario
+    assert batch_size == len(q_lens)
     if not hasattr(torch, "npu") or not torch.npu.is_available():
         pytest.skip("NPU is required for torch_npu FIAS v2 comparison")
 
@@ -146,10 +154,18 @@ def test_paged_attention_matches_fias_v2_with_qwen3_moe_scenarios(
                             NUM_KV_HEADS, HEAD_DIM, DTYPE, device)
     )
 
+    if max(q_lens) == 1:
+        sparse_mode = 0
+        atten_mask = None
+    else:
+        sparse_mode = 3
+        atten_mask = _make_sparse_causal_mask(device)
+
     triton_out = paged_attention(query, key_cache, value_cache, block_table,
                                  actual_seq_qlen, actual_seq_kvlen,
                                  NUM_Q_HEADS, NUM_KV_HEADS, softmax_scale,
-                                 BLOCK_SIZE, block_m, block_n, sinks)
+                                 BLOCK_SIZE, block_m, block_n, sinks,
+                                 atten_mask)
 
     fias_out, _ = torch_npu.npu_fused_infer_attention_score_v2(
         query=query,
@@ -160,8 +176,8 @@ def test_paged_attention_matches_fias_v2_with_qwen3_moe_scenarios(
         input_layout="TND",
         pre_tokens=65535,
         next_tokens=0,
-        atten_mask=None,
-        sparse_mode=3,
+        atten_mask=atten_mask,
+        sparse_mode=sparse_mode,
         softmax_scale=softmax_scale,
         block_table=block_table,
         block_size=BLOCK_SIZE,

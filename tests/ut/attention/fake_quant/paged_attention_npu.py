@@ -11,6 +11,7 @@ This mirrors the paged ``npu_fused_infer_attention_score_v2`` call in
                (num_seqs + 1,) cumulative q lengths with leading 0
   kv_lens    : (num_seqs,) actual kv length per sequence
   q_block_lens: (num_seqs + 1,) cumulative query-block lengths for BLOCK_M
+  atten_mask  : optional 2D causal mask, where non-zero entries are masked
   sinks       : optional (num_q_heads,) attention sink bias
 
 The public wrapper also accepts the local test-friendly 4D cache layouts
@@ -39,9 +40,16 @@ def _paged_attn_fwd_inner(
         q_abs_pos,
         q_mask,
         kv_seq_len,
+        context_len,
+        atten_mask_ptr,
+        stride_mask_q,
+        stride_mask_k,
+        mask_rows,
+        mask_cols,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         HEAD_DIM: tl.constexpr,
+        HAS_ATTEN_MASK: tl.constexpr,
 ):
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, HEAD_DIM)
@@ -69,6 +77,22 @@ def _paged_attn_fwd_inner(
 
         qk = tl.dot(q, k) * qk_scale
         causal_mask = seq_offset[None, :] <= q_abs_pos[:, None]
+        if HAS_ATTEN_MASK:
+            mask_k = seq_offset[None, :] - context_len
+            mask_q = q_abs_pos[:, None] - context_len
+            mask_index_valid = (
+                (mask_q >= 0)
+                & (mask_q < mask_rows)
+                & (mask_k >= 0)
+                & (mask_k < mask_cols)
+            )
+            mask_offsets = mask_q * stride_mask_q + mask_k * stride_mask_k
+            mask_value = tl.load(
+                atten_mask_ptr + mask_offsets,
+                mask=mask_index_valid,
+                other=0,
+            )
+            causal_mask = causal_mask & (mask_value == 0)
         kv_mask = seq_offset[None, :] < kv_seq_len
         qk = tl.where(q_mask[:, None] & causal_mask & kv_mask, qk, -1.0e20)
 
@@ -98,12 +122,14 @@ def _paged_attn_fwd_inner(
 
 @triton.jit
 def _paged_attn_fwd(
-        Q, K_cache, V_cache, Out, block_table_ptr,
+        Q, K_cache, V_cache, Out, block_table_ptr, atten_mask_ptr,
         cu_q_lens_ptr, q_block_lens_ptr, kv_lens_ptr, sink_ptr,
         stride_q_tok, stride_q_head, stride_q_dim: tl.constexpr,
         stride_k_blk, stride_k_slot, stride_k_flat: tl.constexpr,
         stride_v_blk, stride_v_slot, stride_v_flat: tl.constexpr,
         stride_o_tok, stride_o_head, stride_o_dim: tl.constexpr,
+        stride_mask_q,
+        stride_mask_k,
         block_table_stride: tl.int64,
         BLOCK_SIZE: tl.constexpr,
         HEAD_DIM: tl.constexpr,
@@ -113,7 +139,10 @@ def _paged_attn_fwd(
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         num_seqs,
+        mask_rows,
+        mask_cols,
         HAS_SINKS: tl.constexpr,
+        HAS_ATTEN_MASK: tl.constexpr,
 ):
     q_block_idx = tl.program_id(0)
     q_head_idx = tl.program_id(1)
@@ -179,9 +208,16 @@ def _paged_attn_fwd(
         q_abs_pos=q_abs_pos,
         q_mask=q_mask,
         kv_seq_len=kv_len,
+        context_len=context_len,
+        atten_mask_ptr=atten_mask_ptr,
+        stride_mask_q=stride_mask_q,
+        stride_mask_k=stride_mask_k,
+        mask_rows=mask_rows,
+        mask_cols=mask_cols,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         HEAD_DIM=HEAD_DIM,
+        HAS_ATTEN_MASK=HAS_ATTEN_MASK,
     )
 
     acc = acc / l_i[:, None]
@@ -226,7 +262,8 @@ class _paged_attention(torch.autograd.Function):
     def forward(ctx, q, k_cache, v_cache, block_table,
                 cu_q_lens, kv_lens,
                 num_q_heads, num_kv_heads,
-                sm_scale, block_size, BLOCK_M=16, BLOCK_N=128, sinks=None):
+                sm_scale, block_size, BLOCK_M=16, BLOCK_N=128, sinks=None,
+                atten_mask=None):
         del ctx
         head_dim = q.shape[-1]
         assert q.dim() == 3
@@ -236,6 +273,8 @@ class _paged_attention(torch.autograd.Function):
         assert BLOCK_N in {32, 64, 128, 256}
         if sinks is not None:
             assert sinks.shape[0] == num_q_heads
+        if atten_mask is not None:
+            assert atten_mask.dim() == 2
 
         k_cache = _normalize_kv_cache(k_cache, block_size, num_kv_heads,
                                       head_dim)
@@ -260,10 +299,22 @@ class _paged_attention(torch.autograd.Function):
         num_kv_groups = num_q_heads // num_kv_heads
         out = torch.empty_like(q)
         grid = (total_q_blocks, num_q_heads)
+        mask_rows = 0
+        mask_cols = 0
+        stride_mask_q = 0
+        stride_mask_k = 0
+        atten_mask_ptr = q
+        if atten_mask is not None:
+            atten_mask_ptr = atten_mask
+            mask_rows = atten_mask.shape[0]
+            mask_cols = atten_mask.shape[1]
+            stride_mask_q = atten_mask.stride(0)
+            stride_mask_k = atten_mask.stride(1)
 
         _paged_attn_fwd[grid](
             Q=q, K_cache=k_cache, V_cache=v_cache, Out=out,
             block_table_ptr=block_table,
+            atten_mask_ptr=atten_mask_ptr,
             cu_q_lens_ptr=cu_q_lens,
             q_block_lens_ptr=q_block_lens,
             kv_lens_ptr=kv_lens,
@@ -280,6 +331,8 @@ class _paged_attention(torch.autograd.Function):
             stride_o_tok=out.stride(0),
             stride_o_head=out.stride(1),
             stride_o_dim=out.stride(2),
+            stride_mask_q=stride_mask_q,
+            stride_mask_k=stride_mask_k,
             block_table_stride=block_table.stride(0),
             BLOCK_SIZE=block_size,
             HEAD_DIM=head_dim,
@@ -289,7 +342,10 @@ class _paged_attention(torch.autograd.Function):
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             num_seqs=num_seqs,
+            mask_rows=mask_rows,
+            mask_cols=mask_cols,
             HAS_SINKS=sinks is not None,
+            HAS_ATTEN_MASK=atten_mask is not None,
             num_warps=(4 if head_dim == 64 else 8),
         )
         return out
