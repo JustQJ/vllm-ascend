@@ -39,6 +39,7 @@ from vllm.v1.attention.backends.registry import (  # type: ignore
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import AttentionSpec, CrossAttentionSpec
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.context_parallel.common_cp import AscendMetadataForDecode, AscendMetadataForPrefill
@@ -65,6 +66,7 @@ from vllm_ascend.compilation.acl_graph import (
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
 from vllm_ascend.utils import weak_ref_tensors
+from vllm_ascend.ops.triton.paged_attn import paged_attention
 from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
 
 # default max value of sliding window size
@@ -1267,6 +1269,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         ):
             key = key[:num_tokens]
             value = value[:num_tokens]
+
         # Get workspace from cache or calculate it if not present.
         if self.sinks is not None:
             actual_seq_qlen = attn_metadata.actual_seq_lengths_q
@@ -1329,28 +1332,64 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     sparse_mode=4,
                 )
             else:
-                attn_output, _ = DeviceOperator.npu_fused_infer_attention_score(
-                    query=query,
-                    key=key,
-                    value=value,
-                    atten_mask=attn_metadata.attn_mask,
-                    block_table=block_table,
-                    input_layout="TND",
-                    block_size=block_size,
-                    actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
-                    actual_seq_lengths_kv=actual_seq_lengths_kv,
-                    num_key_value_heads=self.num_kv_heads,
-                    num_heads=self.num_heads,
-                    head_size=self.head_size,
-                    scale=self.scale,
-                    key_cache=self.key_cache,
-                    value_cache=self.value_cache,
-                    current_key=passed_key,
-                    current_value=passed_value,
-                    attn_metadata=attn_metadata,
-                    is_prefill_no_cache=attn_metadata.attn_state == AscendAttentionState.PrefillNoCache,
-                    sparse_mode=3,
-                )
+                if envs_ascend.VLLM_ASCEND_USE_PAGED_ATTENTION:
+                    actual_seq_qlen = torch.as_tensor(
+                        attn_metadata.actual_seq_lengths_q,
+                        dtype=torch.int64,
+                        device=query.device,
+                    )
+                    kv_lens_or_cu = torch.as_tensor(
+                        actual_seq_lengths_kv,
+                        dtype=torch.int64,
+                        device=query.device,
+                    )
+                    if block_table is not None and block_table.dtype != torch.int32:
+                        block_table = block_table.to(torch.int32)
+                    if block_table is None:
+                        kv_lens = torch.cat([
+                            kv_lens_or_cu[:1],
+                            kv_lens_or_cu[1:] - kv_lens_or_cu[:-1],
+                        ])
+                    else:
+                        kv_lens = kv_lens_or_cu
+                    attn_output = paged_attention(
+                        q=query,
+                        k_cache=key,
+                        v_cache=value,
+                        block_table=block_table,
+                        cu_q_lens=actual_seq_qlen,
+                        kv_lens=kv_lens,
+                        num_q_heads=self.num_heads,
+                        num_kv_heads=self.num_kv_heads,
+                        sm_scale=self.scale,
+                        block_size=block_size,
+                        sinks=None,
+                        atten_mask=attn_metadata.attn_mask,
+                        use_mxfp4_p=envs_ascend.VLLM_ASCEND_PAGED_ATTN_USE_MXFP4_P,
+                    )
+                else:
+                    attn_output, _ = DeviceOperator.npu_fused_infer_attention_score(
+                        query=query,
+                        key=key,
+                        value=value,
+                        atten_mask=attn_metadata.attn_mask,
+                        block_table=block_table,
+                        input_layout="TND",
+                        block_size=block_size,
+                        actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
+                        actual_seq_lengths_kv=actual_seq_lengths_kv,
+                        num_key_value_heads=self.num_kv_heads,
+                        num_heads=self.num_heads,
+                        head_size=self.head_size,
+                        scale=self.scale,
+                        key_cache=self.key_cache,
+                        value_cache=self.value_cache,
+                        current_key=passed_key,
+                        current_value=passed_value,
+                        attn_metadata=attn_metadata,
+                        is_prefill_no_cache=attn_metadata.attn_state == AscendAttentionState.PrefillNoCache,
+                        sparse_mode=3,
+                    )
 
             attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
         output[:num_tokens] = attn_output[:num_tokens]
