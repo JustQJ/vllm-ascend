@@ -274,6 +274,9 @@ class _paged_attention(torch.autograd.Function):
         assert num_q_heads % num_kv_heads == 0
         assert BLOCK_M in {16, 32, 64}
         assert BLOCK_N in {32, 64, 128, 256}
+        assert block_table.dtype == torch.int32
+        assert cu_q_lens.dtype == torch.int32
+        assert kv_lens.dtype == torch.int32
         if sinks is not None:
             assert sinks.shape[0] == num_q_heads
         if atten_mask is not None:
@@ -289,9 +292,12 @@ class _paged_attention(torch.autograd.Function):
             cu_q_lens = torch.cat([cu_q_lens.new_zeros((1,)), cu_q_lens])
         assert cu_q_lens.shape[0] == num_seqs + 1
         cu_q_lens_cpu = cu_q_lens.detach().cpu().tolist()
+        assert cu_q_lens_cpu[0] == 0
+        assert cu_q_lens_cpu[-1] == q.shape[0]
         q_block_lens_list = [0]
         for seq_idx in range(num_seqs):
             seq_q_len = cu_q_lens_cpu[seq_idx + 1] - cu_q_lens_cpu[seq_idx]
+            assert seq_q_len >= 0
             q_block_lens_list.append(q_block_lens_list[-1] +
                                      (seq_q_len + BLOCK_M - 1) // BLOCK_M)
         total_q_blocks = q_block_lens_list[-1]

@@ -82,11 +82,17 @@ def _scenario_cases():
 
 
 def _cumulative_lengths(lengths, device):
-    return torch.tensor(lengths, dtype=torch.int32).cumsum(dim=0).to(device)
+    return torch.tensor(_cumulative_lengths_list(lengths),
+                        dtype=torch.int32).to(device)
 
 
 def _cumulative_lengths_list(lengths):
-    return torch.tensor(lengths, dtype=torch.int32).cumsum(dim=0).tolist()
+    total = 0
+    cumulative = []
+    for length in lengths:
+        total += int(length)
+        cumulative.append(total)
+    return cumulative
 
 
 def _build_paged_inputs(q_lens, kv_lens, block_size, num_q_heads, num_kv_heads,
