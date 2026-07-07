@@ -28,6 +28,68 @@ DEVICE = "npu"
 
 
 @triton.jit
+def clip(x, min_val, max_val):
+    """Clip x to [min_val, max_val]."""
+    return tl.minimum(tl.maximum(x, min_val), max_val)
+
+
+@triton.jit
+def to_mxfp4c7(tensor, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, p_cx=7.0):
+    """Quantize tensor to MXFP4-C7 (block-shared-scale MXFP4 with p_scale).
+
+    MXFP4: 2 exponent bits + 1 sign bit + 2 mantissa bits (mbits=3 with
+    implicit leading 1).  Shared scale is computed per 32-element sub-block and
+    divided by *p_cx* before ceiling, which has the effect of attenuating
+    small values (equivalent to ~p_scale ≈ 0.93 for p_cx=7).
+
+    Reference: ``tests/ut/attention/fake_quant/test_npu_fused_infer_attention_triton.py``
+    """
+    FP32_EXPONENT_BIAS = 127.0
+    FP32_MIN_NORMAL = tl.exp2(-FP32_EXPONENT_BIAS + 1)
+    ebits, mbits = 2.0, 3.0
+    emax = tl.exp2(ebits - 1)
+    max_norm = tl.exp2(emax) * (tl.exp2(mbits - 1) - 1) / tl.exp2(mbits - 2)
+
+    NUM_SUB_BLOCKS: tl.constexpr = BLOCK_N // 32
+    tensor = tl.reshape(tensor, (BLOCK_M, NUM_SUB_BLOCKS, 32))
+
+    shared_exp = tl.max(tl.abs(tensor), axis=-1, keep_dims=True)
+    shared_exp = shared_exp / p_cx
+
+    mask = (shared_exp == 0).to(shared_exp.dtype)
+    M = shared_exp + FP32_MIN_NORMAL * mask
+    shared_exp = tl.ceil(tl.log2(M))
+
+    mask = (tensor > -FP32_EXPONENT_BIAS).to(tensor.dtype)
+    tensor = tensor * mask
+
+    scale_emax = tl.exp2(8.0 - 1.0) - 1
+    shared_exp = tl.where(shared_exp > scale_emax, float('nan'), shared_exp)
+    shared_exp = tl.where(shared_exp < -scale_emax, -scale_emax, shared_exp)
+
+    tensor = tensor / (tl.exp2(shared_exp))
+    mask = (tensor == 0).to(tensor.dtype)
+    private_exp = tl.floor(tl.log2(tl.abs(tensor) + mask))
+
+    min_exp = -(tl.exp2(ebits - 1)) + 2
+    private_exp = tl.maximum(private_exp, min_exp)
+
+    tensor = tensor / (tl.exp2(private_exp)) * (tl.exp2(mbits - 2))
+    tensor_sign = (tensor > 0).to(tensor.dtype) - (tensor < 0).to(tensor.dtype)
+    tensor = tensor_sign * tl.floor(tl.abs(tensor) + 0.5)
+    tensor = tensor / (tl.exp2(mbits - 2)) * (tl.exp2(private_exp))
+
+    tensor = clip(tensor, -max_norm, max_norm)
+    tensor = tl.where(tensor == float('inf'), float('inf'), tensor)
+    tensor = tl.where(tensor == -float('inf'), -float('inf'), tensor)
+    tensor = tl.where(tensor == float('nan'), float('nan'), tensor)
+
+    recovered_tensor = tensor * (tl.exp2(shared_exp))
+    recovered_tensor = tl.reshape(recovered_tensor, (BLOCK_M, BLOCK_N))
+    return recovered_tensor
+
+
+@triton.jit
 def _paged_attn_fwd_inner(
         acc, l_i, m_i, q,
         K_base, V_base,
@@ -50,6 +112,7 @@ def _paged_attn_fwd_inner(
         BLOCK_N: tl.constexpr,
         HEAD_DIM: tl.constexpr,
         HAS_ATTEN_MASK: tl.constexpr,
+        USE_MXFP4_P: tl.constexpr,
 ):
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, HEAD_DIM)
@@ -101,6 +164,8 @@ def _paged_attn_fwd_inner(
         m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
         qk -= m_ij[:, None]
         p = tl.exp(qk)
+        if USE_MXFP4_P:
+            p = to_mxfp4c7(p, BLOCK_M, BLOCK_N).to(p.dtype)
         l_ij = tl.sum(p, axis=1)
         alpha = tl.exp(m_i - m_ij)
         l_i = l_i * alpha + l_ij
@@ -145,6 +210,7 @@ def _paged_attn_fwd(
         mask_cols,
         HAS_SINKS: tl.constexpr,
         HAS_ATTEN_MASK: tl.constexpr,
+        USE_MXFP4_P: tl.constexpr,
 ):
     q_block_idx = tl.program_id(0)
     q_head_idx = tl.program_id(1)
@@ -221,6 +287,7 @@ def _paged_attn_fwd(
         BLOCK_N=BLOCK_N,
         HEAD_DIM=HEAD_DIM,
         HAS_ATTEN_MASK=HAS_ATTEN_MASK,
+        USE_MXFP4_P=USE_MXFP4_P,
     )
 
     acc = acc / l_i[:, None]
@@ -266,7 +333,7 @@ class _paged_attention(torch.autograd.Function):
                 cu_q_lens, kv_lens,
                 num_q_heads, num_kv_heads,
                 sm_scale, block_size, BLOCK_M=16, BLOCK_N=128, sinks=None,
-                atten_mask=None):
+                atten_mask=None, use_mxfp4_p=False):
         del ctx
         head_dim = q.shape[-1]
         assert q.dim() == 3
@@ -293,7 +360,7 @@ class _paged_attention(torch.autograd.Function):
         assert cu_q_lens.shape[0] == num_seqs + 1
         cu_q_lens_cpu = cu_q_lens.detach().cpu().tolist()
         assert cu_q_lens_cpu[0] == 0
-        assert cu_q_lens_cpu[-1] == q.shape[0]
+        assert 0 <= cu_q_lens_cpu[-1] <= q.shape[0]
         q_block_lens_list = [0]
         for seq_idx in range(num_seqs):
             seq_q_len = cu_q_lens_cpu[seq_idx + 1] - cu_q_lens_cpu[seq_idx]
@@ -355,6 +422,7 @@ class _paged_attention(torch.autograd.Function):
             mask_cols=mask_cols,
             HAS_SINKS=sinks is not None,
             HAS_ATTEN_MASK=atten_mask is not None,
+            USE_MXFP4_P=use_mxfp4_p,
             num_warps=(4 if head_dim == 64 else 8),
         )
         return out

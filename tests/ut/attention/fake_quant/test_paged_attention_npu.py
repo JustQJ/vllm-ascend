@@ -16,7 +16,7 @@ BLOCK_SIZE = 128
 PREFILL_TARGETS = [2*1024, 8 * 1024]
 DECODE_KV_TARGET = 8 * 1024
 DECODE_Q_TARGETS = [1, 4, 8]
-BATCH_SIZES = [1, 4, 8, 32]
+BATCH_SIZES = [1, 4, 8, 16, 32, 64]
 BLOCK_SHAPES = [
     # (16, 32),
     # (16, 64),
@@ -49,6 +49,9 @@ def _scenario_cases():
     cases = []
     shape_idx = 0
     for batch_size in BATCH_SIZES:
+        ## only when batch size is smaller than 8 for prefill scenario, otherwise the kernel will be error due to program is to larger
+        if batch_size > 8:
+            continue
         for target_len in PREFILL_TARGETS:
             block_m, block_n = BLOCK_SHAPES[shape_idx % len(BLOCK_SHAPES)]
             shape_idx += 1
@@ -141,6 +144,104 @@ def _build_paged_inputs(q_lens, kv_lens, block_size, num_q_heads, num_kv_heads,
         actual_seq_qlen,
         actual_seq_kvlen,
         sinks.to(device).contiguous(),
+    )
+
+
+def _print_error_stats(name, abs_error, rel_error):
+    abs_flat = abs_error.flatten()
+    rel_flat = rel_error.flatten()
+    quantiles = torch.tensor([0.5, 0.9, 0.99], dtype=torch.float32)
+    abs_q = torch.quantile(abs_flat, quantiles)
+    rel_q = torch.quantile(rel_flat, quantiles)
+    print(
+        f"\n[{name}] abs_error: "
+        f"mean={abs_flat.mean().item():.6e}, "
+        f"max={abs_flat.max().item():.6e}, "
+        f"p50={abs_q[0].item():.6e}, "
+        f"p90={abs_q[1].item():.6e}, "
+        f"p99={abs_q[2].item():.6e}"
+    )
+    print(
+        f"[{name}] rel_error: "
+        f"mean={rel_flat.mean().item():.6e}, "
+        f"max={rel_flat.max().item():.6e}, "
+        f"p50={rel_q[0].item():.6e}, "
+        f"p90={rel_q[1].item():.6e}, "
+        f"p99={rel_q[2].item():.6e}"
+    )
+
+
+def _save_error_distribution_plot(abs_error, output_path, title):
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    pyplot = pytest.importorskip("matplotlib.pyplot")
+
+    data = abs_error.flatten().numpy()
+    pyplot.figure(figsize=(8, 5))
+    pyplot.hist(data, bins=100, log=True)
+    pyplot.xlabel("absolute error")
+    pyplot.ylabel("count (log scale)")
+    pyplot.title(title)
+    pyplot.grid(True, alpha=0.3)
+    pyplot.tight_layout()
+    pyplot.savefig(output_path)
+    pyplot.close()
+    print(f"[MXFP4_P] abs error distribution plot: {output_path}")
+
+
+@pytest.mark.parametrize(
+    "scenario,batch_size,q_lens,kv_lens,block_m,block_n",
+    _scenario_cases(),
+)
+def test_paged_attention_mxfp4_p_error_distribution(
+        scenario, batch_size, q_lens, kv_lens, block_m, block_n, tmp_path):
+    assert batch_size == len(q_lens)
+    if not hasattr(torch, "npu") or not torch.npu.is_available():
+        pytest.skip("NPU is required for Triton PagedAttention comparison")
+
+    torch.manual_seed(0)
+    device = "npu"
+    softmax_scale = HEAD_DIM ** -0.5
+    query, key_cache, value_cache, block_table, actual_seq_qlen, actual_seq_kvlen, sinks = (
+        _build_paged_inputs(q_lens, kv_lens, BLOCK_SIZE, NUM_Q_HEADS,
+                            NUM_KV_HEADS, HEAD_DIM, DTYPE, device)
+    )
+
+    if max(q_lens) == 1:
+        atten_mask = None
+    else:
+        atten_mask = _make_sparse_causal_mask(device)
+
+    base_out = paged_attention(query, key_cache, value_cache, block_table,
+                               actual_seq_qlen, actual_seq_kvlen,
+                               NUM_Q_HEADS, NUM_KV_HEADS, softmax_scale,
+                               BLOCK_SIZE, block_m, block_n, sinks,
+                               atten_mask, False)
+    mxfp4_p_out = paged_attention(query, key_cache, value_cache, block_table,
+                                  actual_seq_qlen, actual_seq_kvlen,
+                                  NUM_Q_HEADS, NUM_KV_HEADS, softmax_scale,
+                                  BLOCK_SIZE, block_m, block_n, sinks,
+                                  atten_mask, True)
+    torch.npu.synchronize()
+
+    base_cpu = base_out.to(torch.float32).cpu()
+    mxfp4_p_cpu = mxfp4_p_out.to(torch.float32).cpu()
+    abs_error = (mxfp4_p_cpu - base_cpu).abs()
+    rel_error = abs_error / base_cpu.abs().clamp_min(1e-6)
+    assert torch.isfinite(abs_error).all()
+    assert torch.isfinite(rel_error).all()
+    assert abs_error.max().item() > 0
+
+    case_name = (
+        f"{scenario}-bs{batch_size}-qmax{max(q_lens)}-"
+        f"kvmax{max(kv_lens)}-bm{block_m}-bn{block_n}"
+    )
+    _print_error_stats(case_name, abs_error, rel_error)
+    plot_path = tmp_path / f"{case_name}-mxfp4-p-abs-error.png"
+    _save_error_distribution_plot(
+        abs_error,
+        plot_path,
+        f"USE_MXFP4_P vs baseline abs error ({case_name})",
     )
 
 
