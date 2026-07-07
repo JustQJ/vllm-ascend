@@ -10,7 +10,7 @@ This mirrors the paged ``npu_fused_infer_attention_score_v2`` call in
   cu_q_lens  : (num_seqs,) production actual_seq_qlen, or
                (num_seqs + 1,) cumulative q lengths with leading 0
   kv_lens    : (num_seqs,) actual kv length per sequence
-  q_block_lens: (num_seqs + 1,) cumulative query-block lengths for BLOCK_M
+  q_block_seq/q_block_local: per-query-block sequence and local block ids
   atten_mask  : optional 2D causal mask, where non-zero entries are masked
   sinks       : optional (num_q_heads,) attention sink bias
 
@@ -219,7 +219,8 @@ def _paged_attn_fwd_inner(
 @triton.jit
 def _paged_attn_fwd(
         Q, K_cache, V_cache, Out, block_table_ptr, atten_mask_ptr,
-        cu_q_lens_ptr, q_block_lens_ptr, kv_lens_ptr, sink_ptr,
+        cu_q_lens_ptr, q_block_seq_ptr, q_block_local_ptr, kv_lens_ptr,
+        sink_ptr,
         stride_q_tok, stride_q_head, stride_q_dim: tl.constexpr,
         stride_k_blk, stride_k_slot, stride_k_flat: tl.constexpr,
         stride_v_blk, stride_v_slot, stride_v_flat: tl.constexpr,
@@ -234,7 +235,6 @@ def _paged_attn_fwd(
         qk_scale,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
-        num_seqs,
         mask_rows,
         mask_cols,
         HAS_SINKS: tl.constexpr,
@@ -245,25 +245,14 @@ def _paged_attn_fwd(
     q_head_idx = tl.program_id(1)
     kv_head_idx = q_head_idx // num_kv_groups
 
-    lo = 0
-    hi = num_seqs
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if tl.load(q_block_lens_ptr + mid) <= q_block_idx:
-            lo = mid + 1
-        else:
-            hi = mid
-    seq = lo - 1
-    if seq < 0:
-        seq = 0
+    seq = tl.load(q_block_seq_ptr + q_block_idx).to(tl.int32)
+    q_block_local = tl.load(q_block_local_ptr + q_block_idx).to(tl.int32)
 
     q_start = tl.load(cu_q_lens_ptr + seq)
     q_end = tl.load(cu_q_lens_ptr + seq + 1)
     q_len = q_end - q_start
     kv_len = tl.load(kv_lens_ptr + seq).to(tl.int32)
 
-    q_block_start = tl.load(q_block_lens_ptr + seq)
-    q_block_local = q_block_idx - q_block_start
     offs_m = tl.arange(0, BLOCK_M)
     q_idx = q_start + q_block_local * BLOCK_M + offs_m
     q_local = q_idx - q_start
@@ -390,15 +379,20 @@ class _paged_attention(torch.autograd.Function):
         cu_q_lens_cpu = cu_q_lens.detach().cpu().tolist()
         assert cu_q_lens_cpu[0] == 0
         assert 0 <= cu_q_lens_cpu[-1] <= q.shape[0]
-        q_block_lens_list = [0]
+        q_block_seq_list = []
+        q_block_local_list = []
+        total_q_blocks = 0
         for seq_idx in range(num_seqs):
             seq_q_len = cu_q_lens_cpu[seq_idx + 1] - cu_q_lens_cpu[seq_idx]
             assert seq_q_len >= 0
-            q_block_lens_list.append(q_block_lens_list[-1] +
-                                     (seq_q_len + BLOCK_M - 1) // BLOCK_M)
-        total_q_blocks = q_block_lens_list[-1]
-        q_block_lens = torch.tensor(q_block_lens_list, dtype=torch.int32,
-                                    device=q.device)
+            seq_q_blocks = (seq_q_len + BLOCK_M - 1) // BLOCK_M
+            q_block_seq_list.extend([seq_idx] * seq_q_blocks)
+            q_block_local_list.extend(range(seq_q_blocks))
+            total_q_blocks += seq_q_blocks
+        q_block_seq = torch.tensor(q_block_seq_list, dtype=torch.int32,
+                                   device=q.device)
+        q_block_local = torch.tensor(q_block_local_list, dtype=torch.int32,
+                                     device=q.device)
 
         qk_scale = sm_scale
         num_kv_groups = num_q_heads // num_kv_heads
@@ -429,7 +423,8 @@ class _paged_attention(torch.autograd.Function):
             block_table_ptr=block_table,
             atten_mask_ptr=atten_mask_ptr,
             cu_q_lens_ptr=cu_q_lens,
-            q_block_lens_ptr=q_block_lens,
+            q_block_seq_ptr=q_block_seq,
+            q_block_local_ptr=q_block_local,
             kv_lens_ptr=kv_lens,
             sink_ptr=sinks,
             stride_q_tok=q.stride(0),
@@ -454,7 +449,6 @@ class _paged_attention(torch.autograd.Function):
             qk_scale=qk_scale,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
-            num_seqs=num_seqs,
             mask_rows=mask_rows,
             mask_cols=mask_cols,
             HAS_SINKS=sinks is not None,
