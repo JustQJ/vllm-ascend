@@ -186,11 +186,13 @@ def _paged_attn_fwd_inner(
             )
             causal_mask = causal_mask & (mask_value == 0)
         kv_mask = seq_offset[None, :] < kv_seq_len
-        qk = tl.where(q_mask[:, None] & causal_mask & kv_mask, qk, -1.0e20)
+        attn_valid = q_mask[:, None] & causal_mask & kv_mask
+        qk_for_max = tl.where(attn_valid, qk, -1.0e20)
 
-        m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-        qk -= m_ij[:, None]
-        p = tl.exp(qk)
+        m_ij = tl.maximum(m_i, tl.max(qk_for_max, axis=1))
+        p_arg = tl.where(attn_valid, qk - m_ij[:, None], -80.0)
+        p = tl.exp(p_arg)
+        p = tl.where(attn_valid, p, 0.0)
         if USE_MXFP4_P:
             p = to_mxfp4c7_p_only(p, BLOCK_M, BLOCK_N).to(p.dtype)
         l_ij = tl.sum(p, axis=1)
@@ -460,6 +462,8 @@ class _paged_attention(torch.autograd.Function):
             USE_MXFP4_P=use_mxfp4_p,
             num_warps=(4 if head_dim == 64 else 8),
         )
+        if q.device.type == "npu":
+            torch.npu.synchronize()
         return out
 
 
