@@ -387,6 +387,14 @@ class _paged_attention(torch.autograd.Function):
             stride_mask_q = atten_mask.stride(0)
             stride_mask_k = atten_mask.stride(1)
 
+        num_programs = grid[0] * grid[1]
+        assert num_programs <= 65535, (
+            f"Ascend coreDim overflow: {num_programs} > 65535, "
+            f"total_q_blocks={total_q_blocks}, "
+            f"num_q_heads={num_q_heads}, "
+            f"BLOCK_M={BLOCK_M}"
+        )
+
         _paged_attn_fwd[grid](
             Q=q, K_cache=k_cache, V_cache=v_cache, Out=out,
             block_table_ptr=block_table,
