@@ -90,6 +90,33 @@ def to_mxfp4c7(tensor, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, p_cx=7.0):
 
 
 @triton.jit
+def to_mxfp4c7_p_only(p, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                      p_cx: tl.constexpr = 7.0):
+    FP32_MIN_NORMAL = tl.exp2(-126.0)
+    NUM_SUB_BLOCKS: tl.constexpr = BLOCK_N // 32
+
+    x = tl.reshape(p, (BLOCK_M, NUM_SUB_BLOCKS, 32))
+
+    max_val = tl.max(x, axis=-1, keep_dims=True)
+    max_val = tl.maximum(max_val, FP32_MIN_NORMAL)
+
+    shared_exp = tl.ceil(tl.log2(max_val / p_cx))
+    shared_exp = tl.minimum(tl.maximum(shared_exp, -127.0), 127.0)
+
+    x = x * tl.exp2(-shared_exp)
+
+    private_exp = tl.floor(tl.log2(tl.maximum(x, FP32_MIN_NORMAL)))
+    private_exp = tl.maximum(private_exp, 0.0)
+
+    x = x * tl.exp2(-private_exp) * 2.0
+    x = tl.floor(x + 0.5)
+    x = x * 0.5 * tl.exp2(private_exp)
+    x = tl.minimum(x, 6.0)
+
+    x = x * tl.exp2(shared_exp)
+    return tl.reshape(x, (BLOCK_M, BLOCK_N))
+
+@triton.jit
 def _paged_attn_fwd_inner(
         acc, l_i, m_i, q,
         K_base, V_base,
@@ -165,7 +192,7 @@ def _paged_attn_fwd_inner(
         qk -= m_ij[:, None]
         p = tl.exp(qk)
         if USE_MXFP4_P:
-            p = to_mxfp4c7(p, BLOCK_M, BLOCK_N).to(p.dtype)
+            p = to_mxfp4c7_p_only(p, BLOCK_M, BLOCK_N).to(p.dtype)
         l_ij = tl.sum(p, axis=1)
         alpha = tl.exp(m_i - m_ij)
         l_i = l_i * alpha + l_ij

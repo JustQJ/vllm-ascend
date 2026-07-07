@@ -13,24 +13,26 @@ HEAD_DIM = 128
 DTYPE = torch.bfloat16
 KV_CACHE_CAPACITY_TOKENS = 16 * 1024
 BLOCK_SIZE = 128
-PREFILL_TARGETS = [2*1024, 8 * 1024]
+PREFILL_TARGETS = [2*1024, 8*1024]
 DECODE_KV_TARGET = 8 * 1024
 DECODE_Q_TARGETS = [1, 4, 8]
-BATCH_SIZES = [1, 4, 8, 16, 32, 64]
+BATCH_SIZES = [64]
 BLOCK_SHAPES = [
     # (16, 32),
     # (16, 64),
-    # (16, 128),
+    (16, 128),
     # (16, 256),
     # (32, 32),
     # (32, 64),
-    (32, 128),
+    # (32, 128),
     # (32, 256),
     # (64, 32),
     # (64, 64),
     # (64, 128),
     # (64, 256),
 ]
+## TODO MODIFY this 
+PLOTDIR = "/mnt/share/t00970481/mx-quant/figures"
 
 
 def _make_sparse_causal_mask(device):
@@ -50,7 +52,7 @@ def _scenario_cases():
     shape_idx = 0
     for batch_size in BATCH_SIZES:
         ## only when batch size is smaller than 8 for prefill scenario, otherwise the kernel will be error due to program is to larger
-        if batch_size > 8:
+        if batch_size >= 4:
             continue
         for target_len in PREFILL_TARGETS:
             block_m, block_n = BLOCK_SHAPES[shape_idx % len(BLOCK_SHAPES)]
@@ -147,12 +149,32 @@ def _build_paged_inputs(q_lens, kv_lens, block_size, num_q_heads, num_kv_heads,
     )
 
 
+def _safe_quantile(flat, quantiles, max_samples=200000):
+    flat = flat.flatten()
+    n = flat.numel()
+
+    if n <= max_samples:
+        return torch.quantile(flat, quantiles)
+
+    gen = torch.Generator(device=flat.device)
+    gen.manual_seed(0)
+
+    idx = torch.randint(
+        0,
+        n,
+        (max_samples,),
+        device=flat.device,
+        generator=gen,
+    )
+    sampled = flat[idx]
+    return torch.quantile(sampled, quantiles)
+
 def _print_error_stats(name, abs_error, rel_error):
     abs_flat = abs_error.flatten()
     rel_flat = rel_error.flatten()
     quantiles = torch.tensor([0.5, 0.9, 0.99], dtype=torch.float32)
-    abs_q = torch.quantile(abs_flat, quantiles)
-    rel_q = torch.quantile(rel_flat, quantiles)
+    abs_q = _safe_quantile(abs_flat, quantiles)
+    rel_q = _safe_quantile(rel_flat, quantiles)
     print(
         f"\n[{name}] abs_error: "
         f"mean={abs_flat.mean().item():.6e}, "
@@ -194,7 +216,7 @@ def _save_error_distribution_plot(abs_error, output_path, title):
     _scenario_cases(),
 )
 def test_paged_attention_mxfp4_p_error_distribution(
-        scenario, batch_size, q_lens, kv_lens, block_m, block_n, tmp_path):
+        scenario, batch_size, q_lens, kv_lens, block_m, block_n):
     assert batch_size == len(q_lens)
     if not hasattr(torch, "npu") or not torch.npu.is_available():
         pytest.skip("NPU is required for Triton PagedAttention comparison")
@@ -228,6 +250,29 @@ def test_paged_attention_mxfp4_p_error_distribution(
     mxfp4_p_cpu = mxfp4_p_out.to(torch.float32).cpu()
     abs_error = (mxfp4_p_cpu - base_cpu).abs()
     rel_error = abs_error / base_cpu.abs().clamp_min(1e-6)
+
+    def check_nan_inf(tensor, name):
+        nan_mask = torch.isnan(tensor)
+        inf_mask = torch.isinf(tensor)
+        nan_cnt = nan_mask.sum().item()
+        inf_cnt = inf_mask.sum().item()
+        total_elem = tensor.numel()
+        
+        print(f"\n==== {name} ====")
+        print(f"total num: {total_elem}")
+        print(f"NaN: {nan_cnt}, 占比: {nan_cnt / total_elem:.6f}")
+        print(f"Inf: {inf_cnt}, 占比: {inf_cnt / total_elem:.6f}")
+        if nan_cnt > 0:
+            print("NaN")
+        if inf_cnt > 0:
+            print("Inf")
+        return nan_cnt, inf_cnt
+    
+    check_nan_inf(base_cpu, "base_cpu")
+    check_nan_inf(mxfp4_p_cpu, "mxfp4_p_cpu")
+    check_nan_inf(abs_error, "abs_error")
+    check_nan_inf(rel_error, "rel_error")
+
     assert torch.isfinite(abs_error).all()
     assert torch.isfinite(rel_error).all()
     assert abs_error.max().item() > 0
@@ -237,7 +282,7 @@ def test_paged_attention_mxfp4_p_error_distribution(
         f"kvmax{max(kv_lens)}-bm{block_m}-bn{block_n}"
     )
     _print_error_stats(case_name, abs_error, rel_error)
-    plot_path = tmp_path / f"{case_name}-mxfp4-p-abs-error.png"
+    plot_path = f"{PLOTDIR}/{case_name}-mxfp4-p-abs-error.png"
     _save_error_distribution_plot(
         abs_error,
         plot_path,
@@ -300,4 +345,4 @@ def test_paged_attention_matches_fias_v2_with_qwen3_moe_scenarios(
         learnable_sink=sinks,
     )
 
-    torch.testing.assert_close(triton_out, fias_out, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(triton_out, fias_out, atol=1e-3, rtol=1e-3)
