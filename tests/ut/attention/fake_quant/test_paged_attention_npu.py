@@ -4,7 +4,7 @@ import torch
 torch_npu = pytest.importorskip("torch_npu")
 pytest.importorskip("triton")
 
-from tests.ut.attention.fake_quant.paged_attention_npu import paged_attention
+from vllm_ascend.ops.triton.paged_attn.paged_attention_npu import paged_attention
 
 
 NUM_Q_HEADS = 64

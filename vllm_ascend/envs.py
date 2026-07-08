@@ -110,6 +110,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Whether to use Triton PagedAttention instead of npu_fused_infer_attention_score_v2.
+    # When enabled, the Triton kernel in vllm_ascend/ops/triton/paged_attn/ will be used
+    # for paged attention computation in forward_fused_infer_attention.
+    "VLLM_ASCEND_USE_PAGED_ATTENTION": lambda: bool(int(os.getenv("VLLM_ASCEND_USE_PAGED_ATTENTION", "0"))),
+    # Whether to apply MXFP4-C7 fake quantization to the softmax-P matrix inside
+    # the Triton PagedAttention kernel. Only takes effect when
+    # VLLM_ASCEND_USE_PAGED_ATTENTION is enabled.
+    "VLLM_ASCEND_PAGED_ATTN_USE_MXFP4_P": lambda: bool(int(os.getenv("VLLM_ASCEND_PAGED_ATTN_USE_MXFP4_P", "0"))),
 }
 
 # end-env-vars-definition
