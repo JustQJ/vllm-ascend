@@ -169,7 +169,7 @@ def _safe_quantile(flat, quantiles, max_samples=200000):
     sampled = flat[idx]
     return torch.quantile(sampled, quantiles)
 
-def _print_error_stats(name, abs_error, rel_error):
+def _print_error_stats(name, abs_error, rel_error, mse=None):
     abs_flat = abs_error.flatten()
     rel_flat = rel_error.flatten()
     quantiles = torch.tensor([0.5, 0.9, 0.99], dtype=torch.float32)
@@ -191,6 +191,8 @@ def _print_error_stats(name, abs_error, rel_error):
         f"p90={rel_q[1].item():.6e}, "
         f"p99={rel_q[2].item():.6e}"
     )
+    if mse is not None:
+        print(f"[{name}] mse: {mse:.6e}")
 
 
 def _save_error_distribution_plot(abs_error, output_path, title):
@@ -243,7 +245,7 @@ def test_paged_attention_mxfp4_p_error_distribution(
     torch_npu.npu.manual_seed_all(0)
     device = "npu"
     softmax_scale = HEAD_DIM ** -0.5
-    query, key_cache, value_cache, block_table, actual_seq_qlen, actual_seq_kvlen, sinks = (
+    query, key_cache, value_cache, block_table, actual_seq_qlen, actual_seq_kvlen, _ = (
         _build_paged_inputs(q_lens, kv_lens, BLOCK_SIZE, NUM_Q_HEADS,
                             NUM_KV_HEADS, HEAD_DIM, DTYPE, device)
     )
@@ -255,13 +257,15 @@ def test_paged_attention_mxfp4_p_error_distribution(
     base_out = paged_attention(query, key_cache, value_cache, block_table,
                                actual_seq_qlen, actual_seq_kvlen,
                                NUM_Q_HEADS, NUM_KV_HEADS, softmax_scale,
-                               BLOCK_SIZE, block_m, block_n, sinks,
-                               atten_mask, False)
+                               BLOCK_SIZE, block_m, block_n,
+                               sinks=None, atten_mask=atten_mask,
+                               use_mxfp4_p=False)
     mxfp4_p_out = paged_attention(query, key_cache, value_cache, block_table,
                                   actual_seq_qlen, actual_seq_kvlen,
                                   NUM_Q_HEADS, NUM_KV_HEADS, softmax_scale,
-                                  BLOCK_SIZE, block_m, block_n, sinks,
-                                  atten_mask, True)
+                                  BLOCK_SIZE, block_m, block_n,
+                                  sinks=None, atten_mask=atten_mask,
+                                  use_mxfp4_p=True)
     torch.npu.synchronize()
 
     base_cpu = base_out.to(torch.float32).cpu()
@@ -269,19 +273,7 @@ def test_paged_attention_mxfp4_p_error_distribution(
     abs_error = (mxfp4_p_cpu - base_cpu).abs()
     rel_error = abs_error / base_cpu.abs().clamp_min(1e-6)
 
-    
-    
-    # check_nan_inf(base_cpu, "base_cpu")
-    # check_nan_inf(mxfp4_p_cpu, "mxfp4_p_cpu2")
-    # check_nan_inf(abs_error, "abs_error")
-    # check_nan_inf(rel_error, "rel_error")
-
-    # base_cpu_nan_mask = torch.isnan(mxfp4_p_cpu).nonzero()
-    # print(base_cpu_nan_mask[:50].tolist())
-    # print("mxfp4_p_cpu shape", mxfp4_p_cpu.shape)
-
-
-    assert torch.isfinite(abs_error).all()
+    mse = (mxfp4_p_cpu - base_cpu).pow(2).mean().item()
     assert torch.isfinite(rel_error).all()
     assert abs_error.max().item() >= 0
 
@@ -289,7 +281,7 @@ def test_paged_attention_mxfp4_p_error_distribution(
         f"{scenario}-bs{batch_size}-qmax{max(q_lens)}-"
         f"kvmax{max(kv_lens)}-bm{block_m}-bn{block_n}"
     )
-    _print_error_stats(case_name, abs_error, rel_error)
+    _print_error_stats(case_name, abs_error, rel_error, mse)
     plot_path = f"{PLOTDIR}/{case_name}-mxfp4-p-abs-error.png"
     _save_error_distribution_plot(
         abs_error,
@@ -359,5 +351,77 @@ def test_paged_attention_matches_fias_v2_with_qwen3_moe_scenarios(
         actual_seq_kvlen=actual_seq_kvlen_list,
         learnable_sink=sinks,
     )
+
+    mse = (triton_out.float() - fias_out.float()).pow(2).mean().item()
+    print(f"[triton-vs-fias_v2] mse: {mse:.6e}")
+
+    torch.testing.assert_close(triton_out, fias_out, atol=5e-3, rtol=5e-3)
+
+
+@pytest.mark.parametrize(
+    "scenario,batch_size,q_lens,kv_lens,block_m,block_n",
+    _scenario_cases(),
+)
+def test_paged_attention_matches_fias_v1_with_qwen3_moe_scenarios(
+        scenario, batch_size, q_lens, kv_lens, block_m, block_n):
+    """对比 Triton paged_attention（无 sink）与 torch_npu.npu_fused_infer_attention_score（FIAS v1）。
+
+    FIAS v1 对应 DeviceOperator.npu_fused_infer_attention_score 路径：
+    production 中默认 sparse_mode=3、无 sliding_window、无 learnable_sink 时走此分支。
+    """
+    del scenario
+    assert batch_size == len(q_lens)
+    if not hasattr(torch, "npu") or not torch.npu.is_available():
+        pytest.skip("NPU is required for torch_npu FIAS v1 comparison")
+
+    torch.manual_seed(0)
+    torch_npu.npu.manual_seed(0)
+    torch_npu.npu.manual_seed_all(0)
+    device = "npu"
+    softmax_scale = HEAD_DIM ** -0.5
+
+    # FIAS v1 不支持 learnable_sink，paged_attention 侧也传 sinks=None
+    query, key_cache, value_cache, block_table, actual_seq_qlen, actual_seq_kvlen, _ = (
+        _build_paged_inputs(q_lens, kv_lens, BLOCK_SIZE, NUM_Q_HEADS,
+                            NUM_KV_HEADS, HEAD_DIM, DTYPE, device)
+    )
+    actual_seq_qlen_list = _cumulative_lengths_list(q_lens)
+    actual_seq_kvlen_list = [int(length) for length in kv_lens]
+    if max(q_lens) == 1:
+        sparse_mode = 0
+        atten_mask = None
+    else:
+        sparse_mode = 3
+        atten_mask = _make_sparse_causal_mask(device)
+
+    # ———— Triton PagedAttention（无 sink） ————
+    triton_out = paged_attention(
+        query, key_cache, value_cache, block_table,
+        actual_seq_qlen, actual_seq_kvlen,
+        NUM_Q_HEADS, NUM_KV_HEADS, softmax_scale,
+        BLOCK_SIZE, block_m, block_n,
+        sinks=None,          # ← FIAS v1 无 sink
+        atten_mask=atten_mask,
+    )
+
+    # ———— FIAS v1（对应 DeviceOperator → torch_npu.npu_fused_infer_attention_score） ————
+    fias_out, _ = torch_npu.npu_fused_infer_attention_score(
+        query=query,
+        key=key_cache,
+        value=value_cache,
+        num_heads=NUM_Q_HEADS,                # v1: num_heads
+        num_key_value_heads=NUM_KV_HEADS,
+        scale=softmax_scale,                   # v1: scale
+        atten_mask=atten_mask,
+        block_table=block_table,
+        input_layout="TND",
+        block_size=BLOCK_SIZE,
+        actual_seq_lengths=actual_seq_qlen_list,       # v1: actual_seq_lengths
+        actual_seq_lengths_kv=actual_seq_kvlen_list,
+        sparse_mode=sparse_mode,
+    )
+
+    mse = (triton_out.float() - fias_out.float()).pow(2).mean().item()
+    print(f"[triton-vs-fias_v1] mse: {mse:.6e}")
 
     torch.testing.assert_close(triton_out, fias_out, atol=5e-3, rtol=5e-3)
