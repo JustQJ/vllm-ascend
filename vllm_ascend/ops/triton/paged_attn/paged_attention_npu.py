@@ -465,5 +465,37 @@ class _paged_attention(torch.autograd.Function):
         )
         return out
 
-
-paged_attention = _paged_attention.apply
+def paged_attention(
+    query,
+    key_cache,
+    value_cache,
+    block_table,
+    actual_seq_qlen,
+    actual_seq_kvlen,
+    num_q_heads,
+    num_kv_heads,
+    softmax_scale,
+    block_size,
+    block_m=16,
+    block_n=128,
+    sinks=None,
+    atten_mask=None,
+    use_mxfp4_p=False
+):
+    return _paged_attention.apply(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        actual_seq_qlen,
+        actual_seq_kvlen,
+        num_q_heads,
+        num_kv_heads,
+        softmax_scale,
+        block_size,
+        block_m,
+        block_n,
+        sinks,
+        atten_mask,
+        use_mxfp4_p
+    )
