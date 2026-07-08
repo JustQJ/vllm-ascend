@@ -194,7 +194,7 @@ def _paged_attn_fwd_inner(
         p = tl.exp(p_arg)
         p = tl.where(attn_valid, p, 0.0)
         if USE_MXFP4_P:
-            p = to_mxfp4c7_p_only(p, BLOCK_M, BLOCK_N).to(p.dtype)
+            p = to_mxfp4c7(p, BLOCK_M, BLOCK_N).to(p.dtype)
         l_ij = tl.sum(p, axis=1)
         alpha = tl.exp(m_i - m_ij)
         l_i = l_i * alpha + l_ij
