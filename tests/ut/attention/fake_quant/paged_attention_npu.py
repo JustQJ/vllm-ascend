@@ -375,24 +375,31 @@ class _paged_attention(torch.autograd.Function):
         num_seqs = kv_lens.shape[0]
         if cu_q_lens.shape[0] == num_seqs:
             cu_q_lens = torch.cat([cu_q_lens.new_zeros((1,)), cu_q_lens])
-        assert cu_q_lens.shape[0] == num_seqs + 1
-        cu_q_lens_cpu = cu_q_lens.detach().cpu().tolist()
-        assert cu_q_lens_cpu[0] == 0
-        assert 0 <= cu_q_lens_cpu[-1] <= q.shape[0]
-        q_block_seq_list = []
-        q_block_local_list = []
-        total_q_blocks = 0
-        for seq_idx in range(num_seqs):
-            seq_q_len = cu_q_lens_cpu[seq_idx + 1] - cu_q_lens_cpu[seq_idx]
-            assert seq_q_len >= 0
-            seq_q_blocks = (seq_q_len + BLOCK_M - 1) // BLOCK_M
-            q_block_seq_list.extend([seq_idx] * seq_q_blocks)
-            q_block_local_list.extend(range(seq_q_blocks))
-            total_q_blocks += seq_q_blocks
-        q_block_seq = torch.tensor(q_block_seq_list, dtype=torch.int32,
-                                   device=q.device)
-        q_block_local = torch.tensor(q_block_local_list, dtype=torch.int32,
-                                     device=q.device)
+        # 每个 sequence 的 query 长度 & block 数
+        seq_q_lens = cu_q_lens[1:] - cu_q_lens[:-1]          # [num_seqs]
+        seq_q_blocks = (seq_q_lens + BLOCK_M - 1) // BLOCK_M  # [num_seqs], ceil 除法
+        # q_block_seq：把 seq_idx 按 block 数 repeat
+        q_block_seq = torch.repeat_interleave(
+            torch.arange(num_seqs, dtype=torch.int32, device=q.device),
+            seq_q_blocks.to(torch.int64),
+        )  # [total_q_blocks]
+
+        total_q_blocks = q_block_seq.shape[0]
+
+        # q_block_local：每个 seq 内 0, 1, 2, ..., seq_q_blocks[i]-1
+        # 构造 prefix starts：每个 seq 在展平数组里的起始位置
+        cum_blocks = torch.cumsum(seq_q_blocks, dim=0)        # [num_seqs]
+        seq_starts = torch.cat([
+            torch.zeros(1, dtype=torch.int32, device=q.device),
+            cum_blocks[:-1],
+        ])  # [num_seqs]，例如 seq_q_blocks=[3,2,4] → [0,3,5]
+        seq_starts_expanded = torch.repeat_interleave(
+            seq_starts, seq_q_blocks.to(torch.int64),
+        )  # [total_q_blocks]
+        q_block_local = (
+            torch.arange(total_q_blocks, dtype=torch.int32, device=q.device)
+            - seq_starts_expanded
+        )
 
         qk_scale = sm_scale
         num_kv_groups = num_q_heads // num_kv_heads
@@ -456,8 +463,6 @@ class _paged_attention(torch.autograd.Function):
             USE_MXFP4_P=use_mxfp4_p,
             num_warps=(4 if head_dim == 64 else 8),
         )
-        if q.device.type == "npu":
-            torch.npu.synchronize()
         return out
 
 
