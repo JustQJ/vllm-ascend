@@ -505,3 +505,69 @@ def test_paged_attention_matches_fias_v1_with_contiguous_prefill(
     mse = (triton_out.float() - fias_out.float()).pow(2).mean().item()
     print(f"[triton-contiguous-prefill-vs-fias_v1] mse: {mse:.6e}")
     torch.testing.assert_close(triton_out, fias_out, atol=5e-3, rtol=5e-3)
+
+
+@pytest.mark.parametrize(
+    "scenario,batch_size,q_lens,kv_lens,block_m,block_n",
+    _prefill_scenario_cases(),
+)
+def test_paged_attention_contiguous_prefill_mxfp4_p_error_distribution(
+        scenario, batch_size, q_lens, kv_lens, block_m, block_n):
+    assert scenario == "prefill"
+    assert batch_size == len(q_lens)
+    assert q_lens == kv_lens
+    if not hasattr(torch, "npu") or not torch.npu.is_available():
+        pytest.skip("NPU is required for Triton PagedAttention comparison")
+
+    torch.manual_seed(0)
+    torch_npu.npu.manual_seed(0)
+    torch_npu.npu.manual_seed_all(0)
+    device = "npu"
+    softmax_scale = HEAD_DIM ** -0.5
+
+    query, key, value, actual_seq_qlen, actual_seq_kvlen = (
+        _build_contiguous_inputs(q_lens, NUM_Q_HEADS, NUM_KV_HEADS,
+                                 HEAD_DIM, DTYPE, device)
+    )
+    atten_mask = _make_sparse_causal_mask(device)
+
+    base_out = paged_attention(
+        query, key, value, None,
+        actual_seq_qlen, actual_seq_kvlen,
+        NUM_Q_HEADS, NUM_KV_HEADS, softmax_scale,
+        BLOCK_SIZE, block_m, block_n,
+        sinks=None,
+        atten_mask=atten_mask,
+        use_mxfp4_p=False,
+    )
+    mxfp4_p_out = paged_attention(
+        query, key, value, None,
+        actual_seq_qlen, actual_seq_kvlen,
+        NUM_Q_HEADS, NUM_KV_HEADS, softmax_scale,
+        BLOCK_SIZE, block_m, block_n,
+        sinks=None,
+        atten_mask=atten_mask,
+        use_mxfp4_p=True,
+    )
+    torch.npu.synchronize()
+
+    base_cpu = base_out.to(torch.float32).cpu()
+    mxfp4_p_cpu = mxfp4_p_out.to(torch.float32).cpu()
+    abs_error = (mxfp4_p_cpu - base_cpu).abs()
+    rel_error = abs_error / base_cpu.abs().clamp_min(1e-6)
+    mse = (mxfp4_p_cpu - base_cpu).pow(2).mean().item()
+
+    assert torch.isfinite(rel_error).all()
+    assert abs_error.max().item() >= 0
+
+    case_name = (
+        f"contiguous-{scenario}-bs{batch_size}-qmax{max(q_lens)}-"
+        f"kvmax{max(kv_lens)}-bm{block_m}-bn{block_n}"
+    )
+    _print_error_stats(case_name, abs_error, rel_error, mse)
+    plot_path = f"{PLOTDIR}/{case_name}-mxfp4-p-abs-error.png"
+    _save_error_distribution_plot(
+        abs_error,
+        plot_path,
+        f"Contiguous prefill USE_MXFP4_P vs baseline abs error ({case_name})",
+    )
