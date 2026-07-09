@@ -88,7 +88,7 @@ def _scenario_cases():
 
 def _cumulative_lengths(lengths, device):
     return torch.tensor(_cumulative_lengths_list(lengths),
-                        dtype=torch.int32).to(device)
+                        dtype=torch.int64).to(device)
 
 
 def _cumulative_lengths_list(lengths):
@@ -135,7 +135,7 @@ def _build_paged_inputs(q_lens, kv_lens, block_size, num_q_heads, num_kv_heads,
             value_cache[physical_block, block_offset] = value_tokens[token_idx].reshape(-1)
 
     actual_seq_qlen = _cumulative_lengths(q_lens, device)
-    actual_seq_kvlen = torch.tensor(kv_lens, dtype=torch.int32, device=device)
+    actual_seq_kvlen = torch.tensor(kv_lens, dtype=torch.int64, device=device)
     sinks = (torch.randn(num_q_heads, dtype=torch.float32) * 0.1).to(
         dtype=dtype)
     return (
@@ -157,7 +157,7 @@ def _build_contiguous_inputs(q_lens, num_q_heads, num_kv_heads, head_dim,
                       dtype=dtype) * 0.25
     value = torch.randn_like(key)
     actual_seq_qlen = _cumulative_lengths(q_lens, device)
-    actual_seq_kvlen = torch.tensor(q_lens, dtype=torch.int32, device=device)
+    actual_seq_kvlen = torch.tensor(q_lens, dtype=torch.int64, device=device)
     return (
         query.to(device).contiguous(),
         key.to(device).contiguous(),

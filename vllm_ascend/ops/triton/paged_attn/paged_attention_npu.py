@@ -11,7 +11,7 @@ This mirrors the paged ``npu_fused_infer_attention_score_v2`` call in
                first prefill (PrefillNoCache)
   cu_q_lens  : (num_seqs,) production actual_seq_qlen, or
                (num_seqs + 1,) cumulative q lengths with leading 0
-  kv_lens    : (num_seqs,) actual kv length per sequence
+  kv_lens    : (num_seqs,) actual kv length per sequence, int64
   q_block_seq/q_block_local: per-query-block sequence and local block ids
   atten_mask  : optional 2D causal mask, where non-zero entries are masked
   sinks       : optional (num_q_heads,) attention sink bias
@@ -268,17 +268,17 @@ def _paged_attn_fwd(
     q_head_idx = tl.program_id(1)
     kv_head_idx = q_head_idx // num_kv_groups
 
-    seq = tl.load(q_block_seq_ptr + q_block_idx).to(tl.int32)
-    q_block_local = tl.load(q_block_local_ptr + q_block_idx).to(tl.int32)
+    seq = tl.load(q_block_seq_ptr + q_block_idx).to(tl.int64)
+    q_block_local = tl.load(q_block_local_ptr + q_block_idx).to(tl.int64)
 
     q_start = tl.load(cu_q_lens_ptr + seq)
     q_end = tl.load(cu_q_lens_ptr + seq + 1)
     q_len = q_end - q_start
-    kv_len = tl.load(kv_lens_ptr + seq).to(tl.int32)
+    kv_len = tl.load(kv_lens_ptr + seq).to(tl.int64)
     if IS_CONTIGUOUS_KV:
-        kv_start = tl.load(cu_k_lens_ptr + seq).to(tl.int32)
+        kv_start = tl.load(cu_k_lens_ptr + seq).to(tl.int64)
     else:
-        kv_start = tl.full((), 0, dtype=tl.int32)
+        kv_start = tl.full((), 0, dtype=tl.int64)
 
     offs_m = tl.arange(0, BLOCK_M)
     q_idx = q_start + q_block_local * BLOCK_M + offs_m
@@ -405,8 +405,8 @@ class _paged_attention(torch.autograd.Function):
         assert num_q_heads % num_kv_heads == 0
         assert BLOCK_M in {16, 32, 64}
         assert BLOCK_N in {32, 64, 128, 256}
-        assert cu_q_lens.dtype == torch.int32
-        assert kv_lens.dtype == torch.int32
+        assert cu_q_lens.dtype == torch.int64
+        assert kv_lens.dtype == torch.int64
         is_contiguous_kv = block_table is None
         if not is_contiguous_kv:
             assert block_table.dtype == torch.int32
@@ -432,7 +432,7 @@ class _paged_attention(torch.autograd.Function):
         if is_contiguous_kv:
             cu_k_lens = torch.cat([
                 kv_lens.new_zeros((1,)),
-                torch.cumsum(kv_lens, dim=0, dtype=torch.int32),
+                torch.cumsum(kv_lens, dim=0, dtype=torch.int64),
             ])
         else:
             cu_k_lens = cu_q_lens
@@ -441,7 +441,7 @@ class _paged_attention(torch.autograd.Function):
         seq_q_blocks = (seq_q_lens + BLOCK_M - 1) // BLOCK_M  # [num_seqs], ceil 除法
         # q_block_seq：把 seq_idx 按 block 数 repeat
         q_block_seq = torch.repeat_interleave(
-            torch.arange(num_seqs, dtype=torch.int32, device=q.device),
+            torch.arange(num_seqs, dtype=torch.int64, device=q.device),
             seq_q_blocks.to(torch.int64),
         )  # [total_q_blocks]
 
@@ -451,14 +451,14 @@ class _paged_attention(torch.autograd.Function):
         # 构造 prefix starts：每个 seq 在展平数组里的起始位置
         cum_blocks = torch.cumsum(seq_q_blocks, dim=0)        # [num_seqs]
         seq_starts = torch.cat([
-            torch.zeros(1, dtype=torch.int32, device=q.device),
+            torch.zeros(1, dtype=torch.int64, device=q.device),
             cum_blocks[:-1],
         ])  # [num_seqs]，例如 seq_q_blocks=[3,2,4] → [0,3,5]
         seq_starts_expanded = torch.repeat_interleave(
             seq_starts, seq_q_blocks.to(torch.int64),
         )  # [total_q_blocks]
         q_block_local = (
-            torch.arange(total_q_blocks, dtype=torch.int32, device=q.device)
+            torch.arange(total_q_blocks, dtype=torch.int64, device=q.device)
             - seq_starts_expanded
         )
 

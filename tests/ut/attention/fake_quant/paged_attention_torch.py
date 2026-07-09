@@ -204,8 +204,8 @@ def paged_attention(q, k_cache, v_cache, block_table, cu_q_lens, kv_lens,
     assert num_q_heads % num_kv_heads == 0
     assert BLOCK_M in {16, 32, 64}
     assert BLOCK_N in {32, 64, 128, 256}
-    assert cu_q_lens.dtype == torch.int32
-    assert kv_lens.dtype == torch.int32
+    assert cu_q_lens.dtype == torch.int64
+    assert kv_lens.dtype == torch.int64
     is_contiguous_kv = block_table is None
     if not is_contiguous_kv:
         assert block_table.dtype == torch.int32

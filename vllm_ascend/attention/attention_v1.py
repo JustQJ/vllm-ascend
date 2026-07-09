@@ -1335,14 +1335,16 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 if envs_ascend.VLLM_ASCEND_USE_PAGED_ATTENTION:
                     actual_seq_qlen = torch.as_tensor(
                         attn_metadata.actual_seq_lengths_q,
-                        dtype=torch.int32,
+                        dtype=torch.int64,
                         device=query.device,
                     )
                     kv_lens_or_cu = torch.as_tensor(
                         actual_seq_lengths_kv,
-                        dtype=torch.int32,
+                        dtype=torch.int64,
                         device=query.device,
                     )
+                    if block_table is not None and block_table.dtype != torch.int32:
+                        block_table = block_table.to(torch.int32)
                     if block_table is None:
                         kv_lens = torch.cat([
                             kv_lens_or_cu[:1],
