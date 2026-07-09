@@ -1332,17 +1332,24 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     sparse_mode=4,
                 )
             else:
-                if envs_ascend.VLLM_ASCEND_USE_PAGED_ATTENTION and block_table is not None:
+                if envs_ascend.VLLM_ASCEND_USE_PAGED_ATTENTION:
                     actual_seq_qlen = torch.as_tensor(
                         attn_metadata.actual_seq_lengths_q,
                         dtype=torch.int32,
                         device=query.device,
                     )
-                    kv_lens = torch.as_tensor(
+                    kv_lens_or_cu = torch.as_tensor(
                         actual_seq_lengths_kv,
                         dtype=torch.int32,
                         device=query.device,
                     )
+                    if block_table is None:
+                        kv_lens = torch.cat([
+                            kv_lens_or_cu[:1],
+                            kv_lens_or_cu[1:] - kv_lens_or_cu[:-1],
+                        ])
+                    else:
+                        kv_lens = kv_lens_or_cu
                     attn_output = paged_attention(
                         q=query,
                         k_cache=key,

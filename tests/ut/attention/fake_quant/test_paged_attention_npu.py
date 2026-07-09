@@ -149,6 +149,24 @@ def _build_paged_inputs(q_lens, kv_lens, block_size, num_q_heads, num_kv_heads,
     )
 
 
+def _build_contiguous_inputs(q_lens, num_q_heads, num_kv_heads, head_dim,
+                             dtype, device):
+    query = torch.randn(sum(q_lens), num_q_heads, head_dim,
+                        dtype=dtype) * 0.25
+    key = torch.randn(sum(q_lens), num_kv_heads, head_dim,
+                      dtype=dtype) * 0.25
+    value = torch.randn_like(key)
+    actual_seq_qlen = _cumulative_lengths(q_lens, device)
+    actual_seq_kvlen = torch.tensor(q_lens, dtype=torch.int32, device=device)
+    return (
+        query.to(device).contiguous(),
+        key.to(device).contiguous(),
+        value.to(device).contiguous(),
+        actual_seq_qlen,
+        actual_seq_kvlen,
+    )
+
+
 def _safe_quantile(flat, quantiles, max_samples=200000):
     flat = flat.flatten()
     n = flat.numel()
@@ -424,4 +442,53 @@ def test_paged_attention_matches_fias_v1_with_qwen3_moe_scenarios(
     mse = (triton_out.float() - fias_out.float()).pow(2).mean().item()
     print(f"[triton-vs-fias_v1] mse: {mse:.6e}")
 
+    torch.testing.assert_close(triton_out, fias_out, atol=5e-3, rtol=5e-3)
+
+
+def test_paged_attention_matches_fias_v1_with_contiguous_prefill():
+    if not hasattr(torch, "npu") or not torch.npu.is_available():
+        pytest.skip("NPU is required for torch_npu FIAS v1 comparison")
+
+    torch.manual_seed(0)
+    torch_npu.npu.manual_seed(0)
+    torch_npu.npu.manual_seed_all(0)
+    device = "npu"
+    q_lens = [64, 48]
+    block_m, block_n = BLOCK_SHAPES[0]
+    softmax_scale = HEAD_DIM ** -0.5
+
+    query, key, value, actual_seq_qlen, actual_seq_kvlen = (
+        _build_contiguous_inputs(q_lens, NUM_Q_HEADS, NUM_KV_HEADS,
+                                 HEAD_DIM, DTYPE, device)
+    )
+    atten_mask = _make_sparse_causal_mask(device)
+
+    triton_out = paged_attention(
+        query, key, value, None,
+        actual_seq_qlen, actual_seq_kvlen,
+        NUM_Q_HEADS, NUM_KV_HEADS, softmax_scale,
+        BLOCK_SIZE, block_m, block_n,
+        sinks=None,
+        atten_mask=atten_mask,
+    )
+
+    fias_out, _ = torch_npu.npu_fused_infer_attention_score(
+        query=query,
+        key=key,
+        value=value,
+        num_heads=NUM_Q_HEADS,
+        num_key_value_heads=NUM_KV_HEADS,
+        scale=softmax_scale,
+        atten_mask=atten_mask,
+        block_table=None,
+        input_layout="TND",
+        block_size=BLOCK_SIZE,
+        actual_seq_lengths=_cumulative_lengths_list(q_lens),
+        actual_seq_lengths_kv=_cumulative_lengths_list(q_lens),
+        sparse_mode=3,
+    )
+    torch.npu.synchronize()
+
+    mse = (triton_out.float() - fias_out.float()).pow(2).mean().item()
+    print(f"[triton-contiguous-prefill-vs-fias_v1] mse: {mse:.6e}")
     torch.testing.assert_close(triton_out, fias_out, atol=5e-3, rtol=5e-3)

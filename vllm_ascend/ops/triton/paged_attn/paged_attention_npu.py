@@ -7,6 +7,8 @@ This mirrors the paged ``npu_fused_infer_attention_score_v2`` call in
   k_cache    : (num_blocks, block_size, num_kv_heads * head_dim)
   v_cache    : (num_blocks, block_size, num_kv_heads * head_dim)
   block_table: (num_seqs, max_blocks_per_seq) int32
+               optional; when None, key/value are contiguous TND tensors for
+               first prefill (PrefillNoCache)
   cu_q_lens  : (num_seqs,) production actual_seq_qlen, or
                (num_seqs + 1,) cumulative q lengths with leading 0
   kv_lens    : (num_seqs,) actual kv length per sequence
@@ -17,7 +19,9 @@ This mirrors the paged ``npu_fused_infer_attention_score_v2`` call in
 The public wrapper also accepts the local test-friendly 4D cache layouts
 ``(num_blocks, block_size, num_kv_heads, head_dim)`` and
 ``(num_blocks, num_kv_heads, block_size, head_dim)``; both are normalized to
-the production 3D cache layout before launching the kernel.
+the production 3D cache layout before launching the kernel.  When
+``block_table`` is None, K/V are expected in contiguous TND layout
+``(num_kv_tokens, num_kv_heads, head_dim)``.
 """
 
 import torch
@@ -126,6 +130,7 @@ def _paged_attn_fwd_inner(
         stride_v_blk, stride_v_slot, stride_v_flat: tl.constexpr,
         qk_scale,
         kv_head_idx,
+        kv_start,
         q_abs_pos,
         q_mask,
         kv_seq_len,
@@ -139,6 +144,7 @@ def _paged_attn_fwd_inner(
         BLOCK_N: tl.constexpr,
         HEAD_DIM: tl.constexpr,
         HAS_ATTEN_MASK: tl.constexpr,
+        IS_CONTIGUOUS_KV: tl.constexpr,
         USE_MXFP4_P: tl.constexpr,
 ):
     offs_n = tl.arange(0, BLOCK_N)
@@ -147,18 +153,26 @@ def _paged_attn_fwd_inner(
 
     for j in range(num_tiles):
         seq_offset = j * BLOCK_N + offs_n
-        slot_in_block = seq_offset % BLOCK_SIZE
-        logical_block = seq_offset // BLOCK_SIZE
-        phys_block = tl.load(
-            block_tables_ptr + logical_block
-        ).to(tl.int64)
+        if IS_CONTIGUOUS_KV:
+            k_token = kv_start + seq_offset
+            k_offset = (
+                k_token[None, :] * stride_k_blk
+                + kv_head_idx * stride_k_slot
+                + offs_d[:, None] * stride_k_flat
+            )
+        else:
+            slot_in_block = seq_offset % BLOCK_SIZE
+            logical_block = seq_offset // BLOCK_SIZE
+            phys_block = tl.load(
+                block_tables_ptr + logical_block
+            ).to(tl.int64)
 
-        flat_head_offset = kv_head_idx * HEAD_DIM
-        k_offset = (
-            phys_block[None, :] * stride_k_blk
-            + slot_in_block[None, :] * stride_k_slot
-            + (flat_head_offset + offs_d[:, None]) * stride_k_flat
-        )
+            flat_head_offset = kv_head_idx * HEAD_DIM
+            k_offset = (
+                phys_block[None, :] * stride_k_blk
+                + slot_in_block[None, :] * stride_k_slot
+                + (flat_head_offset + offs_d[:, None]) * stride_k_flat
+            )
         k = tl.load(
             K_base + k_offset,
             mask=seq_offset[None, :] < kv_seq_len,
@@ -200,11 +214,19 @@ def _paged_attn_fwd_inner(
         l_i = l_i * alpha + l_ij
         acc = acc * alpha[:, None]
 
-        v_offset = (
-            phys_block[:, None] * stride_v_blk
-            + slot_in_block[:, None] * stride_v_slot
-            + (flat_head_offset + offs_d[None, :]) * stride_v_flat
-        )
+        if IS_CONTIGUOUS_KV:
+            v_token = kv_start + seq_offset
+            v_offset = (
+                v_token[:, None] * stride_v_blk
+                + kv_head_idx * stride_v_slot
+                + offs_d[None, :] * stride_v_flat
+            )
+        else:
+            v_offset = (
+                phys_block[:, None] * stride_v_blk
+                + slot_in_block[:, None] * stride_v_slot
+                + (flat_head_offset + offs_d[None, :]) * stride_v_flat
+            )
         v = tl.load(
             V_base + v_offset,
             mask=seq_offset[:, None] < kv_seq_len,
@@ -219,8 +241,8 @@ def _paged_attn_fwd_inner(
 @triton.jit
 def _paged_attn_fwd(
         Q, K_cache, V_cache, Out, block_table_ptr, atten_mask_ptr,
-        cu_q_lens_ptr, q_block_seq_ptr, q_block_local_ptr, kv_lens_ptr,
-        sink_ptr,
+        cu_q_lens_ptr, cu_k_lens_ptr, q_block_seq_ptr, q_block_local_ptr,
+        kv_lens_ptr, sink_ptr,
         stride_q_tok, stride_q_head, stride_q_dim: tl.constexpr,
         stride_k_blk, stride_k_slot, stride_k_flat: tl.constexpr,
         stride_v_blk, stride_v_slot, stride_v_flat: tl.constexpr,
@@ -239,6 +261,7 @@ def _paged_attn_fwd(
         mask_cols,
         HAS_SINKS: tl.constexpr,
         HAS_ATTEN_MASK: tl.constexpr,
+        IS_CONTIGUOUS_KV: tl.constexpr,
         USE_MXFP4_P: tl.constexpr,
 ):
     q_block_idx = tl.program_id(0)
@@ -252,6 +275,10 @@ def _paged_attn_fwd(
     q_end = tl.load(cu_q_lens_ptr + seq + 1)
     q_len = q_end - q_start
     kv_len = tl.load(kv_lens_ptr + seq).to(tl.int32)
+    if IS_CONTIGUOUS_KV:
+        kv_start = tl.load(cu_k_lens_ptr + seq).to(tl.int32)
+    else:
+        kv_start = tl.full((), 0, dtype=tl.int32)
 
     offs_m = tl.arange(0, BLOCK_M)
     q_idx = q_start + q_block_local * BLOCK_M + offs_m
@@ -292,6 +319,7 @@ def _paged_attn_fwd(
         stride_v_flat=stride_v_flat,
         qk_scale=qk_scale,
         kv_head_idx=kv_head_idx,
+        kv_start=kv_start,
         q_abs_pos=q_abs_pos,
         q_mask=q_mask,
         kv_seq_len=kv_len,
@@ -305,6 +333,7 @@ def _paged_attn_fwd(
         BLOCK_N=BLOCK_N,
         HEAD_DIM=HEAD_DIM,
         HAS_ATTEN_MASK=HAS_ATTEN_MASK,
+        IS_CONTIGUOUS_KV=IS_CONTIGUOUS_KV,
         USE_MXFP4_P=USE_MXFP4_P,
     )
 
@@ -345,6 +374,23 @@ def _normalize_kv_cache(cache, block_size, num_kv_heads, head_dim):
     )
 
 
+def _normalize_contiguous_kv(cache, num_kv_heads, head_dim):
+    if cache.dim() == 3:
+        assert cache.shape[1] == num_kv_heads
+        assert cache.shape[2] == head_dim
+        return cache
+
+    if cache.dim() == 2:
+        expected = num_kv_heads * head_dim
+        assert cache.shape[1] == expected
+        return cache.view(cache.shape[0], num_kv_heads, head_dim)
+
+    raise AssertionError(
+        "Contiguous KV must be shaped as (tokens, Hkv, D) or "
+        "(tokens, Hkv * D) when block_table is None"
+    )
+
+
 class _paged_attention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k_cache, v_cache, block_table,
@@ -359,22 +405,37 @@ class _paged_attention(torch.autograd.Function):
         assert num_q_heads % num_kv_heads == 0
         assert BLOCK_M in {16, 32, 64}
         assert BLOCK_N in {32, 64, 128, 256}
-        assert block_table.dtype == torch.int32
         assert cu_q_lens.dtype == torch.int32
         assert kv_lens.dtype == torch.int32
+        is_contiguous_kv = block_table is None
+        if not is_contiguous_kv:
+            assert block_table.dtype == torch.int32
         if sinks is not None:
             assert sinks.shape[0] == num_q_heads
         if atten_mask is not None:
             assert atten_mask.dim() == 2
 
-        k_cache = _normalize_kv_cache(k_cache, block_size, num_kv_heads,
-                                      head_dim)
-        v_cache = _normalize_kv_cache(v_cache, block_size, num_kv_heads,
-                                      head_dim)
+        if is_contiguous_kv:
+            k_cache = _normalize_contiguous_kv(k_cache, num_kv_heads,
+                                               head_dim)
+            v_cache = _normalize_contiguous_kv(v_cache, num_kv_heads,
+                                               head_dim)
+        else:
+            k_cache = _normalize_kv_cache(k_cache, block_size, num_kv_heads,
+                                          head_dim)
+            v_cache = _normalize_kv_cache(v_cache, block_size, num_kv_heads,
+                                          head_dim)
 
         num_seqs = kv_lens.shape[0]
         if cu_q_lens.shape[0] == num_seqs:
             cu_q_lens = torch.cat([cu_q_lens.new_zeros((1,)), cu_q_lens])
+        if is_contiguous_kv:
+            cu_k_lens = torch.cat([
+                kv_lens.new_zeros((1,)),
+                torch.cumsum(kv_lens, dim=0, dtype=torch.int32),
+            ])
+        else:
+            cu_k_lens = cu_q_lens
         # 每个 sequence 的 query 长度 & block 数
         seq_q_lens = cu_q_lens[1:] - cu_q_lens[:-1]          # [num_seqs]
         seq_q_blocks = (seq_q_lens + BLOCK_M - 1) // BLOCK_M  # [num_seqs], ceil 除法
@@ -427,9 +488,10 @@ class _paged_attention(torch.autograd.Function):
 
         _paged_attn_fwd[grid](
             Q=q, K_cache=k_cache, V_cache=v_cache, Out=out,
-            block_table_ptr=block_table,
+            block_table_ptr=block_table if block_table is not None else q,
             atten_mask_ptr=atten_mask_ptr,
             cu_q_lens_ptr=cu_q_lens,
+            cu_k_lens_ptr=cu_k_lens,
             q_block_seq_ptr=q_block_seq,
             q_block_local_ptr=q_block_local,
             kv_lens_ptr=kv_lens,
@@ -448,7 +510,7 @@ class _paged_attention(torch.autograd.Function):
             stride_o_dim=out.stride(2),
             stride_mask_q=stride_mask_q,
             stride_mask_k=stride_mask_k,
-            block_table_stride=block_table.stride(0),
+            block_table_stride=block_table.stride(0) if block_table is not None else 0,
             BLOCK_SIZE=block_size,
             HEAD_DIM=head_dim,
             num_q_heads=num_q_heads,
@@ -460,6 +522,7 @@ class _paged_attention(torch.autograd.Function):
             mask_cols=mask_cols,
             HAS_SINKS=sinks is not None,
             HAS_ATTEN_MASK=atten_mask is not None,
+            IS_CONTIGUOUS_KV=is_contiguous_kv,
             USE_MXFP4_P=use_mxfp4_p,
             num_warps=(4 if head_dim == 64 else 8),
         )
