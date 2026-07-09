@@ -50,6 +50,29 @@ def _varied_lengths(max_len, batch_size):
 def _scenario_cases():
     cases = []
     shape_idx = 0
+    cases.extend(_prefill_scenario_cases(shape_idx))
+    shape_idx += len(cases)
+
+    for batch_size in BATCH_SIZES:
+        kv_lens = _varied_lengths(DECODE_KV_TARGET, batch_size)
+        for q_target in DECODE_Q_TARGETS:
+            block_m, block_n = BLOCK_SHAPES[shape_idx % len(BLOCK_SHAPES)]
+            shape_idx += 1
+            q_lens = _varied_lengths(q_target, batch_size)
+            cases.append(pytest.param(
+                "decode_mtp",
+                batch_size,
+                q_lens,
+                kv_lens,
+                block_m,
+                block_n,
+                id=f"decode-bs{batch_size}-q{q_target}-kv8k-bm{block_m}-bn{block_n}",
+            ))
+    return cases
+
+
+def _prefill_scenario_cases(shape_idx=0):
+    cases = []
     for batch_size in BATCH_SIZES:
         ## only when batch size is smaller than 8 for prefill scenario, otherwise the kernel will be error due to program is to larger
         if batch_size >= 4:
@@ -66,22 +89,6 @@ def _scenario_cases():
                 block_m,
                 block_n,
                 id=f"prefill-bs{batch_size}-max{target_len}-bm{block_m}-bn{block_n}",
-            ))
-
-    for batch_size in BATCH_SIZES:
-        kv_lens = _varied_lengths(DECODE_KV_TARGET, batch_size)
-        for q_target in DECODE_Q_TARGETS:
-            block_m, block_n = BLOCK_SHAPES[shape_idx % len(BLOCK_SHAPES)]
-            shape_idx += 1
-            q_lens = _varied_lengths(q_target, batch_size)
-            cases.append(pytest.param(
-                "decode_mtp",
-                batch_size,
-                q_lens,
-                kv_lens,
-                block_m,
-                block_n,
-                id=f"decode-bs{batch_size}-q{q_target}-kv8k-bm{block_m}-bn{block_n}",
             ))
     return cases
 
@@ -445,7 +452,15 @@ def test_paged_attention_matches_fias_v1_with_qwen3_moe_scenarios(
     torch.testing.assert_close(triton_out, fias_out, atol=5e-3, rtol=5e-3)
 
 
-def test_paged_attention_matches_fias_v1_with_contiguous_prefill():
+@pytest.mark.parametrize(
+    "scenario,batch_size,q_lens,kv_lens,block_m,block_n",
+    _prefill_scenario_cases(),
+)
+def test_paged_attention_matches_fias_v1_with_contiguous_prefill(
+        scenario, batch_size, q_lens, kv_lens, block_m, block_n):
+    assert scenario == "prefill"
+    assert batch_size == len(q_lens)
+    assert q_lens == kv_lens
     if not hasattr(torch, "npu") or not torch.npu.is_available():
         pytest.skip("NPU is required for torch_npu FIAS v1 comparison")
 
@@ -453,8 +468,6 @@ def test_paged_attention_matches_fias_v1_with_contiguous_prefill():
     torch_npu.npu.manual_seed(0)
     torch_npu.npu.manual_seed_all(0)
     device = "npu"
-    q_lens = [64, 48]
-    block_m, block_n = BLOCK_SHAPES[0]
     softmax_scale = HEAD_DIM ** -0.5
 
     query, key, value, actual_seq_qlen, actual_seq_kvlen = (
@@ -484,7 +497,7 @@ def test_paged_attention_matches_fias_v1_with_contiguous_prefill():
         input_layout="TND",
         block_size=BLOCK_SIZE,
         actual_seq_lengths=_cumulative_lengths_list(q_lens),
-        actual_seq_lengths_kv=_cumulative_lengths_list(q_lens),
+        actual_seq_lengths_kv=_cumulative_lengths_list(kv_lens),
         sparse_mode=3,
     )
     torch.npu.synchronize()
