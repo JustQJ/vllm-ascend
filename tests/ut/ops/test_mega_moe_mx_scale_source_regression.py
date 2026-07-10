@@ -46,3 +46,17 @@ def test_mx_scale_debug_covers_compute_layout_and_gm_copy():
 
     assert "SyncFuncStatic<AscendC::HardEvent::V_S" in source
     assert "SyncFuncStatic<AscendC::HardEvent::S_V" in source
+
+
+def test_mx_scale_gm_probe_preserves_global_tensor_constness():
+    source = _epilogue_source()
+
+    assert (
+        "GlobalTensor<int8_t> sampleGm = quantScaleGlobal_[offset]"
+        in source
+    )
+    assert (
+        "reinterpret_cast<__gm__ uint8_t *>("
+        "quantScaleGlobal_.GetPhyAddr())"
+        not in source
+    )

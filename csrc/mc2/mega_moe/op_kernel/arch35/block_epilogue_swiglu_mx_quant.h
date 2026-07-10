@@ -390,17 +390,15 @@ __aicore__ inline bool
 BlockEpilogueSwigluMxQuant<BLOCK_EPILOGUE_DEQUANT_FUNC_LOCAL_PARAMS>::DebugScaleGmBytesAnyNonZero(
     uint64_t offset, uint32_t bytes)
 {
-    AscendC::GlobalTensor<uint8_t> sampleGm;
-    sampleGm.SetGlobalBuffer(
-        reinterpret_cast<__gm__ uint8_t *>(quantScaleGlobal_.GetPhyAddr()) + offset);
+    AscendC::GlobalTensor<int8_t> sampleGm = quantScaleGlobal_[offset];
     AscendC::PipeBarrier<PIPE_ALL>();
     __asm__ __volatile__("");
-    AscendC::DataCacheCleanAndInvalid<uint8_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+    AscendC::DataCacheCleanAndInvalid<int8_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
         AscendC::DcciDst::CACHELINE_OUT>(sampleGm);
     __asm__ __volatile__("");
     uint8_t anyNonZero = 0;
     for (uint32_t index = 0; index < bytes; ++index) {
-        anyNonZero |= sampleGm.GetValue(index);
+        anyNonZero |= static_cast<uint8_t>(sampleGm.GetValue(index));
     }
     return anyNonZero != 0;
 }
