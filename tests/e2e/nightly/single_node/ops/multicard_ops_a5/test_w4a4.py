@@ -1,11 +1,9 @@
 import os
-import torch
-import torch_npu
-from torch.multiprocessing import Process, Manager
-import torch.distributed as dist
-from torch.distributed import ReduceOp
-import torch.multiprocessing as mp
 
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+import torch_npu
 
 from vllm_ascend.utils import bootstrap_custom_op_env, enable_custom_op
 
@@ -26,7 +24,7 @@ except ImportError:
 from vllm_ascend.ops.mega_moe import get_symm_buffer_for_mega_moe, mega_moe
 from vllm_ascend.ops.mega_moe import npu_get_mega_moe_ccl_buffer_size as get_mega_moe_ccl_buffer_size
 
-E = 1
+E = 4
 BS = 256
 H = 4096
 N = 1024
@@ -148,7 +146,8 @@ def run_megamoe_npu(
         ep_group, num_experts=num_experts,
         num_max_tokens_per_rank=0, num_topk=topK,
         hidden=H, intermediate_hidden=0,
-        dispatch_quant_mode=4, dispatch_quant_out_dtype=296,  max_recv_token_num=0
+        dispatch_quant_mode=4, dispatch_quant_out_dtype=296,
+        max_recv_token_num=x.shape[0] * world_size * min(E, topK),
     )
     print(f"[INFO] 运行mega_moe")
     # 步骤3：运行mega_moe，传入上一步构造的sym_buffer
@@ -189,13 +188,12 @@ def gen_npu(target_func, **server_kwargs):
     rank_list = list(range(world_size))
     print(f"rank list is: {rank_list}")
 
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.SimpleQueue()
     proc_list = []
-    manager = Manager()
-    result_queue = manager.Queue()
-    mp.set_start_method("forkserver", force=True)
     for rank in rank_list:
         rank_kwargs = parse_rank_input(target_func, result_queue, rank, server_kwargs)
-        proc = Process(target=target_func, kwargs=rank_kwargs)
+        proc = ctx.Process(target=target_func, kwargs=rank_kwargs)
         proc.start()
         proc_list.append(proc)
 
