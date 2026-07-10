@@ -158,11 +158,19 @@ def run_megamoe_npu(
     dist.destroy_process_group()
     print(f'rank {rank} epid {rank} npu finished! \n')
 
+    # Sending tensors through torch.multiprocessing moves their storages into
+    # shared memory. On an NFS-backed temp directory those live handles become
+    # .nfs files and make multiprocessing finalization fail. This smoke test
+    # only needs output metadata, so keep the queue payload storage-free.
     queue.put([
         rank,
         [
-            y.cpu(), expert_token_nums.cpu()
-        ]
+            {"shape": tuple(y.shape), "dtype": str(y.dtype)},
+            {
+                "shape": tuple(expert_token_nums.shape),
+                "dtype": str(expert_token_nums.dtype),
+            },
+        ],
     ])
 
 def gen_npu(target_func, **server_kwargs):
