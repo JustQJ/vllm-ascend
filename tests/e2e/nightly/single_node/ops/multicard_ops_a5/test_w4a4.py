@@ -151,9 +151,21 @@ def run_megamoe_npu(
     )
     print(f"[INFO] 运行mega_moe")
     # 步骤3：运行mega_moe，传入上一步构造的sym_buffer
+    # MEGA_MOE_PY_DEBUG=1 env flag drives the py-boundary diagnostic prints in
+    # vllm_ascend/ops/mega_moe.py (OP_2026_07_10_001 tracing).
+    os.environ.setdefault("MEGA_MOE_PY_DEBUG", "1")
     y, expert_token_nums = mega_moe(**megamoe_kwargs, sym_buffer=distribute_buffer)
 
     torch.npu.synchronize()
+    # Post-call numeric smoke check (helps tell "true zero" from display rounding).
+    _y_sum = y.abs().sum().item()
+    _y_std = y.std().item()
+    _y_min = y.min().item()
+    _y_max = y.max().item()
+    _y_all_zero = bool((y == 0).all().item())
+    print(f"[INFO] device_{rank} mega_moe y stats: "
+          f"sum={_y_sum:.4f} std={_y_std:.4f} min={_y_min:.4f} max={_y_max:.4f} "
+          f"all_zero={_y_all_zero}", flush=True)
     print(f"[INFO] device_{rank} finish\n")
     dist.destroy_process_group()
     print(f'rank {rank} epid {rank} npu finished! \n')

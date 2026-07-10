@@ -1263,11 +1263,32 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::GroupMatmulWithCombine(
 }
 
 template <TemplateMegaMoeTypeClass>
+// Process() expert-combine diagnostic counters
+// 0 = release default; 1 = trace GMM1/GMM2/unpermute iterations in Process().
+// Used for narrowing down OP_2026_07_10_001 (y all-zero on 950 EP_2).
+#ifndef MEGA_MOE_PROCESS_DEBUG
+#define MEGA_MOE_PROCESS_DEBUG 1
+#endif
+#if MEGA_MOE_PROCESS_DEBUG
+// Ascend C kernel: AscendC::printf, NOT std::printf.  We only print a static
+// string (no %u/%p) because some CANN toolkits reject format arguments in
+// kernel-side printf.  Numeric counters are deliberately NOT printed; the
+// side-effect-free trace points alone tell us which branch we fell into.
+#define MM_PROC_TRACE(msg)                                                                         \
+    do {                                                                                           \
+        AscendC::printf("[MMPROC] " msg "\n");                                                    \
+    } while (0)
+#else
+#define MM_PROC_TRACE(msg) ((void)0)
+#endif
+
+
 __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::Process()
 {
     // 1.本卡数据处理
     int64_t oriOverflowMode = GetCtrlSpr<OVERFLOW_MODE_CTRL, OVERFLOW_MODE_CTRL>();
     SetCtrlSpr<OVERFLOW_MODE_CTRL, OVERFLOW_MODE_CTRL>(0);
+    MM_PROC_TRACE("Process enter");
     SendAndQuantBuffInit();
     SendMaskCal();               // 源卡按所有全局专家算 mask 并推送到目标专家卡
     ResetFlagList();             // 清理workSpace空间上的flag位
@@ -1308,6 +1329,8 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::Process()
         }
     }
 
+    uint32_t gmm1_hit = 0;
+    uint32_t gmm1_skip = 0;
     for (int localExpertId = 0; localExpertId < expertPerRank_; localExpertId++) {
         curSendCnt = nextSendCnt;  // forward: dispatch(e) → GMM1(e)
 
@@ -1324,10 +1347,17 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::Process()
 
         // GMM1 consumer 消费 expert e。
         if (!UpdateGroupParams<AddrUpdateMode::kGmm1>(gmm1State, localExpertId, curSendCnt)) {
+            ++gmm1_skip;
             continue;
         }
+        ++gmm1_hit;
         UpdateGlobalBuffer<AddrUpdateMode::kGmm1>(gmm1AddrInfo, gmm1State);
         GroupMatmulWithSwigluQuant(gmm1AddrInfo, gmm1State);
+    }
+    if (gmm1_hit == 0) {
+        MM_PROC_TRACE("GMM1 loop done: ALL SKIP (0 hits)");
+    } else {
+        MM_PROC_TRACE("GMM1 loop done: at least one hit");
     }
     EndSync(vecSetSyncCom_);
     if constexpr(g_coreType == AIV) {
@@ -1342,12 +1372,21 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::Process()
     ExpertLoopState gmm2State{initShape, initOffset, 0};
     InitCombineBuffers();
 
+    uint32_t gmm2_hit = 0;
+    uint32_t gmm2_skip = 0;
     for (uint32_t expertIdx = 0; expertIdx < expertPerRank_; expertIdx++) {
         if (!UpdateGroupParams<AddrUpdateMode::kGmm2>(gmm2State, expertIdx)) {
+            ++gmm2_skip;
             continue;
         }
+        ++gmm2_hit;
         UpdateGlobalBuffer<AddrUpdateMode::kGmm2>(gmm2AddrInfo, gmm2State);
         GroupMatmulWithCombine(gmm2AddrInfo, gmm2State, expertIdx);
+    }
+    if (gmm2_hit == 0) {
+        MM_PROC_TRACE("GMM2 loop done: ALL SKIP (0 hits)");
+    } else {
+        MM_PROC_TRACE("GMM2 loop done: at least one hit");
     }
     if constexpr (CombineQuantMode == COMBINE_NO_QUANT) {
         EndGMM2Sync(vecSetSyncCom_, gmm2PingPongIdx_);
@@ -1359,7 +1398,9 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::Process()
     if constexpr(g_coreType == AIV) {
         UnpermuteBuffInit();
         CrossRankSyncInWorldSize(); // 全卡软同步，确认combine send完成
+        MM_PROC_TRACE("pre-unpermute");
         Unpermute();
+        MM_PROC_TRACE("post-unpermute done");
     }
     SetCtrlSpr<OVERFLOW_MODE_CTRL, OVERFLOW_MODE_CTRL>(oriOverflowMode);
 }

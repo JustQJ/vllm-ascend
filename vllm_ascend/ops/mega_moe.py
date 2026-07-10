@@ -278,7 +278,29 @@ def mega_moe(
     """
     import torch
 
-    return torch.ops._C_ascend.npu_mega_moe(
+    # ── ACL NN boundary diagnostic ──────────────────────────────────────────────
+    # 0 = release default; 1 = print y statistics right after the ACL NN call so we
+    #     can distinguish "ACL NN wrote nothing" from "ACL NN ran but produced 0".
+    # Used for narrowing down OP_2026_07_10_001 (y all-zero on 950 EP_2).
+    MEGA_MOE_PY_DEBUG = os.environ.get("MEGA_MOE_PY_DEBUG", "1") == "1"
+    if MEGA_MOE_PY_DEBUG:
+        print(
+            f"[MMDBG] py-boundary ENTER | y=placeholder "
+            f"x.shape={tuple(x.shape)} x.dtype={x.dtype} "
+            f"x.abs().sum()={x.abs().sum().item():.4f} x.std()={x.std().item():.4f}\n"
+            f"[MMDBG] dispatch_quant_out_dtype(sym_buffer)={sym_buffer.dispatch_quant_out_dtype!r} "
+            f"weight1_type={weight1_type!r} weight2_type={weight2_type!r} "
+            f"type(l1_weights[0])={type(l1_weights[0]).__name__} "
+            f"l1_weights[0].dtype={l1_weights[0].dtype} "
+            f"l1_weights[0].shape={tuple(l1_weights[0].shape)}\n"
+            f"[MMDBG] topo_type(sym_buffer)={sym_buffer.topo_type!r} "
+            f"rank_num_per_server(sym_buffer)={sym_buffer.rank_num_per_server!r} "
+            f"ep_world_size={sym_buffer.ep_world_size}",
+            flush=True,
+        )
+    # ────────────────────────────────────────────────────────────────────────────
+
+    result = torch.ops._C_ascend.npu_mega_moe(
         sym_buffer.context,
         x,
         topk_ids,
@@ -306,3 +328,21 @@ def mega_moe(
         topo_type=sym_buffer.topo_type,
         rank_num_per_server=sym_buffer.rank_num_per_server,
     )
+
+    # ── Post-call diagnostic ───────────────────────────────────────────────────
+    if MEGA_MOE_PY_DEBUG:
+        y, expert_token_nums = result
+        # Force synchronize so we see the value as the kernel produced it.
+        torch.npu.synchronize()
+        print(
+            f"[MMDBG] py-boundary EXIT | y.shape={tuple(y.shape)} y.dtype={y.dtype} "
+            f"y.abs().sum()={y.abs().sum().item():.4f} y.std()={y.std().item():.4f} "
+            f"y.min()={y.min().item():.4f} y.max()={y.max().item():.4f} "
+            f"y.all_zero={(y == 0).all().item()} "
+            f"expert_token_nums.shape={tuple(expert_token_nums.shape)} "
+            f"expert_token_nums={expert_token_nums.tolist()}",
+            flush=True,
+        )
+    # ────────────────────────────────────────────────────────────────────────────
+
+    return result
