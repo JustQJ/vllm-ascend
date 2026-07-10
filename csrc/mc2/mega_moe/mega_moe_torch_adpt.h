@@ -154,7 +154,7 @@ std::tuple<at::Tensor, at::Tensor> npu_mega_moe(
     local_moe_expert_num = moe_expert_num / ep_world_size;
     at::Tensor expert_token_nums_out;
     expert_token_nums_out = at::empty({local_moe_expert_num}, x.options().dtype(at::kInt));
-    float activation_clamp_value = activation_clamp.value_or(std::numeric_limits<float>::max());
+    double activation_clamp_value = activation_clamp.value_or(std::numeric_limits<float>::max());
     int64_t topo_type_value = topo_type.value_or(0);
     int64_t rank_num_per_server_value = rank_num_per_server.value_or(2);
 

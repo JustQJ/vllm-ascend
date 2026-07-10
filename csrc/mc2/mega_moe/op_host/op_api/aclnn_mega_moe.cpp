@@ -36,7 +36,7 @@ extern aclnnStatus aclnnInnerMegaMoeGetWorkspaceSize(
     const aclTensorList* bias2Optional, const aclTensor* xActiveMaskOptional, const aclTensor* scalesOptional,
     int64_t moeExpertNum, int64_t epWorldSize, int64_t cclBufferSize, int64_t maxRecvTokenNum,
     int64_t dispatchQuantMode, int64_t dispatchQuantOutDtype, int64_t combineQuantMode, char* commAlg,
-    int64_t numMaxTokensPerRank, char* activation, float activationClamp, int activationOutDtype,
+    int64_t numMaxTokensPerRank, char* activation, double activationClamp, int activationOutDtype,
     bool transposeWeight1, bool transposeWeight2, int64_t weight1Interleave, int64_t topoType,
     int64_t rankNumPerServer, aclTensor* yOut,
     aclTensor* expertTokenNumsOut, uint64_t* workspaceSize, aclOpExecutor** executor);
@@ -98,7 +98,7 @@ aclnnStatus aclnnMegaMoeGetWorkspaceSize(
     const aclTensorList *weightScales2Optional, const aclTensorList *bias1Optional, const aclTensorList *bias2Optional,
     const aclTensor *xActiveMaskOptional, int64_t moeExpertNum, int64_t epWorldSize, int64_t cclBufferSize,
     int64_t maxRecvTokenNum, int64_t dispatchQuantMode, int64_t dispatchQuantOutDtype, int64_t combineQuantMode,
-    const char *commAlg, int64_t numMaxTokensPerRank, const char *activation, float activationClamp,
+    const char *commAlg, int64_t numMaxTokensPerRank, const char *activation, double activationClamp,
     int64_t topoType, int64_t rankNumPerServer, aclTensor *yOut,
     aclTensor *expertTokenNumsOut, uint64_t *workspaceSize, aclOpExecutor **executor)
 {
