@@ -1401,8 +1401,32 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::Process()
         MM_PROC_TRACE("pre-unpermute");
         Unpermute();
         MM_PROC_TRACE("post-unpermute done");
+#if MEGA_MOE_PROCESS_DEBUG
+        // --- y2GmAddr write-back canary -------------------------------------------------
+        // Immediately after Unpermute(), write a known bf16 pattern DIRECTLY to y2GmAddr.
+        // If the host-side `y` tensor reads these exact values, the kernel→host address
+        // path is correct and any upstream-zero bug is in combine/unpermute itself.
+        // If the host reads all-zero (or garbage), y2GmAddr does not alias the Python
+        // storage and the ACL tensor binding is broken.
+        {
+            __gm__ bfloat16_t* yBase = reinterpret_cast<__gm__ bfloat16_t*>(params_.y2GmAddr);
+            if (yBase != nullptr) {
+                yBase[0] = 1.0f;   // bf16 1.0 == 0x3F80
+                yBase[1] = 2.0f;   // bf16 2.0 == 0x4000
+                yBase[2] = 3.0f;   // bf16 3.0 == 0x4040
+                yBase[3] = 4.0f;   // bf16 4.0 == 0x4080
+                AscendC::pipe_barrier(PIPE_ALL);
+                MM_PROC_TRACE("y2-canary WRITE 1,2,3,4 bf16");
+            } else {
+                MM_PROC_TRACE("y2-canary SKIP (null y2GmAddr)");
+            }
+        }
+#endif
     }
     SetCtrlSpr<OVERFLOW_MODE_CTRL, OVERFLOW_MODE_CTRL>(oriOverflowMode);
+#if MEGA_MOE_PROCESS_DEBUG
+    MM_PROC_TRACE("Process exit");
+#endif
 }
 
 }   // namespace MegaMoeImpl

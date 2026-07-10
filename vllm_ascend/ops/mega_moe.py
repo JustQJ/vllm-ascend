@@ -334,13 +334,27 @@ def mega_moe(
         y, expert_token_nums = result
         # Force synchronize so we see the value as the kernel produced it.
         torch.npu.synchronize()
+        y_abs_sum = y.abs().sum().item()
+        y_std = y.std().item()
+        y_min = y.min().item()
+        y_max = y.max().item()
+        y_all_zero = bool((y == 0).all().item())
+        # Read the first 4 bf16 slots (the "canary" the kernel may have written).
+        y_flat = y.reshape(-1)
+        canary = [y_flat[i].item() for i in range(min(4, y_flat.shape[0]))]
+        canary_u16 = [
+            y_flat[i].view(torch.int16).item() for i in range(min(4, y_flat.shape[0]))
+        ]
         print(
             f"[MMDBG] py-boundary EXIT | y.shape={tuple(y.shape)} y.dtype={y.dtype} "
-            f"y.abs().sum()={y.abs().sum().item():.4f} y.std()={y.std().item():.4f} "
-            f"y.min()={y.min().item():.4f} y.max()={y.max().item():.4f} "
-            f"y.all_zero={(y == 0).all().item()} "
+            f"y.abs().sum()={y_abs_sum:.4f} y.std()={y_std:.4f} "
+            f"y.min()={y_min:.4f} y.max()={y_max:.4f} "
+            f"y.all_zero={y_all_zero} "
             f"expert_token_nums.shape={tuple(expert_token_nums.shape)} "
-            f"expert_token_nums={expert_token_nums.tolist()}",
+            f"expert_token_nums={expert_token_nums.tolist()}\n"
+            f"[MMDBG] CANARY gpu-storage-y2[0..3]={canary}  uint16={canary_u16}  "
+            f"(expect [1.0, 2.0, 3.0, 4.0] if kernel writes through to host storage, "
+            f"or [0.0, 0.0, 0.0, 0.0] if address alias is broken)",
             flush=True,
         )
     # ────────────────────────────────────────────────────────────────────────────
