@@ -7,10 +7,126 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+import os
 from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+
+
+_MEGA_MOE_DEBUG_RECORD_ELEMS = 96
+_MEGA_MOE_DEBUG_MAX_TOPK = 8
+_MEGA_MOE_DEBUG_ROUTE_SAMPLES = 8
+_MEGA_MOE_DEBUG_MAGIC = [11.0, 22.0, 33.0, 44.0]
+
+
+def _mega_moe_debug_tensor_summary(
+    name: str, tensor: Optional[torch.Tensor], *, sample_values: bool = True
+) -> str:
+    """Return a best-effort tensor summary without letting diagnostics abort the op."""
+    if tensor is None:
+        return f"[MMDBG] INPUT {name}=None"
+
+    fields = [
+        f"[MMDBG] INPUT {name}",
+        f"shape={tuple(tensor.shape)}",
+        f"numel={tensor.numel()}",
+        f"dtype={tensor.dtype}",
+        f"device={tensor.device}",
+        f"stride={tuple(tensor.stride())}",
+        f"contiguous={tensor.is_contiguous()}",
+        f"storage_offset={tensor.storage_offset()}",
+        f"data_ptr=0x{tensor.data_ptr():x}",
+    ]
+    try:
+        import torch_npu
+
+        fields.append(f"npu_format={torch_npu.get_npu_format(tensor)}")
+    except Exception as exc:  # pragma: no cover - NPU/CANN-version dependent
+        fields.append(f"npu_format=<unavailable:{type(exc).__name__}>")
+
+    if sample_values:
+        try:
+            flat = tensor.reshape(-1)
+            sample = flat[: min(16, flat.numel())].cpu().tolist()
+            fields.append(f"sample16={sample}")
+            fields.append(f"sample16_nonzero={sum(value != 0 for value in sample)}")
+        except Exception as exc:  # pragma: no cover - custom dtype/layout dependent
+            fields.append(f"sample16=<unavailable:{type(exc).__name__}:{exc}>")
+    else:
+        fields.append("sample16=<skipped-for-custom-dtype-or-format>")
+    return " ".join(fields)
+
+
+def _mega_moe_debug_numeric_stats(name: str, tensor: torch.Tensor) -> str:
+    try:
+        values = tensor.float()
+        return (
+            f"[MMDBG] STATS {name} numel={values.numel()} "
+            f"abs_sum={values.abs().sum().item():.6g} "
+            f"min={values.min().item():.6g} max={values.max().item():.6g} "
+            f"all_zero={bool((values == 0).all().item())} "
+            f"finite={bool(torch.isfinite(values).all().item())}"
+        )
+    except Exception as exc:  # pragma: no cover - custom dtype/layout dependent
+        return f"[MMDBG] STATS {name}=<unavailable:{type(exc).__name__}:{exc}>"
+
+
+def _mega_moe_debug_record_lines(y: torch.Tensor) -> List[str]:
+    """Decode the 96-bf16 diagnostic record embedded in y[0, :96]."""
+    flat = y.reshape(-1)
+    if flat.numel() < _MEGA_MOE_DEBUG_RECORD_ELEMS:
+        return [
+            f"[MMDBG] RECORD unavailable: y has {flat.numel()} elements, "
+            f"need {_MEGA_MOE_DEBUG_RECORD_ELEMS}"
+        ]
+
+    record = flat[:_MEGA_MOE_DEBUG_RECORD_ELEMS].float().cpu().tolist()
+    magic_ok = record[:4] == _MEGA_MOE_DEBUG_MAGIC
+    lines = [
+        f"[MMDBG] RECORD magic={record[:4]} magic_ok={magic_ok}",
+        (
+            "[MMDBG] RECORD meta "
+            f"version={record[4]} rank={record[5]} bs={record[6]} hidden={record[7]} "
+            f"topk={record[8]} grouped_matmul_mode={record[9]} "
+            f"quant_mode={record[10]} combine_quant_mode={record[11]} "
+            f"gmm1_hit={record[12]} gmm1_skip={record[13]} "
+            f"gmm2_hit={record[14]} gmm2_skip={record[15]}"
+        ),
+        f"[MMDBG] RECORD unpermute_acc_samples={record[16:24]}",
+        f"[MMDBG] RECORD topk_weights_token0={record[24:32]}",
+    ]
+    route_count = min(int(record[8]), _MEGA_MOE_DEBUG_MAX_TOPK) if magic_ok else _MEGA_MOE_DEBUG_MAX_TOPK
+    for route_idx in range(route_count):
+        start = 32 + route_idx * _MEGA_MOE_DEBUG_ROUTE_SAMPLES
+        end = start + _MEGA_MOE_DEBUG_ROUTE_SAMPLES
+        samples = record[start:end]
+        lines.append(
+            f"[MMDBG] RECORD expandedX_route{route_idx}_samples={samples} "
+            f"all_zero={all(value == 0 for value in samples)}"
+        )
+    if not magic_ok:
+        lines.append(
+            "[MMDBG] RECORD magic missing: kernel was not rebuilt/selected, Unpermute was not reached, "
+            "or the y2 write-back path is broken"
+        )
+    else:
+        active_weights = record[24:24 + route_count]
+        route_samples = record[32:32 + route_count * _MEGA_MOE_DEBUG_ROUTE_SAMPLES]
+        acc_samples = record[16:24]
+        payload_all_zero = bool((flat[_MEGA_MOE_DEBUG_RECORD_ELEMS:] == 0).all().item())
+        if all(value == 0 for value in active_weights):
+            verdict = "token-0 top-k weights are all zero"
+        elif all(value == 0 for value in route_samples):
+            verdict = "sampled expandedX is all zero: fault is at/before GMM2+Combine"
+        elif all(value == 0 for value in acc_samples):
+            verdict = "expandedX is nonzero but accumulation is zero: inspect Unpermute weighting/cast"
+        elif payload_all_zero:
+            verdict = "token-0 accumulation is nonzero but y payload is zero: inspect final output coverage/write-back"
+        else:
+            verdict = "expandedX, Unpermute accumulation, and y payload all contain nonzero samples"
+        lines.append(f"[MMDBG] RECORD verdict={verdict}")
+    return lines
 
 
 def _get_hccl_comm_name(group: dist.ProcessGroup, rank_id: int) -> str:
@@ -284,20 +400,39 @@ def mega_moe(
     # Used for narrowing down OP_2026_07_10_001 (y all-zero on 950 EP_2).
     MEGA_MOE_PY_DEBUG = os.environ.get("MEGA_MOE_PY_DEBUG", "1") == "1"
     if MEGA_MOE_PY_DEBUG:
-        print(
-            f"[MMDBG] py-boundary ENTER | y=placeholder "
-            f"x.shape={tuple(x.shape)} x.dtype={x.dtype} "
-            f"x.abs().sum()={x.abs().sum().item():.4f} x.std()={x.std().item():.4f}\n"
-            f"[MMDBG] dispatch_quant_out_dtype(sym_buffer)={sym_buffer.dispatch_quant_out_dtype!r} "
-            f"weight1_type={weight1_type!r} weight2_type={weight2_type!r} "
-            f"type(l1_weights[0])={type(l1_weights[0]).__name__} "
-            f"l1_weights[0].dtype={l1_weights[0].dtype} "
-            f"l1_weights[0].shape={tuple(l1_weights[0].shape)}\n"
-            f"[MMDBG] topo_type(sym_buffer)={sym_buffer.topo_type!r} "
-            f"rank_num_per_server(sym_buffer)={sym_buffer.rank_num_per_server!r} "
-            f"ep_world_size={sym_buffer.ep_world_size}",
-            flush=True,
-        )
+        debug_lines = [
+            (
+                f"[MMDBG] py-boundary ENTER rank={sym_buffer.rank_id} "
+                f"ep_world_size={sym_buffer.ep_world_size} num_experts={sym_buffer.num_experts} "
+                f"num_topk={sym_buffer.num_topk} hidden={sym_buffer.hidden} "
+                f"dispatch_quant_mode={sym_buffer.dispatch_quant_mode} "
+                f"dispatch_quant_out_dtype={sym_buffer.dispatch_quant_out_dtype!r} "
+                f"combine_quant_mode={sym_buffer.combine_quant_mode} "
+                f"weight1_type={weight1_type!r} weight2_type={weight2_type!r} "
+                f"topo_type={sym_buffer.topo_type!r} "
+                f"rank_num_per_server={sym_buffer.rank_num_per_server!r}"
+            ),
+            _mega_moe_debug_tensor_summary("x", x),
+            _mega_moe_debug_numeric_stats("x", x),
+            _mega_moe_debug_tensor_summary("topk_ids", topk_ids),
+            _mega_moe_debug_numeric_stats("topk_ids", topk_ids),
+            _mega_moe_debug_tensor_summary("topk_weights", topk_weights),
+            _mega_moe_debug_numeric_stats("topk_weights", topk_weights),
+            _mega_moe_debug_tensor_summary("weight1", l1_weights[0], sample_values=False),
+            _mega_moe_debug_tensor_summary("weight2", l2_weights[0], sample_values=False),
+            _mega_moe_debug_tensor_summary(
+                "weight1_scale",
+                l1_weights_sf[0] if l1_weights_sf else None,
+                sample_values=False,
+            ),
+            _mega_moe_debug_tensor_summary(
+                "weight2_scale",
+                l2_weights_sf[0] if l2_weights_sf else None,
+                sample_values=False,
+            ),
+            _mega_moe_debug_tensor_summary("x_active_mask", x_active_mask),
+        ]
+        print("\n".join(debug_lines), flush=True)
     # ────────────────────────────────────────────────────────────────────────────
 
     result = torch.ops._C_ascend.npu_mega_moe(
@@ -334,29 +469,27 @@ def mega_moe(
         y, expert_token_nums = result
         # Force synchronize so we see the value as the kernel produced it.
         torch.npu.synchronize()
+        y_flat = y.reshape(-1)
+        y_payload = y_flat[_MEGA_MOE_DEBUG_RECORD_ELEMS:]
         y_abs_sum = y.abs().sum().item()
         y_std = y.std().item()
         y_min = y.min().item()
         y_max = y.max().item()
         y_all_zero = bool((y == 0).all().item())
-        # Read the first 4 bf16 slots (the "canary" the kernel may have written).
-        y_flat = y.reshape(-1)
-        canary = [y_flat[i].item() for i in range(min(4, y_flat.shape[0]))]
-        canary_u16 = [
-            y_flat[i].view(torch.int16).item() for i in range(min(4, y_flat.shape[0]))
-        ]
-        print(
+        payload_abs_sum = y_payload.abs().sum().item()
+        payload_all_zero = bool((y_payload == 0).all().item())
+        output_lines = [
             f"[MMDBG] py-boundary EXIT | y.shape={tuple(y.shape)} y.dtype={y.dtype} "
             f"y.abs().sum()={y_abs_sum:.4f} y.std()={y_std:.4f} "
             f"y.min()={y_min:.4f} y.max()={y_max:.4f} "
             f"y.all_zero={y_all_zero} "
+            f"payload[{_MEGA_MOE_DEBUG_RECORD_ELEMS}:].abs().sum()={payload_abs_sum:.4f} "
+            f"payload[{_MEGA_MOE_DEBUG_RECORD_ELEMS}:].all_zero={payload_all_zero} "
             f"expert_token_nums.shape={tuple(expert_token_nums.shape)} "
-            f"expert_token_nums={expert_token_nums.tolist()}\n"
-            f"[MMDBG] CANARY gpu-storage-y2[0..3]={canary}  uint16={canary_u16}  "
-            f"(expect [1.0, 2.0, 3.0, 4.0] if kernel writes through to host storage, "
-            f"or [0.0, 0.0, 0.0, 0.0] if address alias is broken)",
-            flush=True,
-        )
+            f"expert_token_nums={expert_token_nums.tolist()}"
+        ]
+        output_lines.extend(_mega_moe_debug_record_lines(y))
+        print("\n".join(output_lines), flush=True)
     # ────────────────────────────────────────────────────────────────────────────
 
     return result

@@ -39,6 +39,57 @@ using BlockOffset = Shape<int64_t, int64_t, int64_t, int64_t, int64_t,
                                   typename Weight1Type, int32_t QuantMode, int32_t CombineQuantMode
 #define TemplateMegaMoeTypeFunc XType, OutputType, TopkWeightsType, Weight1Type, QuantMode, CombineQuantMode
 
+// Process()/Unpermute diagnostic instrumentation.
+// 0 = release default; 1 = trace execution and inject a token-0 output canary.
+// Used for narrowing down OP_2026_07_10_001 (y all-zero on 950 EP_2).
+#ifndef MEGA_MOE_PROCESS_DEBUG
+#define MEGA_MOE_PROCESS_DEBUG 1
+#endif
+#if MEGA_MOE_PROCESS_DEBUG
+// Ascend C kernel: AscendC::printf, NOT std::printf. Only print static strings;
+// some CANN toolkits reject kernel-side printf format arguments.
+#define MM_PROC_TRACE(msg)                                                                         \
+    do {                                                                                           \
+        AscendC::printf("[MMPROC] " msg "\n");                                                    \
+    } while (0)
+#else
+#define MM_PROC_TRACE(msg) ((void)0)
+#endif
+
+#if MEGA_MOE_PROCESS_DEBUG
+#define MM_PROC_TRACE_STATE(label, condition)                                                       \
+    do {                                                                                           \
+        if (condition) {                                                                           \
+            MM_PROC_TRACE(label ": NONZERO");                                                     \
+        } else {                                                                                   \
+            MM_PROC_TRACE(label ": ALL_ZERO");                                                    \
+        }                                                                                          \
+    } while (0)
+
+constexpr uint32_t MM_DEBUG_RECORD_ELEMS = 96U;
+constexpr uint32_t MM_DEBUG_MAX_TOPK = 8U;
+constexpr uint32_t MM_DEBUG_ROUTE_SAMPLES = 8U;
+constexpr uint32_t MM_DEBUG_GM_SAMPLE_BYTES = 64U;
+
+__aicore__ inline bool MmDebugGmBytesAnyNonZero(GM_ADDR address)
+{
+    if (address == nullptr) {
+        return false;
+    }
+    GlobalTensor<uint8_t> sampleGm;
+    sampleGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(address));
+    PipeBarrier<PIPE_ALL>();
+    __asm__ __volatile__("");
+    DataCacheCleanAndInvalid<uint8_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(sampleGm);
+    __asm__ __volatile__("");
+    uint8_t anyNonZero = 0;
+    for (uint32_t index = 0; index < MM_DEBUG_GM_SAMPLE_BYTES; ++index) {
+        anyNonZero |= sampleGm.GetValue(index);
+    }
+    return anyNonZero != 0;
+}
+#endif
+
 template <TemplateMegaMoeTypeClass>
 class MegaMoe {
 public:
@@ -76,7 +127,8 @@ private:
         uint64_t sendCnt = 0);
     template <AddrUpdateMode Mode>
     __aicore__ inline void UpdateGlobalBuffer(GMMAddrInfo &gmmAddrInfo, const ExpertLoopState &state);
-    __aicore__ inline void Unpermute();
+    __aicore__ inline void Unpermute(
+        uint32_t gmm1Hit, uint32_t gmm1Skip, uint32_t gmm2Hit, uint32_t gmm2Skip);
     __aicore__ inline void InitCombineBuffers();
     __aicore__ inline void ProcessCombine(const GMMAddrInfo &gmmAddrInfo, const ExpertLoopState &gmm2State,
         uint32_t expertIdx);
@@ -1115,8 +1167,15 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::UnpermuteBuffInit()
 // Unpermute：对于各个专家还回来token的后处理，进行对应scale相乘与累加
 // ===============================================================
 template <TemplateMegaMoeTypeClass>
-__aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::Unpermute()
+__aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::Unpermute(
+    uint32_t gmm1Hit, uint32_t gmm1Skip, uint32_t gmm2Hit, uint32_t gmm2Skip)
 {
+#if !MEGA_MOE_PROCESS_DEBUG
+    (void)gmm1Hit;
+    (void)gmm1Skip;
+    (void)gmm2Hit;
+    (void)gmm2Skip;
+#endif
     int32_t coreLen, coreOffset;
     TilingByCore(m_, coreLen, coreOffset, 1);
     GlobalTensor<bfloat16_t> expandedX;
@@ -1168,10 +1227,113 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::Unpermute()
             }
             SetFlag<AscendC::HardEvent::V_MTE2>(event);
         }
-        // fp32 -> bf16
+#if MEGA_MOE_PROCESS_DEBUG
+        float debugAcc0 = 0.0f;
+        float debugAcc1 = 0.0f;
+        float debugAcc2 = 0.0f;
+        float debugAcc3 = 0.0f;
+        float debugAcc4 = 0.0f;
+        float debugAcc5 = 0.0f;
+        float debugAcc6 = 0.0f;
+        float debugAcc7 = 0.0f;
+        if (tokenIdx == 0) {
+            SyncFuncStatic<AscendC::HardEvent::V_S, SYNC_EVENT_ID3>();
+            debugAcc0 = dataResFp32Tensor_.GetValue(0);
+            debugAcc1 = dataResFp32Tensor_.GetValue(1);
+            debugAcc2 = dataResFp32Tensor_.GetValue(2);
+            debugAcc3 = dataResFp32Tensor_.GetValue(3);
+            debugAcc4 = dataResFp32Tensor_.GetValue(k_ / 2);
+            debugAcc5 = dataResFp32Tensor_.GetValue(k_ / 2 + 1);
+            debugAcc6 = dataResFp32Tensor_.GetValue(k_ - 2);
+            debugAcc7 = dataResFp32Tensor_.GetValue(k_ - 1);
+            SyncFuncStatic<AscendC::HardEvent::S_V, SYNC_EVENT_ID3>();
+        }
+#endif
+        // fp32 -> bf16 and write the unmodified operator output first.
         Cast(dataResTensor_, dataResFp32Tensor_, AscendC::RoundMode::CAST_RINT, k_);
         SyncFuncStatic<AscendC::HardEvent::V_MTE3, SYNC_EVENT_ID3>();
         DataCopy(output[tokenIdx * k_], dataResTensor_, k_);
+#if MEGA_MOE_PROCESS_DEBUG
+        if (tokenIdx == 0 && k_ >= MM_DEBUG_RECORD_ELEMS) {
+            // Ensure the normal output copy has consumed dataResTensor_, then consume
+            // the two normal-loop V_MTE2 flags before reusing dataIn0Bf16 for probes.
+            SyncFuncStatic<AscendC::HardEvent::MTE3_MTE2, SYNC_EVENT_ID2>();
+            WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
+            WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID1);
+
+            // [0:16] fixed metadata/counters.
+            dataResFp32Tensor_.SetValue(0, 11.0f);
+            dataResFp32Tensor_.SetValue(1, 22.0f);
+            dataResFp32Tensor_.SetValue(2, 33.0f);
+            dataResFp32Tensor_.SetValue(3, 44.0f);
+            dataResFp32Tensor_.SetValue(4, 1.0f); // record version
+            dataResFp32Tensor_.SetValue(5, static_cast<float>(rankId_));
+            dataResFp32Tensor_.SetValue(6, static_cast<float>(m_));
+            dataResFp32Tensor_.SetValue(7, static_cast<float>(k_));
+            dataResFp32Tensor_.SetValue(8, static_cast<float>(topK_));
+            dataResFp32Tensor_.SetValue(9, static_cast<float>(params_.tilingData->groupedMatmulMode));
+            dataResFp32Tensor_.SetValue(10, static_cast<float>(QuantMode));
+            dataResFp32Tensor_.SetValue(11, static_cast<float>(CombineQuantMode));
+            dataResFp32Tensor_.SetValue(12, static_cast<float>(gmm1Hit));
+            dataResFp32Tensor_.SetValue(13, static_cast<float>(gmm1Skip));
+            dataResFp32Tensor_.SetValue(14, static_cast<float>(gmm2Hit));
+            dataResFp32Tensor_.SetValue(15, static_cast<float>(gmm2Skip));
+
+            // [16:24] pre-record Unpermute accumulation samples from spread-out columns.
+            dataResFp32Tensor_.SetValue(16, debugAcc0);
+            dataResFp32Tensor_.SetValue(17, debugAcc1);
+            dataResFp32Tensor_.SetValue(18, debugAcc2);
+            dataResFp32Tensor_.SetValue(19, debugAcc3);
+            dataResFp32Tensor_.SetValue(20, debugAcc4);
+            dataResFp32Tensor_.SetValue(21, debugAcc5);
+            dataResFp32Tensor_.SetValue(22, debugAcc6);
+            dataResFp32Tensor_.SetValue(23, debugAcc7);
+
+            // [24:32] token-0 top-k weights, zero-filled when topK_ < 8.
+            for (uint32_t routeIdx = 0; routeIdx < MM_DEBUG_MAX_TOPK; ++routeIdx) {
+                float routeWeight = routeIdx < topK_ ? topKWeightsTensor_.GetValue(routeIdx) : 0.0f;
+                dataResFp32Tensor_.SetValue(24 + routeIdx, routeWeight);
+            }
+
+            // [32:96] up to 8 expandedX routes x 8 spread-out column samples.
+            for (uint32_t index = 32; index < MM_DEBUG_RECORD_ELEMS; ++index) {
+                dataResFp32Tensor_.SetValue(index, 0.0f);
+            }
+            if constexpr (CombineQuantMode == COMBINE_NO_QUANT) {
+                uint32_t debugRouteCount = topK_ < MM_DEBUG_MAX_TOPK ? topK_ : MM_DEBUG_MAX_TOPK;
+                for (uint32_t routeIdx = 0; routeIdx < debugRouteCount; ++routeIdx) {
+                    DataCopy(dataIn0Bf16, expandedX[routeIdx * k_], k_);
+                    SyncFuncStatic<AscendC::HardEvent::MTE2_V, SYNC_EVENT_ID4>();
+                    Cast(dataIn0Fp32, dataIn0Bf16, AscendC::RoundMode::CAST_NONE, k_);
+                    SyncFuncStatic<AscendC::HardEvent::V_S, SYNC_EVENT_ID4>();
+                    uint32_t recordOffset = 32 + routeIdx * MM_DEBUG_ROUTE_SAMPLES;
+                    dataResFp32Tensor_.SetValue(recordOffset, dataIn0Fp32.GetValue(0));
+                    dataResFp32Tensor_.SetValue(recordOffset + 1, dataIn0Fp32.GetValue(1));
+                    dataResFp32Tensor_.SetValue(recordOffset + 2, dataIn0Fp32.GetValue(2));
+                    dataResFp32Tensor_.SetValue(recordOffset + 3, dataIn0Fp32.GetValue(3));
+                    dataResFp32Tensor_.SetValue(recordOffset + 4, dataIn0Fp32.GetValue(k_ / 2));
+                    dataResFp32Tensor_.SetValue(recordOffset + 5, dataIn0Fp32.GetValue(k_ / 2 + 1));
+                    dataResFp32Tensor_.SetValue(recordOffset + 6, dataIn0Fp32.GetValue(k_ - 2));
+                    dataResFp32Tensor_.SetValue(recordOffset + 7, dataIn0Fp32.GetValue(k_ - 1));
+                    SyncFuncStatic<AscendC::HardEvent::S_MTE2, SYNC_EVENT_ID4>();
+                }
+            } else {
+                MM_PROC_TRACE("debug record expandedX sampling unsupported for combine quant");
+            }
+
+            // Scalar record -> vector Cast -> the same normal UB->GM output path.
+            SyncFuncStatic<AscendC::HardEvent::S_V, SYNC_EVENT_ID4>();
+            Cast(dataResTensor_, dataResFp32Tensor_, AscendC::RoundMode::CAST_RINT, MM_DEBUG_RECORD_ELEMS);
+            SyncFuncStatic<AscendC::HardEvent::V_MTE3, SYNC_EVENT_ID4>();
+            DataCopy(output, dataResTensor_, MM_DEBUG_RECORD_ELEMS);
+            SyncFuncStatic<AscendC::HardEvent::MTE3_S, SYNC_EVENT_ID4>();
+            MM_PROC_TRACE("debug record WRITE y[0,0:96]");
+
+            // Restore the invariant expected by the next token iteration/function tail.
+            SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
+            SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID1);
+        }
+#endif
     }
     WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
     WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID1);
@@ -1263,32 +1425,36 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::GroupMatmulWithCombine(
 }
 
 template <TemplateMegaMoeTypeClass>
-// Process() expert-combine diagnostic counters
-// 0 = release default; 1 = trace GMM1/GMM2/unpermute iterations in Process().
-// Used for narrowing down OP_2026_07_10_001 (y all-zero on 950 EP_2).
-#ifndef MEGA_MOE_PROCESS_DEBUG
-#define MEGA_MOE_PROCESS_DEBUG 1
-#endif
-#if MEGA_MOE_PROCESS_DEBUG
-// Ascend C kernel: AscendC::printf, NOT std::printf.  We only print a static
-// string (no %u/%p) because some CANN toolkits reject format arguments in
-// kernel-side printf.  Numeric counters are deliberately NOT printed; the
-// side-effect-free trace points alone tell us which branch we fell into.
-#define MM_PROC_TRACE(msg)                                                                         \
-    do {                                                                                           \
-        AscendC::printf("[MMPROC] " msg "\n");                                                    \
-    } while (0)
-#else
-#define MM_PROC_TRACE(msg) ((void)0)
-#endif
-
-
 __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::Process()
 {
     // 1.本卡数据处理
     int64_t oriOverflowMode = GetCtrlSpr<OVERFLOW_MODE_CTRL, OVERFLOW_MODE_CTRL>();
     SetCtrlSpr<OVERFLOW_MODE_CTRL, OVERFLOW_MODE_CTRL>(0);
     MM_PROC_TRACE("Process enter");
+#if MEGA_MOE_PROCESS_DEBUG
+    if constexpr (g_coreType == AIV) {
+        if (aivCoreIdx_ == 0) {
+            if constexpr (ENABLE_A8W4) {
+                MM_PROC_TRACE("path ENABLE_A8W4: GMM1/GMM2 A8W4 prologue");
+            } else if constexpr (ENABLE_A4W4) {
+                MM_PROC_TRACE("path ENABLE_A4W4: GMM1 generic A4W4, GMM2 A8W4 prologue");
+            } else if (params_.tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W8_NZ) {
+                MM_PROC_TRACE("path A8W8_NZ");
+            } else {
+                MM_PROC_TRACE("path generic ND");
+            }
+            if constexpr (QuantMode == E2M1_QUANT) {
+                MM_PROC_TRACE("dispatch quant mode E2M1/FP4");
+            } else if constexpr (QuantMode == E4M3_QUANT) {
+                MM_PROC_TRACE("dispatch quant mode E4M3/FP8");
+            } else if constexpr (QuantMode == E5M2_QUANT) {
+                MM_PROC_TRACE("dispatch quant mode E5M2/FP8");
+            } else {
+                MM_PROC_TRACE("dispatch quant mode OTHER");
+            }
+        }
+    }
+#endif
     SendAndQuantBuffInit();
     SendMaskCal();               // 源卡按所有全局专家算 mask 并推送到目标专家卡
     ResetFlagList();             // 清理workSpace空间上的flag位
@@ -1299,6 +1465,14 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::Process()
     }
     SyncAll<false>();            // aic需要等待flag位reset清理完成
     CrossRankSyncInWorldSize();  // 全卡同步
+#if MEGA_MOE_PROCESS_DEBUG
+    if constexpr (g_coreType == AIV) {
+        if (aivCoreIdx_ == 0) {
+            MM_PROC_TRACE_STATE("stage quantTokenScale[0:64B]",
+                MmDebugGmBytesAnyNonZero(params_.peermemInfo.quantTokenScalePtr));
+        }
+    }
+#endif
 
     // 2.本卡专家接收数据dispatch & GroupMatmul1 & SwigluQuant
     DispatchBuffInit();
@@ -1365,6 +1539,24 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::Process()
             ExpertTokenNumCopyOut(); // 本卡专家接受的tokenCnt总数搬出
         }
     }
+#if MEGA_MOE_PROCESS_DEBUG
+    // All cores rendezvous before the one-core scalar GM probes. These probes
+    // classify stage outputs without relying on numeric kernel printf support.
+    PipeBarrier<PIPE_ALL>();
+    SyncAll<true>();
+    if constexpr (g_coreType == AIV) {
+        if (aivCoreIdx_ == 0) {
+            MM_PROC_TRACE_STATE("stage dispatchRevData[0:64B]",
+                MmDebugGmBytesAnyNonZero(params_.workspaceInfo.dispatchRevDataPtr));
+            MM_PROC_TRACE_STATE("stage dispatchRevScale[0:64B]",
+                MmDebugGmBytesAnyNonZero(params_.workspaceInfo.dispatchRevScalePtr));
+            MM_PROC_TRACE_STATE("stage swigluQuantData[0:64B]",
+                MmDebugGmBytesAnyNonZero(params_.workspaceInfo.swigluQuantDataPtr));
+            MM_PROC_TRACE_STATE("stage swigluQuantScale[0:64B]",
+                MmDebugGmBytesAnyNonZero(params_.workspaceInfo.swigluQuantScalePtr));
+        }
+    }
+#endif
 
     // 3. 本卡专家接收数据GroupMatmul2 & Combine
     vecSetSyncCom_ = 0;
@@ -1393,35 +1585,32 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::Process()
     }
     PipeBarrier<PIPE_ALL>();
     SyncAll<true>();
+#if MEGA_MOE_PROCESS_DEBUG
+    if constexpr (g_coreType == AIV) {
+        if (aivCoreIdx_ == 0) {
+            if (params_.workspaceInfo.gmm2MmadResPtr != nullptr) {
+                MM_PROC_TRACE_STATE("stage gmm2MmadRes[0:64B]",
+                    MmDebugGmBytesAnyNonZero(params_.workspaceInfo.gmm2MmadResPtr));
+            } else {
+                MM_PROC_TRACE("stage gmm2MmadRes: NOT_ALLOCATED_FOR_THIS_PATH");
+            }
+        }
+    }
+#endif
 
     // 4. 本卡数据Unpermute
     if constexpr(g_coreType == AIV) {
         UnpermuteBuffInit();
         CrossRankSyncInWorldSize(); // 全卡软同步，确认combine send完成
-        MM_PROC_TRACE("pre-unpermute");
-        Unpermute();
-        MM_PROC_TRACE("post-unpermute done");
 #if MEGA_MOE_PROCESS_DEBUG
-        // --- y2GmAddr write-back canary -------------------------------------------------
-        // Immediately after Unpermute(), write a known bf16 pattern DIRECTLY to y2GmAddr.
-        // If the host-side `y` tensor reads these exact values, the kernel→host address
-        // path is correct and any upstream-zero bug is in combine/unpermute itself.
-        // If the host reads all-zero (or garbage), y2GmAddr does not alias the Python
-        // storage and the ACL tensor binding is broken.
-        {
-            __gm__ bfloat16_t* yBase = reinterpret_cast<__gm__ bfloat16_t*>(params_.y2GmAddr);
-            if (yBase != nullptr) {
-                yBase[0] = 1.0f;   // bf16 1.0 == 0x3F80
-                yBase[1] = 2.0f;   // bf16 2.0 == 0x4000
-                yBase[2] = 3.0f;   // bf16 3.0 == 0x4040
-                yBase[3] = 4.0f;   // bf16 4.0 == 0x4080
-                AscendC::pipe_barrier(PIPE_ALL);
-                MM_PROC_TRACE("y2-canary WRITE 1,2,3,4 bf16");
-            } else {
-                MM_PROC_TRACE("y2-canary SKIP (null y2GmAddr)");
-            }
+        if (aivCoreIdx_ == 0) {
+            MM_PROC_TRACE_STATE("stage combineSend[0:64B]",
+                MmDebugGmBytesAnyNonZero(params_.peermemInfo.combineSendPtr));
         }
 #endif
+        MM_PROC_TRACE("pre-unpermute");
+        Unpermute(gmm1_hit, gmm1_skip, gmm2_hit, gmm2_skip);
+        MM_PROC_TRACE("post-unpermute done");
     }
     SetCtrlSpr<OVERFLOW_MODE_CTRL, OVERFLOW_MODE_CTRL>(oriOverflowMode);
 #if MEGA_MOE_PROCESS_DEBUG

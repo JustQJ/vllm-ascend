@@ -163,9 +163,15 @@ def run_megamoe_npu(
     _y_min = y.min().item()
     _y_max = y.max().item()
     _y_all_zero = bool((y == 0).all().item())
+    # The debug kernel embeds its structured record in y[0, :96]. Keep the
+    # actual-payload verdict separate so the record itself cannot hide y=0.
+    _y_payload = y.reshape(-1)[96:]
+    _payload_sum = _y_payload.abs().sum().item()
+    _payload_all_zero = bool((_y_payload == 0).all().item())
     print(f"[INFO] device_{rank} mega_moe y stats: "
           f"sum={_y_sum:.4f} std={_y_std:.4f} min={_y_min:.4f} max={_y_max:.4f} "
-          f"all_zero={_y_all_zero}", flush=True)
+          f"all_zero={_y_all_zero} payload[96:].sum={_payload_sum:.4f} "
+          f"payload[96:].all_zero={_payload_all_zero}", flush=True)
     print(f"[INFO] device_{rank} finish\n")
     dist.destroy_process_group()
     print(f'rank {rank} epid {rank} npu finished! \n')
