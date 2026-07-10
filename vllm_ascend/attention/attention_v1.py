@@ -17,7 +17,7 @@
 
 from dataclasses import dataclass
 from enum import Enum
-
+from vllm.logger import logger
 import torch
 import torch_npu
 import vllm.envs as envs_vllm
@@ -1004,13 +1004,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     f"key_cache is None in _get_fia_params for mode {attn_metadata.attn_state}. kv_cache={kv_cache}"
                 )
 
-        if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
-            block_size = 128
-            block_table = None
-            actual_seq_lengths_kv = attn_metadata.actual_seq_lengths_q
-            if self.attn_type == AttentionType.ENCODER_DECODER:
-                actual_seq_lengths_kv = torch.cumsum(attn_metadata.seq_lens, dim=0).tolist()
-        elif attn_metadata.attn_state == AscendAttentionState.PrefillCacheHit:
+        # if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
+        #     block_size = 128
+        #     block_table = None
+        #     actual_seq_lengths_kv = attn_metadata.actual_seq_lengths_q
+        #     if self.attn_type == AttentionType.ENCODER_DECODER:
+        #         actual_seq_lengths_kv = torch.cumsum(attn_metadata.seq_lens, dim=0).tolist()
+        # elif attn_metadata.attn_state == AscendAttentionState.PrefillCacheHit:
+        if attn_metadata.attn_state == AscendAttentionState.PrefillCacheHit:
+            logger.info_once(f"run in PrefillCacheHit")
             batch_size = attn_metadata.seq_lens.shape[0]
             block_table = attn_metadata.block_tables[:batch_size, :]
             num_block, block_size, _, _ = self.key_cache.shape  # type: ignore
@@ -1022,6 +1024,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             )
             actual_seq_lengths_kv = attn_metadata.seq_lens_list
         elif attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
+            logger.info_once(f"run in DecodeOnly")
             num_block, block_size, _, _ = self.key_cache.shape  # type: ignore
             key = self.key_cache.view(  # type: ignore
                 num_block, block_size, -1
@@ -1033,6 +1036,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             actual_seq_lengths_kv = attn_metadata.seq_lens_list
         # chunked prefill.
         else:
+            logger.info_once(f"run in else")
+            
             num_block, block_size, _, _ = self.key_cache.shape  # type: ignore
             key = self.key_cache.view(  # type: ignore
                 num_block, block_size, -1
@@ -1077,12 +1082,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
             )
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
         query = query[:num_tokens]
-        if (
-            attn_metadata.attn_state == AscendAttentionState.PrefillNoCache
-            and self.attn_type != AttentionType.ENCODER_DECODER
-        ):
-            key = key[:num_tokens]
-            value = value[:num_tokens]
+        # if (
+        #     attn_metadata.attn_state == AscendAttentionState.PrefillNoCache
+        #     and self.attn_type != AttentionType.ENCODER_DECODER
+        # ):
+        #     key = key[:num_tokens]
+        #     value = value[:num_tokens]
         # Get workspace from cache or calculate it if not present.
         if self.sinks is not None:
             actual_seq_qlen = attn_metadata.actual_seq_lengths_q
@@ -1145,6 +1150,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     sparse_mode=4,
                 )
             else:
+                logger.info_once(f"query.shape : {query.shape}, key.shape: {key.shape}, value.shape: {value.shape}, block_table: {block_table}, block_table: {block_table.shape}")
                 attn_output, _ = torch_npu.npu_fused_infer_attention_score(
                     query=query,
                     key=key,
