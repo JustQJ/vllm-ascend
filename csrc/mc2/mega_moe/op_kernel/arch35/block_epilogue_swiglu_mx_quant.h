@@ -64,7 +64,26 @@ constexpr int64_t QUANT_ONCE_NUM_FP4 = 128;
 constexpr int64_t SCALE_ONCE_NUM = 8;
 constexpr int64_t CONST_64 = 64;
 constexpr uint32_t VF_LEN_FP32 = AscendC::VECTOR_REG_WIDTH / sizeof(float);
+constexpr uint32_t MM_EPILOGUE_DEBUG_EVENT_ID = 5;
 } // namespace
+
+// One-pass diagnostics for OP_2026_07_10_001. Keep messages static because
+// some CANN toolkits reject device printf format arguments.
+#ifndef MEGA_MOE_EPILOGUE_DEBUG
+#define MEGA_MOE_EPILOGUE_DEBUG 1
+#endif
+#if MEGA_MOE_EPILOGUE_DEBUG
+#define MM_EPILOGUE_TRACE_STATE(label, condition)                                                  \
+    do {                                                                                           \
+        if (condition) {                                                                           \
+            AscendC::printf("[MMEPI] " label ": NONZERO\n");                                    \
+        } else {                                                                                   \
+            AscendC::printf("[MMEPI] " label ": ALL_ZERO\n");                                    \
+        }                                                                                          \
+    } while (0)
+#else
+#define MM_EPILOGUE_TRACE_STATE(label, condition) ((void)0)
+#endif
 
 constexpr AscendC::MicroAPI::CastTrait ctInt322Fp32 = {
     AscendC::MicroAPI::RegLayout::UNKNOWN, AscendC::MicroAPI::SatMode::UNKNOWN,
@@ -161,6 +180,8 @@ public:
 private:
     __aicore__ inline void VFDoSwigluForMX(uint16_t mSize, uint16_t pingpongIdx = 0);
 
+    __aicore__ inline void TransMxScaleLayout(uint16_t mSize, uint16_t scaleBlockN);
+
     template <SwigluQuantMsg::QuantMode quantMode, bool IsInterleavedSrc = false>
     __aicore__ inline void VFDoSwigluAndQuantForMX(__ubuf__ int8_t *outputDst, __ubuf__ uint16_t *scaleDst,
                                                    __ubuf__ DataTypeIn *firstSrc, __ubuf__ DataTypeIn *secondSrc,
@@ -190,6 +211,14 @@ private:
 
     __aicore__ inline void CopyScaleFromUb2GmCompact(uint64_t blockCount, uint64_t offset,
                                                      AscendC::LocalTensor<int8_t> &src);
+
+    __aicore__ inline void CopyScaleFromUb2Gm(uint64_t blockCount, uint64_t offset,
+                                              AscendC::LocalTensor<int8_t> &src);
+
+#if MEGA_MOE_EPILOGUE_DEBUG
+    __aicore__ inline bool DebugLocalBytesAnyNonZero(AscendC::LocalTensor<int8_t> &src, uint32_t bytes);
+    __aicore__ inline bool DebugScaleGmBytesAnyNonZero(uint64_t offset, uint32_t bytes);
+#endif
     // GM ADDR
     AscendC::GlobalTensor<int8_t> quantOutputGlobal_;
     AscendC::GlobalTensor<int8_t> quantScaleGlobal_;
@@ -204,6 +233,7 @@ private:
     AscendC::LocalTensor<DataTypeIn> l0cOutUbSecond_{AscendC::TPosition::VECIN, kUbSecondOffset, MAX_SINGLE_MN};
     AscendC::LocalTensor<int8_t> quantOutput_;
     AscendC::LocalTensor<int8_t> quantScaleOutput_;
+    AscendC::LocalTensor<int8_t> quantScaleBlockOutput_;
     AscendC::LocalTensor<bfloat16_t> gluRes_;
     AscendC::LocalTensor<uint16_t> maxExp_;
     AscendC::LocalTensor<uint16_t> halfScale_;
@@ -211,6 +241,7 @@ private:
 
     int64_t n_;
     int64_t scaleN_;
+    int64_t scaleBlockN_;
     uint32_t subBlockIdx_ = AscendC::GetSubBlockIdx();
     uint32_t singleM_; // cur singleShapeM
     uint32_t singleN_;
@@ -222,6 +253,9 @@ private:
 
     BlockCoord blockCoord_{0, 0, 0, 0, 0, 0};
     float clampLimit_{0.0f};
+#if MEGA_MOE_EPILOGUE_DEBUG
+    bool debugPrinted_{false};
+#endif
 };
 
 BLOCK_EPILOGUE_SWIGLU_QUANT_CLASS_LOCAL_PARAMS
@@ -259,6 +293,10 @@ BlockEpilogueSwigluMxQuant<BLOCK_EPILOGUE_DEQUANT_FUNC_LOCAL_PARAMS>::Init(Param
     constexpr uint32_t halfScaleOffset = maxExpOffset + MAX_SINGLE_MN_ALIAS / AscendC::ONE_BLK_SIZE * sizeof(uint16_t);
     halfScale_ = AscendC::LocalTensor<uint16_t>(
         AscendC::TPosition::VECCALC, halfScaleOffset, MAX_SINGLE_MN_ALIAS / AscendC::ONE_BLK_SIZE);
+    constexpr uint32_t quantScaleBlockOffset = halfScaleOffset +
+        MAX_SINGLE_MN_ALIAS / AscendC::ONE_BLK_SIZE * sizeof(uint16_t);
+    quantScaleBlockOutput_ = AscendC::LocalTensor<int8_t>(
+        AscendC::TPosition::VECOUT, quantScaleBlockOffset, params_->baseM * AscendC::ONE_BLK_SIZE);
 }
 
 BLOCK_EPILOGUE_SWIGLU_QUANT_CLASS_LOCAL_PARAMS
@@ -318,6 +356,55 @@ BlockEpilogueSwigluMxQuant<BLOCK_EPILOGUE_DEQUANT_FUNC_LOCAL_PARAMS>::CopyScaleF
     ub2GmParams.dstStride = scaleN_ - blockScaleN;
     AscendC::DataCopyPad<int8_t, AscendC::PaddingMode::Compact>(quantScaleGlobal_[offset], src, ub2GmParams);
 }
+
+BLOCK_EPILOGUE_SWIGLU_QUANT_CLASS_LOCAL_PARAMS
+__aicore__ inline void
+BlockEpilogueSwigluMxQuant<BLOCK_EPILOGUE_DEQUANT_FUNC_LOCAL_PARAMS>::CopyScaleFromUb2Gm(
+    uint64_t blockCount, uint64_t offset, AscendC::LocalTensor<int8_t> &src)
+{
+    AscendC::DataCopyExtParams ub2GmParams{1, 0, 0, 0, 0};
+    ub2GmParams.blockCount = blockCount;
+    ub2GmParams.blockLen = scaleBlockN_ * sizeof(int8_t);
+    ub2GmParams.srcStride = 0;
+    ub2GmParams.dstStride = (scaleN_ - scaleBlockN_) * sizeof(int8_t);
+    AscendC::DataCopyPad(quantScaleGlobal_[offset], src, ub2GmParams);
+}
+
+#if MEGA_MOE_EPILOGUE_DEBUG
+BLOCK_EPILOGUE_SWIGLU_QUANT_CLASS_LOCAL_PARAMS
+__aicore__ inline bool
+BlockEpilogueSwigluMxQuant<BLOCK_EPILOGUE_DEQUANT_FUNC_LOCAL_PARAMS>::DebugLocalBytesAnyNonZero(
+    AscendC::LocalTensor<int8_t> &src, uint32_t bytes)
+{
+    SyncFuncStatic<AscendC::HardEvent::V_S, MM_EPILOGUE_DEBUG_EVENT_ID>();
+    uint8_t anyNonZero = 0;
+    for (uint32_t index = 0; index < bytes; ++index) {
+        anyNonZero |= static_cast<uint8_t>(src.GetValue(index));
+    }
+    SyncFuncStatic<AscendC::HardEvent::S_V, MM_EPILOGUE_DEBUG_EVENT_ID>();
+    return anyNonZero != 0;
+}
+
+BLOCK_EPILOGUE_SWIGLU_QUANT_CLASS_LOCAL_PARAMS
+__aicore__ inline bool
+BlockEpilogueSwigluMxQuant<BLOCK_EPILOGUE_DEQUANT_FUNC_LOCAL_PARAMS>::DebugScaleGmBytesAnyNonZero(
+    uint64_t offset, uint32_t bytes)
+{
+    AscendC::GlobalTensor<uint8_t> sampleGm;
+    sampleGm.SetGlobalBuffer(
+        reinterpret_cast<__gm__ uint8_t *>(quantScaleGlobal_.GetPhyAddr()) + offset);
+    AscendC::PipeBarrier<PIPE_ALL>();
+    __asm__ __volatile__("");
+    AscendC::DataCacheCleanAndInvalid<uint8_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+        AscendC::DcciDst::CACHELINE_OUT>(sampleGm);
+    __asm__ __volatile__("");
+    uint8_t anyNonZero = 0;
+    for (uint32_t index = 0; index < bytes; ++index) {
+        anyNonZero |= sampleGm.GetValue(index);
+    }
+    return anyNonZero != 0;
+}
+#endif
 
 BLOCK_EPILOGUE_SWIGLU_QUANT_CLASS_LOCAL_PARAMS
 __aicore__ inline void BlockEpilogueSwigluMxQuant<BLOCK_EPILOGUE_DEQUANT_FUNC_LOCAL_PARAMS>::ComputeMaxExp(
@@ -722,6 +809,34 @@ BlockEpilogueSwigluMxQuant<BLOCK_EPILOGUE_DEQUANT_FUNC_LOCAL_PARAMS>::VFDoSwiglu
 }
 
 BLOCK_EPILOGUE_SWIGLU_QUANT_CLASS_LOCAL_PARAMS
+__aicore__ inline void
+BlockEpilogueSwigluMxQuant<BLOCK_EPILOGUE_DEQUANT_FUNC_LOCAL_PARAMS>::TransMxScaleLayout(
+    uint16_t mSize, uint16_t scaleBlockN)
+{
+    __ubuf__ int8_t *quantScaleOutputInUbAddr =
+        (__ubuf__ int8_t *)quantScaleOutput_.GetPhyAddr();
+    __ubuf__ int8_t *quantScaleBlockOutputInUbAddr =
+        (__ubuf__ int8_t *)quantScaleBlockOutput_.GetPhyAddr();
+    // Convert compact (mSize, scaleBlockN) scales into 32-byte UB rows so the
+    // normal UB->GM DataCopyPad path can copy a short row reliably.
+    __VEC_SCOPE__
+    {
+        for (uint16_t mIdx = 0; mIdx < mSize; ++mIdx) {
+            uint32_t elemNum = scaleBlockN;
+            AscendC::MicroAPI::MaskReg maskScaleN = AscendC::MicroAPI::UpdateMask<int8_t>(elemNum);
+            AscendC::MicroAPI::RegTensor<int8_t> vreg0;
+            AscendC::MicroAPI::UnalignReg unalignReg;
+            auto srcUb = quantScaleOutputInUbAddr + mIdx * scaleBlockN;
+            AscendC::MicroAPI::DataCopyUnAlignPre(unalignReg, srcUb);
+            AscendC::MicroAPI::DataCopyUnAlign(vreg0, unalignReg, srcUb);
+            auto dstUb = quantScaleBlockOutputInUbAddr + mIdx * AscendC::ONE_BLK_SIZE;
+            AscendC::MicroAPI::DataCopy<int8_t, AscendC::MicroAPI::StoreDist::DIST_NORM_B8>(
+                dstUb, vreg0, maskScaleN);
+        }
+    }
+}
+
+BLOCK_EPILOGUE_SWIGLU_QUANT_CLASS_LOCAL_PARAMS
 __aicore__ inline auto BlockEpilogueSwigluMxQuant<BLOCK_EPILOGUE_DEQUANT_FUNC_LOCAL_PARAMS>::GetFirstL0c2UbTensor()
 {
     return l0cOutUbFirst_;
@@ -741,6 +856,8 @@ BlockEpilogueSwigluMxQuant<BLOCK_EPILOGUE_DEQUANT_FUNC_LOCAL_PARAMS>::operator()
 {
     singleM_ = Get<M_VALUE>(blockShape); // 128
     singleN_ = Get<N_VALUE>(blockShape); // 256
+    scaleBlockN_ = Ops::Base::CeilDiv(static_cast<uint64_t>(singleN_),
+        static_cast<uint64_t>(MXFP_DIVISOR_SIZE)) * MXFP_MULTI_BASE_SIZE;
     blockCoord_ = blockCoord;
 
     if (singleM_ == 0) {
@@ -754,9 +871,40 @@ BlockEpilogueSwigluMxQuant<BLOCK_EPILOGUE_DEQUANT_FUNC_LOCAL_PARAMS>::operator()
     uint64_t yOffset = Get<Y_IDX>(blockCoord);
     uint64_t yScaleOffset = Get<Y_SCALE_IDX>(blockCoord);
     VFDoSwigluForMX(singleM_, pingpongIdx); // switch(x)*y 计算quant quantScale
+#if MEGA_MOE_EPILOGUE_DEBUG
+    const bool debugThisTile = !debugPrinted_ && AscendC::GetBlockIdx() == 0U && subBlockIdx_ == 0U;
+    if (debugThisTile) {
+        AscendC::LocalTensor<int8_t> gluResBytes = gluRes_.template ReinterpretCast<int8_t>();
+        AscendC::LocalTensor<int8_t> maxExpBytes = maxExp_.template ReinterpretCast<int8_t>();
+        AscendC::LocalTensor<int8_t> halfScaleBytes = halfScale_.template ReinterpretCast<int8_t>();
+        MM_EPILOGUE_TRACE_STATE("clamp limit", clampLimit_ != 0.0f);
+        MM_EPILOGUE_TRACE_STATE("SwiGLU result UB before MX quant",
+            DebugLocalBytesAnyNonZero(gluResBytes, CONST_64));
+        MM_EPILOGUE_TRACE_STATE("max exponent UB after ComputeMaxExp",
+            DebugLocalBytesAnyNonZero(maxExpBytes, CONST_64));
+        MM_EPILOGUE_TRACE_STATE("half scale UB after ComputeScale",
+            DebugLocalBytesAnyNonZero(halfScaleBytes, CONST_64));
+        MM_EPILOGUE_TRACE_STATE("quant data UB after MX quant",
+            DebugLocalBytesAnyNonZero(quantOutput_, CONST_64));
+        MM_EPILOGUE_TRACE_STATE("scale compact UB after ComputeScale",
+            DebugLocalBytesAnyNonZero(quantScaleOutput_, CONST_64));
+        SyncFuncStatic<AscendC::HardEvent::S_V, MM_EPILOGUE_DEBUG_EVENT_ID>();
+    }
+#endif
+    if constexpr (!IsInterleaved_) {
+        TransMxScaleLayout(singleM_, scaleBlockN_);
+#if MEGA_MOE_EPILOGUE_DEBUG
+        if (debugThisTile) {
+            MM_EPILOGUE_TRACE_STATE("scale padded UB after TransMxScaleLayout",
+                DebugLocalBytesAnyNonZero(quantScaleBlockOutput_, CONST_64));
+            SyncFuncStatic<AscendC::HardEvent::S_V, MM_EPILOGUE_DEBUG_EVENT_ID>();
+        }
+#endif
+    }
     AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(0);
     AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(0);
-    // scale已按compact布局生成，直接copy到GM，省掉原先TransMxScaleLayout重排scale。
+    // Interleaved mode retains compact copy. The current non-interleaved MegaMoe
+    // path uses padded 32-byte UB rows and the normal DataCopyPad implementation.
     if constexpr (IsInterleaved_) {
         constexpr uint32_t PONG_INT8_ELEMS = MAX_SINGLE_MN * sizeof(DataTypeIn);
         if (pingpongIdx == 1U) {
@@ -770,10 +918,17 @@ BlockEpilogueSwigluMxQuant<BLOCK_EPILOGUE_DEQUANT_FUNC_LOCAL_PARAMS>::operator()
         }
     } else {
         CopyOutputFromUb2Gm(singleM_, yOffset, quantOutput_);
-        CopyScaleFromUb2GmCompact(singleM_, yScaleOffset, quantScaleOutput_);
+        CopyScaleFromUb2Gm(singleM_, yScaleOffset, quantScaleBlockOutput_);
     }
     AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(0);
     AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(0);
+#if MEGA_MOE_EPILOGUE_DEBUG
+    if (debugThisTile) {
+        MM_EPILOGUE_TRACE_STATE("scale GM after DataCopyPad",
+            DebugScaleGmBytesAnyNonZero(yScaleOffset, CONST_64));
+        debugPrinted_ = true;
+    }
+#endif
     AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(0);
     AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(0);
     AscendC::AtomicAdd(groupFlagListGmAddr_, 1);
