@@ -1172,23 +1172,25 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         ])
                     else:
                         kv_lens = kv_lens_or_cu
+                    logger.info_once(f"paged_attention")
                     attn_output = paged_attention(
-                        q=query,
-                        k_cache=key,
-                        v_cache=value,
+                        query=query,
+                        key_cache=key,
+                        value_cache=value,
                         block_table=block_table,
-                        cu_q_lens=actual_seq_qlen,
-                        kv_lens=kv_lens,
+                        actual_seq_qlen=actual_seq_qlen,
+                        actual_seq_kvlen=kv_lens,
                         num_q_heads=self.num_heads,
                         num_kv_heads=self.num_kv_heads,
-                        sm_scale=self.scale,
+                        softmax_scale=self.scale,
                         block_size=block_size,
                         sinks=None,
                         atten_mask=attn_metadata.attn_mask,
                         use_mxfp4_p=envs_ascend.VLLM_ASCEND_PAGED_ATTN_USE_MXFP4_P,
                     )
                 else:
-                    attn_output, _ = DeviceOperator.npu_fused_infer_attention_score(
+                    logger.info_once(f"torch_npu.npu_fused_infer_attention_score")
+                    attn_output, _ = torch_npu.npu_fused_infer_attention_score(
                         query=query,
                         key=key,
                         value=value,
@@ -1200,14 +1202,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         actual_seq_lengths_kv=actual_seq_lengths_kv,
                         num_key_value_heads=self.num_kv_heads,
                         num_heads=self.num_heads,
-                        head_size=self.head_size,
                         scale=self.scale,
-                        key_cache=self.key_cache,
-                        value_cache=self.value_cache,
-                        current_key=passed_key,
-                        current_value=passed_value,
-                        attn_metadata=attn_metadata,
-                        is_prefill_no_cache=attn_metadata.attn_state == AscendAttentionState.PrefillNoCache,
                         sparse_mode=3,
                     )
 
