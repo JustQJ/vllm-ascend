@@ -571,3 +571,126 @@ def test_paged_attention_contiguous_prefill_mxfp4_p_error_distribution(
         plot_path,
         f"Contiguous prefill USE_MXFP4_P vs baseline abs error ({case_name})",
     )
+
+
+def test_paged_attention_matches_fias_v1_with_contiguous_prefill1():
+    if not hasattr(torch, "npu") or not torch.npu.is_available():
+        pytest.skip("NPU is required for torch_npu FIAS v1 comparison")
+
+    torch.manual_seed(0)
+    torch_npu.npu.manual_seed(0)
+    torch_npu.npu.manual_seed_all(0)
+    device = "npu"
+    q_lens = [64, 48]
+    block_m, block_n = BLOCK_SHAPES[0]
+    softmax_scale = HEAD_DIM ** -0.5
+
+    # query, key, value, actual_seq_qlen, actual_seq_kvlen = (
+    #     _build_contiguous_inputs(q_lens, NUM_Q_HEADS, NUM_KV_HEADS,
+    #                              HEAD_DIM, DTYPE, device)
+    # )
+    # atten_mask = _make_sparse_causal_mask(device)
+    filepath = "/mnt/share/t00970481/dump_data_prefill/fused_attention_step_0.pt"
+    data = torch.load(filepath)
+
+    query, key, value, atten_mask, block_table, input_layout, block_size, actual_seq_lengths, actual_seq_lengths_kv, num_key_value_heads, num_heads, scale, sparse_mode, key_cache, attn_output = data['query'].to(device), data['key'].to(device), data['value'].to(device), data['atten_mask'].to(device), data['block_table'], data['input_layout'], data['block_size'], data['actual_seq_lengths'], data['actual_seq_lengths_kv'], data['num_key_value_heads'], data['num_heads'], data['scale'], data['sparse_mode'], data['key_cache'], data['attn_output'].to(device)
+    actual_seq_lengths1 = torch.tensor(actual_seq_lengths).to(device)
+    actual_seq_lengths_kv1 = torch.tensor(actual_seq_lengths_kv).to(device)
+    print(actual_seq_lengths1.dtype, actual_seq_lengths_kv1.dtype)
+    triton_out = paged_attention(
+        query, key, value, block_table,
+        actual_seq_lengths1, actual_seq_lengths_kv1,
+        num_heads, num_key_value_heads, scale,
+        BLOCK_SIZE, block_m, block_n,
+        sinks=None,
+        atten_mask=atten_mask,
+    )
+
+    fias_out, _ = torch_npu.npu_fused_infer_attention_score(
+        query=query,
+        key=key,
+        value=value,
+        num_heads=num_heads,
+        num_key_value_heads=num_key_value_heads,
+        scale=scale,
+        atten_mask=atten_mask,
+        block_table=block_table,
+        input_layout=input_layout,
+        block_size=block_size,
+        actual_seq_lengths=actual_seq_lengths,
+        actual_seq_lengths_kv=actual_seq_lengths_kv,
+        sparse_mode=sparse_mode,
+    )
+    torch.npu.synchronize()
+
+    mse1 = (triton_out.float() - fias_out.float()).pow(2).mean().item()
+    mse2 = (triton_out.float() - attn_output.float()).pow(2).mean().item()
+    mse3 = (fias_out.float() - attn_output.float()).pow(2).mean().item()
+    print(f"[triton-contiguous-prefill-vs-fias_v1] mse1: {mse1}, mse2: {mse2}, mse3: {mse3}")
+    torch.testing.assert_close(triton_out, fias_out, atol=5e-3, rtol=5e-3)
+    
+    torch.testing.assert_close(attn_output, fias_out, atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(triton_out, attn_output, atol=5e-3, rtol=5e-3)
+
+
+def test_paged_attention_matches_fias_v1_with_decode1():
+    if not hasattr(torch, "npu") or not torch.npu.is_available():
+        pytest.skip("NPU is required for torch_npu FIAS v1 comparison")
+
+    torch.manual_seed(0)
+    torch_npu.npu.manual_seed(0)
+    torch_npu.npu.manual_seed_all(0)
+    device = "npu"
+    q_lens = [64, 48]
+    block_m, block_n = BLOCK_SHAPES[0]
+    softmax_scale = HEAD_DIM ** -0.5
+
+    # query, key, value, actual_seq_qlen, actual_seq_kvlen = (
+    #     _build_contiguous_inputs(q_lens, NUM_Q_HEADS, NUM_KV_HEADS,
+    #                              HEAD_DIM, DTYPE, device)
+    # )
+    # atten_mask = _make_sparse_causal_mask(device)
+    filepath = "/mnt/share/t00970481/dump_data_decode/fused_attention_step_0.pt"
+    data = torch.load(filepath)
+
+    query, key, value, atten_mask, block_table, input_layout, block_size, actual_seq_lengths, actual_seq_lengths_kv, num_key_value_heads, num_heads, scale, sparse_mode, key_cache, attn_output = data['query'].to(device), data['key'].to(device), data['value'].to(device), data['atten_mask'].to(device), data['block_table'].to(device), data['input_layout'], data['block_size'], data['actual_seq_lengths'], data['actual_seq_lengths_kv'], data['num_key_value_heads'], data['num_heads'], data['scale'], data['sparse_mode'], data['key_cache'], data['attn_output'].to(device)
+    actual_seq_lengths1 = torch.tensor(actual_seq_lengths).to(device)
+    actual_seq_lengths_kv1 = torch.tensor(actual_seq_lengths_kv).to(device)
+    print(actual_seq_lengths1.dtype, actual_seq_lengths_kv1.dtype, block_table.dtype, query.dtype, value.dtype)
+    triton_out = paged_attention(
+        query, key, value, block_table,
+        actual_seq_lengths1, actual_seq_lengths_kv1,
+        num_heads, num_key_value_heads, scale,
+        BLOCK_SIZE, block_m, block_n,
+        sinks=None,
+        atten_mask=atten_mask,
+    )
+    print(triton_out.shape, triton_out)
+    base_cpu = triton_out.to(torch.float32).cpu()
+    check_nan_inf(base_cpu, "triton_out")
+
+    fias_out, _ = torch_npu.npu_fused_infer_attention_score(
+        query=query,
+        key=key,
+        value=value,
+        num_heads=num_heads,
+        num_key_value_heads=num_key_value_heads,
+        scale=scale,
+        atten_mask=atten_mask,
+        block_table=block_table,
+        input_layout=input_layout,
+        block_size=block_size,
+        actual_seq_lengths=actual_seq_lengths,
+        actual_seq_lengths_kv=actual_seq_lengths_kv,
+        sparse_mode=sparse_mode,
+    )
+    torch.npu.synchronize()
+
+    mse1 = (triton_out.float() - fias_out.float()).pow(2).mean().item()
+    mse2 = (triton_out.float() - attn_output.float()).pow(2).mean().item()
+    mse3 = (fias_out.float() - attn_output.float()).pow(2).mean().item()
+    print(f"[triton-contiguous-prefill-vs-fias_v1] mse1: {mse1}, mse2: {mse2}, mse3: {mse3}")
+    torch.testing.assert_close(triton_out, fias_out, atol=5e-3, rtol=5e-3)
+    
+    torch.testing.assert_close(attn_output, fias_out, atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(triton_out, attn_output, atol=5e-3, rtol=5e-3)

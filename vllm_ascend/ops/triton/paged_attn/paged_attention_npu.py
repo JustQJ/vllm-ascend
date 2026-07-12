@@ -163,8 +163,11 @@ def _paged_attn_fwd_inner(
         else:
             slot_in_block = seq_offset % BLOCK_SIZE
             logical_block = seq_offset // BLOCK_SIZE
+            kv_lane_valid = seq_offset < kv_seq_len
             phys_block = tl.load(
-                block_tables_ptr + logical_block
+                block_tables_ptr + logical_block,
+                mask=kv_lane_valid,
+                other=0,
             ).to(tl.int64)
 
             flat_head_offset = kv_head_idx * HEAD_DIM
@@ -300,9 +303,11 @@ def _paged_attn_fwd(
     if HAS_SINKS:
         sink = tl.load(sink_ptr + q_head_idx).to(tl.float32)
         m_i = sink + tl.zeros([BLOCK_M], dtype=tl.float32)
+        l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
     else:
         m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
-    l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+        l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    # l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
     seq_block_table = block_table_ptr + seq * block_table_stride
@@ -336,8 +341,10 @@ def _paged_attn_fwd(
         IS_CONTIGUOUS_KV=IS_CONTIGUOUS_KV,
         USE_MXFP4_P=USE_MXFP4_P,
     )
-
-    acc = acc / l_i[:, None]
+    empty_row = l_i == 0.0
+    safe_l_i = tl.where(empty_row, 1.0, l_i)
+    acc = acc / safe_l_i[:, None]
+    # acc = acc / l_i[:, None]
     o_offsets = (
         q_idx_safe[:, None] * stride_o_tok
         + q_head_idx * stride_o_head
@@ -396,15 +403,15 @@ class _paged_attention(torch.autograd.Function):
     def forward(ctx, q, k_cache, v_cache, block_table,
                 cu_q_lens, kv_lens,
                 num_q_heads, num_kv_heads,
-                sm_scale, block_size, BLOCK_M=16, BLOCK_N=128, sinks=None,
+                sm_scale, block_size, BLOCK_M=16, BLOCK_N=64, sinks=None,
                 atten_mask=None, use_mxfp4_p=False):
         del ctx
         head_dim = q.shape[-1]
         assert q.dim() == 3
         assert q.shape[1] == num_q_heads
         assert num_q_heads % num_kv_heads == 0
-        assert BLOCK_M in {16, 32, 64}
-        assert BLOCK_N in {32, 64, 128, 256}
+        # assert BLOCK_M in {16, 32, 64}
+        # assert BLOCK_N in {32, 64, 128, 256}
         assert cu_q_lens.dtype == torch.int64
         assert kv_lens.dtype == torch.int64
         is_contiguous_kv = block_table is None
@@ -540,7 +547,7 @@ def paged_attention(
     softmax_scale,
     block_size,
     block_m=16,
-    block_n=128,
+    block_n=64,
     sinks=None,
     atten_mask=None,
     use_mxfp4_p=False
