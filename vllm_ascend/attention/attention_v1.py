@@ -1353,15 +1353,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     else:
                         kv_lens = kv_lens_or_cu
                     attn_output = paged_attention(
-                        q=query,
-                        k_cache=key,
-                        v_cache=value,
+                        query=query,
+                        key_cache=key,
+                        value_cache=value,
                         block_table=block_table,
-                        cu_q_lens=actual_seq_qlen,
-                        kv_lens=kv_lens,
+                        actual_seq_qlen=actual_seq_qlen,
+                        actual_seq_kvlen=kv_lens,
                         num_q_heads=self.num_heads,
                         num_kv_heads=self.num_kv_heads,
-                        sm_scale=self.scale,
+                        softmax_scale=self.scale,
                         block_size=block_size,
                         sinks=None,
                         atten_mask=attn_metadata.attn_mask,
