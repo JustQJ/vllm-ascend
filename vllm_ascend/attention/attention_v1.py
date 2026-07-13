@@ -67,7 +67,7 @@ from vllm_ascend.memcache_comm_fence import record_attention_compute_start
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
 from vllm_ascend.utils import weak_ref_tensors
 from vllm_ascend.ops.triton.paged_attn import paged_attention as fia_triton
-from vllm_ascend.ops.triton.paged_attn.paged_attention_npu import _paged_attention_custom_op_impl as fia_triton_custom_op_impl
+from vllm_ascend.ops.triton.paged_attn import paged_attention_decode_out as fia_triton_decode_out
 from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
 
 # default max value of sliding window size
@@ -658,7 +658,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     if seq_qlens_buffer is not None and latest_cpu_seq_qlens is not None:
                         num_reqs = latest_cpu_seq_qlens.numel()
                         seq_qlens_buffer[:num_reqs].copy_(latest_cpu_seq_qlens, non_blocking=True)
-                    
+
                     torch.npu.graph_task_update_begin(update_stream, handle)
                     input_layout = "TND"
                     extra_args = {}
@@ -673,24 +673,29 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         input_layout = "BNSD"
                         sparse_mode = 0
                     if envs_ascend.VLLM_ASCEND_USE_PAGED_ATTENTION:
-                        # 这里实现有问题，需要 agent 修改
-                        attn_output = fia_triton(
-                        query=query,
-                        key_cache=key,
-                        value_cache=value,
-                        block_table=block_table,
-                        actual_seq_qlen=seq_lens_buffer,
-                        actual_seq_kvlen=seq_qlens_buffer,
-                        num_q_heads=self.num_heads,
-                        num_kv_heads=self.num_kv_heads,
-                        softmax_scale=self.scale,
-                        block_size=block_size,
-                        sinks=None,
-                        # num_reqs=num_reqs,
-                        # out=[attn_output, softmax_lse],
-                        atten_mask=attn_metadata.attn_mask,
-                        use_mxfp4_p=envs_ascend.VLLM_ASCEND_PAGED_ATTN_USE_MXFP4_P,
-                    )
+                        # NOTE: ``update_graph_params`` is a staticmethod, so use
+                        # the locals unpacked from the captured ``attn_params``
+                        # tuple (num_heads / num_kv_heads / scale / attn_mask /
+                        # block_tables / key_cache), NOT ``self.*``. The seq-len
+                        # buffers were already refilled above (kv -> seq_lens_buffer,
+                        # q -> seq_qlens_buffer); pass them to the matching
+                        # actual_seq_* args. Write the result back into the
+                        # captured ``attn_output`` buffer in-place via ``out=``.
+                        fia_triton_decode_out(
+                            query=query,
+                            key_cache=key_cache,
+                            value_cache=value,
+                            block_table=block_tables,
+                            actual_seq_qlen=seq_qlens_buffer,
+                            actual_seq_kvlen=seq_lens_buffer,
+                            num_q_heads=num_heads,
+                            num_kv_heads=num_kv_heads,
+                            softmax_scale=scale,
+                            block_size=block_size,
+                            atten_mask=attn_mask,
+                            use_mxfp4_p=envs_ascend.VLLM_ASCEND_PAGED_ATTN_USE_MXFP4_P,
+                            output=attn_output.view_as(query),
+                        )
                     else:
                         torch_npu.npu_fused_infer_attention_score.out(
                             query=query,
@@ -781,7 +786,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             output = output.unsqueeze(2)
             attn_mask = None
             sparse_mode = 0
-        if workspace is None:
+        if workspace is None and envs_ascend.VLLM_ASCEND_USE_PAGED_ATTENTION is False:
             workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
                 query=query,
                 key=key,
@@ -845,24 +850,28 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         torch.npu.graph_task_group_begin(stream)
         if envs_ascend.VLLM_ASCEND_USE_PAGED_ATTENTION:
-            # 这里实现有问题，需要 agent 修改
-            attn_output = fia_triton(
-            query=query,
-            key_cache=key,
-            value_cache=value,
-            block_table=block_table,
-            actual_seq_qlen=self._seq_lens_buffer,
-            actual_seq_kvlen=self._seq_qlens_buffer,
-            num_q_heads=self.num_heads,
-            num_kv_heads=self.num_kv_heads,
-            softmax_scale=self.scale,
-            block_size=block_size,
-            sinks=None,
-            # num_reqs=num_reqs,
-            # out=[output, softmax_lse],
-            atten_mask=attn_metadata.attn_mask,
-            use_mxfp4_p=envs_ascend.VLLM_ASCEND_PAGED_ATTN_USE_MXFP4_P,
-        )
+            # Graph capture path: only the fixed-address buffers are passed
+            # here. Their *content* is refreshed each replay step by
+            # ``update_graph_params`` (copy_ + fill_), and ``fia_triton`` is
+            # re-invoked there under ``graph_task_update_begin/end`` -- so the
+            # host-side grid is recomputed from the live buffer contents at
+            # replay time, not baked in at capture. The zero-initialized
+            # buffers here only yield an empty placeholder launch.
+            fia_triton_decode_out(
+                query=query,
+                key_cache=key,
+                value_cache=value,
+                block_table=block_table,
+                actual_seq_qlen=self._seq_qlens_buffer,
+                actual_seq_kvlen=self._seq_lens_buffer,
+                num_q_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                softmax_scale=self.scale,
+                block_size=block_size,
+                atten_mask=attn_mask,
+                use_mxfp4_p=envs_ascend.VLLM_ASCEND_PAGED_ATTN_USE_MXFP4_P,
+                output=output.view(num_tokens, self.num_heads, self.head_size),
+            )
         else:
             torch_npu.npu_fused_infer_attention_score.out(
                 query=query,

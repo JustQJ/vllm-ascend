@@ -28,8 +28,6 @@ import torch
 import triton
 import triton.language as tl
 
-from vllm.utils.torch_utils import direct_register_custom_op
-
 DEVICE = "npu"
 
 
@@ -268,16 +266,22 @@ def _paged_attn_fwd(
         HAS_ATTEN_MASK: tl.constexpr,
         IS_CONTIGUOUS_KV: tl.constexpr,
         USE_MXFP4_P: tl.constexpr,
+        IS_DECODE_ONLY: tl.constexpr,
 ):
     q_block_idx = tl.program_id(0)
     q_head_idx = tl.program_id(1)
     kv_head_idx = q_head_idx // num_kv_groups
 
-    seq = tl.load(q_block_seq_ptr + q_block_idx).to(tl.int64)
-    q_block_local = tl.load(q_block_local_ptr + q_block_idx).to(tl.int64)
-
-    q_start = tl.load(cu_q_lens_ptr + seq)
-    q_end = tl.load(cu_q_lens_ptr + seq + 1)
+    if IS_DECODE_ONLY:
+        seq = q_block_idx.to(tl.int64)
+        q_block_local = 0
+        q_start = seq
+        q_end = seq + 1
+    else:
+        seq = tl.load(q_block_seq_ptr + q_block_idx).to(tl.int64)
+        q_block_local = tl.load(q_block_local_ptr + q_block_idx).to(tl.int64)
+        q_start = tl.load(cu_q_lens_ptr + seq).to(tl.int64)
+        q_end = tl.load(cu_q_lens_ptr + seq + 1).to(tl.int64)
     q_len = q_end - q_start
     kv_len = tl.load(kv_lens_ptr + seq).to(tl.int64)
     if IS_CONTIGUOUS_KV:
@@ -533,6 +537,7 @@ class _paged_attention(torch.autograd.Function):
             HAS_ATTEN_MASK=atten_mask is not None,
             IS_CONTIGUOUS_KV=is_contiguous_kv,
             USE_MXFP4_P=use_mxfp4_p,
+            IS_DECODE_ONLY=False,
             num_warps=(4 if head_dim == 64 else 8),
         )
         return out
@@ -573,73 +578,99 @@ def paged_attention(
     )
 
 
-# ── direct_register_custom_op for graph mode ──────────────────────────
+def paged_attention_decode_out(
+    query,
+    key_cache,
+    value_cache,
+    block_table,
+    actual_seq_qlen,
+    actual_seq_kvlen,
+    output,
+    num_q_heads,
+    num_kv_heads,
+    softmax_scale,
+    block_size,
+    block_m=16,
+    block_n=64,
+    atten_mask=None,
+    use_mxfp4_p=False,
+):
+    """Launch single-token paged decode into a caller-owned output tensor."""
+    head_dim = query.shape[-1]
+    assert query.dim() == 3
+    assert query.shape == output.shape
+    assert query.shape[1] == num_q_heads
+    assert num_q_heads % num_kv_heads == 0
+    assert block_table is not None and block_table.dtype == torch.int32
+    assert actual_seq_kvlen.dtype in (torch.int32, torch.int64)
+    assert actual_seq_kvlen.shape[0] >= query.shape[0]
+    assert block_table.shape[0] >= query.shape[0]
+    if atten_mask is not None:
+        assert atten_mask.dim() == 2
 
-
-def _paged_attention_custom_op_impl(
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    block_table: torch.Tensor | None,
-    actual_seq_qlen: torch.Tensor,
-    actual_seq_kvlen: torch.Tensor,
-    num_q_heads: int,
-    num_kv_heads: int,
-    softmax_scale: float,
-    block_size: int,
-    block_m: int = 16,
-    block_n: int = 64,
-    sinks: torch.Tensor | None = None,
-    atten_mask: torch.Tensor | None = None,
-    use_mxfp4_p: bool = False,
-) -> torch.Tensor:
-    """Graph-mode aware implementation: delegates to the existing
-    autograd.Function-based paged_attention."""
-    return _paged_attention.apply(
-        query,
-        key_cache,
-        value_cache,
-        block_table,
-        actual_seq_qlen,
-        actual_seq_kvlen,
-        num_q_heads,
-        num_kv_heads,
-        softmax_scale,
-        block_size,
-        block_m,
-        block_n,
-        sinks,
-        atten_mask,
-        use_mxfp4_p,
+    key_cache = _normalize_kv_cache(key_cache, block_size, num_kv_heads, head_dim)
+    value_cache = _normalize_kv_cache(value_cache, block_size, num_kv_heads, head_dim)
+    grid = (query.shape[0], num_q_heads)
+    num_programs = grid[0] * grid[1]
+    assert num_programs <= 65535, (
+        f"Ascend coreDim overflow: {num_programs} > 65535, "
+        f"batch_size={query.shape[0]}, num_q_heads={num_q_heads}"
     )
 
+    mask_rows = 0
+    mask_cols = 0
+    stride_mask_q = 0
+    stride_mask_k = 0
+    atten_mask_ptr = query
+    if atten_mask is not None:
+        atten_mask_ptr = atten_mask
+        mask_rows = atten_mask.shape[0]
+        mask_cols = atten_mask.shape[1]
+        stride_mask_q = atten_mask.stride(0)
+        stride_mask_k = atten_mask.stride(1)
 
-def _paged_attention_fake_impl(
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    block_table: torch.Tensor | None,
-    actual_seq_qlen: torch.Tensor,
-    actual_seq_kvlen: torch.Tensor,
-    num_q_heads: int,
-    num_kv_heads: int,
-    softmax_scale: float,
-    block_size: int,
-    block_m: int = 16,
-    block_n: int = 64,
-    sinks: torch.Tensor | None = None,
-    atten_mask: torch.Tensor | None = None,
-    use_mxfp4_p: bool = False,
-) -> torch.Tensor:
-    """Fake implementation for Dynamo/AOT tracing: returns an empty tensor
-    with the correct shape/dtype/device, no actual computation."""
-    return torch.empty_like(query)
-
-
-direct_register_custom_op(
-    op_name="triton_paged_attention",
-    op_func=_paged_attention_custom_op_impl,
-    fake_impl=_paged_attention_fake_impl,
-    mutates_args=[],
-    dispatch_key="PrivateUse1",
-)
+    _paged_attn_fwd[grid](
+        Q=query,
+        K_cache=key_cache,
+        V_cache=value_cache,
+        Out=output,
+        block_table_ptr=block_table,
+        atten_mask_ptr=atten_mask_ptr,
+        cu_q_lens_ptr=query,
+        cu_k_lens_ptr=query,
+        q_block_seq_ptr=query,
+        q_block_local_ptr=query,
+        kv_lens_ptr=actual_seq_kvlen,
+        sink_ptr=query,
+        stride_q_tok=query.stride(0),
+        stride_q_head=query.stride(1),
+        stride_q_dim=query.stride(2),
+        stride_k_blk=key_cache.stride(0),
+        stride_k_slot=key_cache.stride(1),
+        stride_k_flat=key_cache.stride(2),
+        stride_v_blk=value_cache.stride(0),
+        stride_v_slot=value_cache.stride(1),
+        stride_v_flat=value_cache.stride(2),
+        stride_o_tok=output.stride(0),
+        stride_o_head=output.stride(1),
+        stride_o_dim=output.stride(2),
+        stride_mask_q=stride_mask_q,
+        stride_mask_k=stride_mask_k,
+        block_table_stride=block_table.stride(0),
+        BLOCK_SIZE=block_size,
+        HEAD_DIM=head_dim,
+        num_q_heads=num_q_heads,
+        num_kv_groups=num_q_heads // num_kv_heads,
+        qk_scale=softmax_scale,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        mask_rows=mask_rows,
+        mask_cols=mask_cols,
+        HAS_SINKS=False,
+        HAS_ATTEN_MASK=atten_mask is not None,
+        IS_CONTIGUOUS_KV=False,
+        USE_MXFP4_P=use_mxfp4_p,
+        IS_DECODE_ONLY=True,
+        num_warps=(4 if head_dim == 64 else 8),
+    )
+    return output
