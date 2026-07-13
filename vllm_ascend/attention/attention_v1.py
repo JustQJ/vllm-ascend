@@ -21,7 +21,7 @@ from enum import Enum
 import torch
 import torch_npu
 import vllm.envs as envs_vllm
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (  # type: ignore
@@ -65,8 +65,9 @@ from vllm_ascend.compilation.acl_graph import (
 )
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
-from vllm_ascend.utils import weak_ref_tensors
 from vllm_ascend.ops.triton.paged_attn import paged_attention
+from vllm_ascend.ops.triton.paged_attn.paged_attention_npu import paged_attention_decode_out
+from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type, weak_ref_tensors
 from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
 
 # default max value of sliding window size
@@ -183,6 +184,8 @@ class AscendMetadata:
     seq_lens: torch.Tensor = None
     seq_lens_cpu: torch.Tensor = None
     seq_lens_list: list[int] = None  # type: ignore
+    # Device-resident sequence lengths used by Triton FULL decode graphs.
+    seq_lens_device: torch.Tensor = None
     actual_seq_lengths_q: list[int] = None  # type: ignore
 
     query_start_loc: torch.Tensor = None
@@ -296,6 +299,9 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             seq_lens = common_attn_metadata.seq_lens_cpu[:num_reqs]
         else:
             seq_lens = common_attn_metadata.seq_lens[:num_reqs].to("cpu")
+        seq_lens_device = (
+            common_attn_metadata.seq_lens[:num_reqs] if common_attn_metadata.seq_lens is not None else None
+        )
 
         slot_mapping = common_attn_metadata.slot_mapping[:num_actual_tokens]
         # this slot_mapping override doesn't work since vllm will override it again. We should fix it vllm.
@@ -341,6 +347,8 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             padding_len = num_reqs_fia - len(seq_lens_list)
             seq_lens_list = seq_lens_list + [1] * padding_len
             seq_lens = torch.cat([seq_lens, seq_lens.new_ones(padding_len)])
+            if seq_lens_device is not None:
+                seq_lens_device = torch.cat([seq_lens_device, seq_lens_device.new_zeros(padding_len)])
         if block_table is not None and block_table.shape[0] < num_reqs_fia:
             block_table = torch.cat(
                 [
@@ -358,6 +366,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens,
             seq_lens_list=seq_lens_list,
+            seq_lens_device=seq_lens_device,
             max_query_len=common_attn_metadata.max_query_len,
             actual_seq_lengths_q=actual_seq_lengths_q,
             slot_mapping=slot_mapping,
@@ -439,9 +448,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self.sinks = sinks
         self.layerIndex = 0
         self.enable_hamming_sparse = is_enable_hamming_sparse()
-        # Some mixed-attention models cannot rely on the iteration order of
-        # attn_metadata during graph replay. Record the captured layer name only
-        # for that path.
+        # Graph replay resolves current attention metadata by the exact layer
+        # name captured for this implementation instance.
         self._layer_name: str | None = None
 
     def _graph_metadata_layer_name(self, layer: AttentionLayer | None = None) -> str | None:
@@ -449,6 +457,28 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # KV-sharing layers replay with the target layer's metadata instead of
         # their own module name, matching vLLM's shared KV-cache ownership.
         return self.kv_sharing_target_layer_name or layer_name
+
+    def _supports_triton_full_decode(
+        self,
+        attn_metadata: AscendMetadata,
+        block_table: torch.Tensor | None,
+    ) -> bool:
+        return (
+            envs_ascend.VLLM_ASCEND_USE_PAGED_ATTENTION
+            and get_ascend_device_type() == AscendDeviceType.A5
+            and self.vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+            and attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+            and attn_metadata.causal
+            and block_table is not None
+            and block_table.dtype == torch.int32
+            and attn_metadata.seq_lens_device is not None
+            and attn_metadata.seq_lens_device.dtype in (torch.int32, torch.int64)
+            and self.vllm_config.speculative_config is None
+            and self.sliding_window is None
+            and self.sinks is None
+            and not self.enable_hamming_sparse
+            and not self.enable_c8_quant
+        )
 
     @staticmethod
     def update_graph_params(
@@ -461,6 +491,46 @@ class AscendAttentionBackendImpl(AttentionImpl):
         draft_attn_metadatas=None,
     ):
         use_layer_aware_replay = needs_layer_aware_fia_graph_replay()
+        graph_params = get_graph_params()
+        triton_params = graph_params.triton_paged_attn_params.get(num_tokens, []) if graph_params is not None else []
+        if triton_params:
+            with torch.npu.stream(update_stream):
+                for param, handle, event in zip(
+                    triton_params,
+                    graph_params.triton_paged_attn_handles[num_tokens],
+                    graph_params.triton_paged_attn_events[num_tokens],
+                ):
+                    (
+                        query,
+                        key_cache,
+                        value_cache,
+                        num_q_heads,
+                        num_kv_heads,
+                        softmax_scale,
+                        block_size,
+                        output,
+                        atten_mask,
+                        use_mxfp4_p,
+                        layer_name,
+                    ) = param
+                    metadata = forward_context.attn_metadata[layer_name]
+                    torch.npu.graph_task_update_begin(update_stream, handle)
+                    paged_attention_decode_out(
+                        query=query,
+                        key_cache=key_cache,
+                        value_cache=value_cache,
+                        block_table=metadata.block_tables,
+                        kv_lens=metadata.seq_lens_device,
+                        output=output,
+                        num_q_heads=num_q_heads,
+                        num_kv_heads=num_kv_heads,
+                        softmax_scale=softmax_scale,
+                        block_size=block_size,
+                        atten_mask=atten_mask,
+                        use_mxfp4_p=use_mxfp4_p,
+                    )
+                    torch.npu.graph_task_update_end(update_stream)
+                    event.record(update_stream)
         if using_paged_attention(num_tokens, vllm_config):
             # Paged Attention update logic
             if _EXTRA_CTX.is_draft_model:
@@ -1106,6 +1176,67 @@ class AscendAttentionBackendImpl(AttentionImpl):
         graph_params.handles[num_tokens].append(handle)
         return output, num_tokens
 
+    def full_graph_triton_paged_attention(
+        self,
+        query: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.key_cache is None or self.value_cache is None:
+            raise RuntimeError("PagedAttention KV cache is not initialized for FULL decode capture")
+        layer_name = self._graph_metadata_layer_name()
+        if layer_name is None:
+            raise RuntimeError("Attention layer name is required for Triton PagedAttention graph replay")
+
+        num_tokens = query.shape[0]
+        num_blocks, block_size, _, _ = self.key_cache.shape
+        key_cache = self.key_cache.view(num_blocks, block_size, -1)
+        value_cache = self.value_cache.view(num_blocks, block_size, -1)
+        block_table = attn_metadata.block_tables
+        if block_table.dtype != torch.int32:
+            raise TypeError(f"Triton PagedAttention block table must be int32, got {block_table.dtype}")
+
+        graph_params = get_graph_params()
+        stream = torch_npu.npu.current_stream()
+        event = torch.npu.ExternalEvent()
+        event.wait(stream)
+        event.reset(stream)
+        graph_params.triton_paged_attn_events[num_tokens].append(event)
+        graph_params.triton_paged_attn_params[num_tokens].append(
+            (
+                weak_ref_tensors(query),
+                weak_ref_tensors(key_cache),
+                weak_ref_tensors(value_cache),
+                self.num_heads,
+                self.num_kv_heads,
+                self.scale,
+                block_size,
+                weak_ref_tensors(output),
+                weak_ref_tensors(attn_metadata.attn_mask) if attn_metadata.attn_mask is not None else None,
+                envs_ascend.VLLM_ASCEND_PAGED_ATTN_USE_MXFP4_P,
+                layer_name,
+            )
+        )
+
+        torch.npu.graph_task_group_begin(stream)
+        paged_attention_decode_out(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_table=block_table,
+            kv_lens=attn_metadata.seq_lens_device,
+            output=output,
+            num_q_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            softmax_scale=self.scale,
+            block_size=block_size,
+            atten_mask=attn_metadata.attn_mask,
+            use_mxfp4_p=envs_ascend.VLLM_ASCEND_PAGED_ATTN_USE_MXFP4_P,
+        )
+        handle = torch.npu.graph_task_group_end(stream)
+        graph_params.triton_paged_attn_handles[num_tokens].append(handle)
+        return output
+
     def full_graph_pa(
         self,
         query: torch.Tensor,
@@ -1242,6 +1373,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # runner v2, there is not capturing attribute in forward_context,
         # just use getattr to avoid attribute error.
         if _EXTRA_CTX.capturing:
+            if self._supports_triton_full_decode(attn_metadata, attn_metadata.block_tables):
+                return self.full_graph_triton_paged_attention(query, attn_metadata, output)
             if self.sinks is not None:
                 attn_output, num_tokens = self.full_graph_fia_v2(query, key, value, attn_metadata, output)
                 output[:num_tokens] = attn_output[:num_tokens]
@@ -1537,10 +1670,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
             shape = [num_tokens, num_heads * head_size]
         """
         assert output is not None, "Output tensor must be provided."
+        if _EXTRA_CTX.capturing or self._use_layer_aware_fia_graph_replay:
+            self._layer_name = layer.layer_name
         if self.enable_hamming_sparse:
             self.layerIndex = int(layer.layer_name.split(".")[2])
-        if self._use_layer_aware_fia_graph_replay:
-            self._layer_name = layer.layer_name
 
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError("fused output quantization is not yet supported for AscendAttentionBackendImpl")

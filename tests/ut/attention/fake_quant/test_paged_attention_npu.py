@@ -4,7 +4,8 @@ import torch
 torch_npu = pytest.importorskip("torch_npu")
 pytest.importorskip("triton")
 
-from vllm_ascend.ops.triton.paged_attn.paged_attention_npu import paged_attention
+from vllm_ascend.ops.triton.paged_attn.paged_attention_npu import paged_attention, paged_attention_decode_out
+from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 
 NUM_Q_HEADS = 64
@@ -254,6 +255,64 @@ def check_nan_inf(tensor, name):
     if inf_cnt > 0:
         print("Inf")
     return nan_cnt, inf_cnt
+
+
+@pytest.mark.parametrize("batch_size", [1, 8, 32])
+@pytest.mark.parametrize("use_mxfp4_p", [False, True])
+def test_paged_attention_decode_out_matches_generic(batch_size, use_mxfp4_p):
+    if (
+        not hasattr(torch, "npu")
+        or not torch.npu.is_available()
+        or get_ascend_device_type() != AscendDeviceType.A5
+    ):
+        pytest.skip("A5 NPU is required for Triton PagedAttention decode comparison")
+
+    torch.manual_seed(0)
+    torch_npu.npu.manual_seed(0)
+    q_lens = [1] * batch_size
+    kv_lens = _varied_lengths(DECODE_KV_TARGET, batch_size)
+    query, key_cache, value_cache, block_table, actual_seq_qlen, actual_seq_kvlen, _ = _build_paged_inputs(
+        q_lens,
+        kv_lens,
+        BLOCK_SIZE,
+        NUM_Q_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        DTYPE,
+        "npu",
+    )
+    expected = paged_attention(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        actual_seq_qlen,
+        actual_seq_kvlen,
+        NUM_Q_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM**-0.5,
+        BLOCK_SIZE,
+        use_mxfp4_p=use_mxfp4_p,
+    )
+    output = torch.empty_like(query)
+
+    result = paged_attention_decode_out(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=block_table,
+        kv_lens=actual_seq_kvlen.to(torch.int32),
+        output=output,
+        num_q_heads=NUM_Q_HEADS,
+        num_kv_heads=NUM_KV_HEADS,
+        softmax_scale=HEAD_DIM**-0.5,
+        block_size=BLOCK_SIZE,
+        use_mxfp4_p=use_mxfp4_p,
+    )
+
+    assert result.data_ptr() == output.data_ptr()
+    torch.testing.assert_close(result, expected, rtol=2e-2, atol=2e-2)
+
 
 @pytest.mark.parametrize(
     "scenario,batch_size,q_lens,kv_lens,block_m,block_n",

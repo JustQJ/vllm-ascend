@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+from vllm.config import CUDAGraphMode
 
 import vllm_ascend.attention.attention_v1 as attn_module
 from tests.ut.base import TestBase
@@ -168,6 +169,66 @@ class TestAscendAttentionMetadataBuilder(TestBase):
 
         self.builder.build(1, common_attn_metadata, mock_model)
 
+    @patch("vllm_ascend.attention.attention_v1.AscendMetadata")
+    def test_build_preserves_device_seq_lens_for_triton_decode(self, mock_ascend_metadata):
+        seq_lens_device = torch.tensor([8, 16], dtype=torch.int32)
+        common_attn_metadata = AscendCommonAttentionMetadata(
+            query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+            query_start_loc_cpu=torch.tensor([0, 1, 2], dtype=torch.int32),
+            seq_lens=seq_lens_device,
+            _seq_lens_cpu=torch.tensor([8, 16], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([8, 16], dtype=torch.int32),
+            num_computed_tokens_cpu=None,
+            num_reqs=2,
+            num_actual_tokens=2,
+            max_query_len=1,
+            max_seq_len=16,
+            block_table_tensor=torch.zeros((2, 1), dtype=torch.int32),
+            slot_mapping=torch.arange(2, dtype=torch.int32),
+            causal=True,
+            actual_seq_lengths_q=[1, 2],
+            positions=torch.arange(2),
+            attn_state=AscendAttentionState.DecodeOnly,
+        )
+
+        self.builder.build(0, common_attn_metadata)
+
+        metadata_kwargs = mock_ascend_metadata.call_args.kwargs
+        self.assertTrue(torch.equal(metadata_kwargs["seq_lens_device"], seq_lens_device))
+        self.assertEqual(metadata_kwargs["seq_lens_device"].dtype, torch.int32)
+
+    @patch("vllm_ascend.attention.attention_v1.AscendMetadata")
+    def test_build_zero_pads_device_seq_lens_for_graph_gear(self, mock_ascend_metadata):
+        common_attn_metadata = AscendCommonAttentionMetadata(
+            query_start_loc=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+            query_start_loc_cpu=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+            seq_lens=torch.tensor([8, 16], dtype=torch.int32),
+            _seq_lens_cpu=torch.tensor([8, 16], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([8, 16], dtype=torch.int32),
+            num_computed_tokens_cpu=None,
+            num_reqs=3,
+            num_actual_tokens=3,
+            max_query_len=1,
+            max_seq_len=16,
+            block_table_tensor=torch.zeros((2, 1), dtype=torch.int32),
+            slot_mapping=torch.arange(3, dtype=torch.int32),
+            causal=True,
+            actual_seq_lengths_q=[1, 2, 3],
+            positions=torch.arange(3),
+            attn_state=AscendAttentionState.DecodeOnly,
+        )
+
+        self.builder.build(0, common_attn_metadata)
+
+        metadata_kwargs = mock_ascend_metadata.call_args.kwargs
+        self.assertTrue(
+            torch.equal(
+                metadata_kwargs["seq_lens_device"],
+                torch.tensor([8, 16, 0], dtype=torch.int32),
+            )
+        )
+        self.assertEqual(metadata_kwargs["block_tables"].shape[0], 3)
+
 
 class TestAscendAttentionBackendImpl(TestBase):
     def setUp(self):
@@ -287,6 +348,203 @@ class TestAscendAttentionBackendImpl(TestBase):
             attn_type=self.attention_type.DECODER,
             kv_sharing_target_layer_name=None,
         )
+
+    @patch("vllm_ascend.attention.attention_v1.get_ascend_device_type", return_value=AscendDeviceType.A5)
+    def test_supports_triton_full_decode_only_for_phase_one_scope(self, mock_device_type):
+        metadata = MagicMock()
+        metadata.attn_state = AscendAttentionState.DecodeOnly
+        metadata.causal = True
+        metadata.block_tables = torch.zeros((2, 1), dtype=torch.int32)
+        metadata.seq_lens_device = torch.ones(2, dtype=torch.int32)
+        self.mock_vllm_config.speculative_config = None
+        self.mock_vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+        self.impl.enable_hamming_sparse = False
+        self.impl.enable_c8_quant = False
+
+        with patch.object(attn_module.envs_ascend, "VLLM_ASCEND_USE_PAGED_ATTENTION", False):
+            self.assertFalse(self.impl._supports_triton_full_decode(metadata, metadata.block_tables))
+
+        with patch.object(attn_module.envs_ascend, "VLLM_ASCEND_USE_PAGED_ATTENTION", True):
+            self.assertTrue(self.impl._supports_triton_full_decode(metadata, metadata.block_tables))
+
+            mock_device_type.return_value = AscendDeviceType.A3
+            self.assertFalse(self.impl._supports_triton_full_decode(metadata, metadata.block_tables))
+            mock_device_type.return_value = AscendDeviceType.A5
+
+            self.mock_vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+            self.assertFalse(self.impl._supports_triton_full_decode(metadata, metadata.block_tables))
+            self.mock_vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+
+            unsupported_cases = (
+                ("attn_state", AscendAttentionState.ChunkedPrefill),
+                ("causal", False),
+            )
+            for field, value in unsupported_cases:
+                original = getattr(metadata, field)
+                with self.subTest(field=field):
+                    setattr(metadata, field, value)
+                    self.assertFalse(self.impl._supports_triton_full_decode(metadata, metadata.block_tables))
+                setattr(metadata, field, original)
+
+            self.assertFalse(self.impl._supports_triton_full_decode(metadata, None))
+
+            int64_block_table = metadata.block_tables.to(torch.int64)
+            self.assertFalse(self.impl._supports_triton_full_decode(metadata, int64_block_table))
+
+            metadata.seq_lens_device = None
+            self.assertFalse(self.impl._supports_triton_full_decode(metadata, metadata.block_tables))
+            metadata.seq_lens_device = torch.ones(2, dtype=torch.float32)
+            self.assertFalse(self.impl._supports_triton_full_decode(metadata, metadata.block_tables))
+            metadata.seq_lens_device = torch.ones(2, dtype=torch.int32)
+
+            self.mock_vllm_config.speculative_config = MagicMock()
+            self.assertFalse(self.impl._supports_triton_full_decode(metadata, metadata.block_tables))
+            self.mock_vllm_config.speculative_config = None
+
+            self.impl.sliding_window = 1024
+            self.assertFalse(self.impl._supports_triton_full_decode(metadata, metadata.block_tables))
+            self.impl.sliding_window = None
+
+            self.impl.sinks = torch.ones(1)
+            self.assertFalse(self.impl._supports_triton_full_decode(metadata, metadata.block_tables))
+            self.impl.sinks = None
+
+            self.impl.enable_hamming_sparse = True
+            self.assertFalse(self.impl._supports_triton_full_decode(metadata, metadata.block_tables))
+            self.impl.enable_hamming_sparse = False
+
+            self.impl.enable_c8_quant = True
+            self.assertFalse(self.impl._supports_triton_full_decode(metadata, metadata.block_tables))
+
+    @patch("torch.npu.ExternalEvent")
+    @patch("vllm_ascend.attention.attention_v1.paged_attention_decode_out")
+    @patch("vllm_ascend.attention.attention_v1.get_graph_params")
+    @patch("torch.npu.graph_task_group_end", return_value="handle")
+    @patch("torch.npu.graph_task_group_begin")
+    def test_full_graph_triton_decode_writes_caller_output(
+        self,
+        mock_group_begin,
+        mock_group_end,
+        mock_get_graph_params,
+        mock_decode_out,
+        mock_external_event,
+    ):
+        query = torch.empty((4, 8, 64))
+        output = torch.empty_like(query)
+        metadata = MagicMock()
+        metadata.attn_state = AscendAttentionState.DecodeOnly
+        metadata.seq_lens_device = torch.tensor([8, 9, 0, 0], dtype=torch.int32)
+        metadata.block_tables = torch.zeros((4, 1), dtype=torch.int32)
+        metadata.attn_mask = None
+        graph_params = MagicMock()
+        graph_params.triton_paged_attn_params = {4: []}
+        graph_params.triton_paged_attn_handles = {4: []}
+        graph_params.triton_paged_attn_events = {4: []}
+        mock_get_graph_params.return_value = graph_params
+        mock_decode_out.side_effect = lambda *args, **kwargs: kwargs["output"]
+        mock_external_event.return_value = self.mock_event
+        self.impl._layer_name = "model.layers.0.self_attn.attn"
+        self.impl.key_cache = torch.empty((2, 128, 8, 64))
+        self.impl.value_cache = torch.empty_like(self.impl.key_cache)
+
+        result = self.impl.full_graph_triton_paged_attention(query, metadata, output)
+
+        self.assertEqual(result.data_ptr(), output.data_ptr())
+        self.assertEqual(graph_params.triton_paged_attn_handles[4], ["handle"])
+        self.assertEqual(
+            graph_params.triton_paged_attn_params[4][0][-1],
+            "model.layers.0.self_attn.attn",
+        )
+        self.assertIs(mock_decode_out.call_args.kwargs["output"], output)
+        mock_group_begin.assert_called_once()
+        mock_group_end.assert_called_once()
+
+    @patch("vllm_ascend.attention.attention_v1.paged_attention_decode_out")
+    @patch("vllm_ascend.attention.attention_v1.get_graph_params")
+    @patch("torch.npu.graph_task_update_begin")
+    @patch("torch.npu.graph_task_update_end")
+    @patch("torch.npu.stream")
+    @patch("vllm_ascend.attention.attention_v1.needs_layer_aware_fia_graph_replay", return_value=False)
+    @patch("vllm_ascend.attention.attention_v1.using_paged_attention", return_value=False)
+    def test_update_triton_decode_uses_current_layer_metadata(
+        self,
+        mock_using_paged_attention,
+        mock_needs_layer_aware_replay,
+        mock_stream,
+        mock_update_end,
+        mock_update_begin,
+        mock_get_graph_params,
+        mock_decode_out,
+    ):
+        del mock_using_paged_attention, mock_needs_layer_aware_replay, mock_stream
+        current_kv_lens = torch.tensor([33, 65], dtype=torch.int32)
+        current_block_table = torch.tensor([[4], [9]], dtype=torch.int32)
+        layer_name = "model.layers.0.self_attn.attn"
+        current_metadata = MagicMock()
+        current_metadata.seq_lens_device = current_kv_lens
+        current_metadata.block_tables = current_block_table
+        current_metadata.attn_mask = None
+        query = torch.empty((2, 8, 64))
+        key_cache = torch.empty((2, 128, 512))
+        value_cache = torch.empty_like(key_cache)
+        output = torch.empty_like(query)
+        event = MagicMock()
+        graph_params = MagicMock()
+        graph_params.triton_paged_attn_params = {
+            2: [(query, key_cache, value_cache, 8, 8, 1.0, 128, output, None, False, layer_name)]
+        }
+        graph_params.triton_paged_attn_handles = {2: ["handle"]}
+        graph_params.triton_paged_attn_events = {2: [event]}
+        graph_params.attn_params = {2: []}
+        graph_params.handles = {2: []}
+        graph_params.events = {2: []}
+        mock_get_graph_params.return_value = graph_params
+        forward_context = MagicMock()
+        forward_context.attn_metadata = {layer_name: current_metadata}
+        attn_module._EXTRA_CTX.sinks = False
+        attn_module._EXTRA_CTX.is_draft_model = False
+
+        self.impl.update_graph_params(
+            self.mock_stream,
+            forward_context,
+            2,
+            self.mock_vllm_config,
+        )
+
+        kwargs = mock_decode_out.call_args.kwargs
+        self.assertIs(kwargs["kv_lens"], current_kv_lens)
+        self.assertIs(kwargs["block_table"], current_block_table)
+        self.assertIs(kwargs["output"], output)
+        mock_update_begin.assert_called_once_with(self.mock_stream, "handle")
+        mock_update_end.assert_called_once_with(self.mock_stream)
+        event.record.assert_called_once_with(self.mock_stream)
+
+    def test_capturing_supported_decode_routes_to_triton_full_graph(self):
+        query = torch.empty((2, 8, 64))
+        output = torch.empty_like(query)
+        metadata = MagicMock()
+        metadata.block_tables = torch.zeros((2, 1), dtype=torch.int32)
+
+        with (
+            patch.object(attn_module._EXTRA_CTX, "capturing", True),
+            patch.object(self.impl, "_supports_triton_full_decode", return_value=True),
+            patch.object(
+                self.impl,
+                "full_graph_triton_paged_attention",
+                return_value=output,
+            ) as mock_full_graph,
+        ):
+            result = self.impl.forward_fused_infer_attention(
+                query=query,
+                key=None,
+                value=None,
+                attn_metadata=metadata,
+                output=output,
+                kv_cache=None,
+            )
+
+        self.assertIs(result, output)
+        mock_full_graph.assert_called_once_with(query, metadata, output)
 
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     def test_large_head_prefill_uses_device_operator_fallback(self, mock_get_forward_context):
@@ -754,6 +1012,9 @@ class TestAscendAttentionBackendImpl(TestBase):
         mock_get_graph_params.return_value.attn_params = {1: [tuple(param)] * 3}
         mock_get_graph_params.return_value.handles = {1: [MagicMock()] * 3}
         mock_get_graph_params.return_value.events = {1: [MagicMock()] * 3}
+        mock_get_graph_params.return_value.triton_paged_attn_params = {1: []}
+        mock_get_graph_params.return_value.triton_paged_attn_handles = {1: []}
+        mock_get_graph_params.return_value.triton_paged_attn_events = {1: []}
 
         attn_metadata_keys = [
             "model.layers.10.self_attn.attn",

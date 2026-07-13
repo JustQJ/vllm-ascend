@@ -19,12 +19,14 @@
 import gc
 import os
 import random
+from unittest.mock import patch
 
 import pytest
 import torch
 from vllm import SamplingParams
 
 from tests.e2e.conftest import ModelName, VllmRunner, model_cache
+from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 DEFAULT_MODEL = ModelName.QWEN3_06B
 
@@ -434,6 +436,58 @@ def test_aclgraph_simple_generation(monkeypatch: pytest.MonkeyPatch, vllm_runner
 
     print(f"Full completion: '{output_text}'")
     print(f"{'=' * 80}\n")
+
+
+def test_triton_paged_attention_full_decode_replay(monkeypatch: pytest.MonkeyPatch):
+    if get_ascend_device_type() != AscendDeviceType.A5:
+        pytest.skip("Triton PagedAttention FULL decode graph validation requires A5")
+
+    monkeypatch.setenv("VLLM_ASCEND_USE_PAGED_ATTENTION", "1")
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    from vllm_ascend.attention import attention_v1 as attention_module
+
+    original_decode_out = attention_module.paged_attention_decode_out
+    kernel_calls = {"capture": 0, "replay_update": 0}
+
+    def tracked_decode_out(*args, **kwargs):
+        phase = "capture" if attention_module._EXTRA_CTX.capturing else "replay_update"
+        kernel_calls[phase] += 1
+        return original_decode_out(*args, **kwargs)
+
+    prompts = [
+        "The capital of France is",
+        "The largest planet is",
+        "One plus one equals",
+    ]
+    sampling_params = SamplingParams(temperature=0.0, max_tokens=4)
+    common_config = {
+        "model_name": DEFAULT_MODEL,
+        "max_model_len": 2048,
+        "dtype": "bfloat16",
+        "gpu_memory_utilization": 0.9,
+        "enable_prefix_caching": False,
+        "max_num_seqs": 8,
+        "tensor_parallel_size": 1,
+        "distributed_executor_backend": "uni",
+    }
+
+    with patch.object(attention_module, "paged_attention_decode_out", tracked_decode_out):
+        with VllmRunner(enforce_eager=True, **common_config) as eager_runner:
+            expected = eager_runner.generate(prompts, sampling_params)
+
+        with VllmRunner(
+            enforce_eager=False,
+            compilation_config={
+                "cudagraph_mode": "FULL_DECODE_ONLY",
+                "cudagraph_capture_sizes": [1, 4, 8],
+            },
+            **common_config,
+        ) as graph_runner:
+            actual = graph_runner.generate(prompts, sampling_params)
+
+    assert [item[0] for item in actual] == [item[0] for item in expected]
+    assert kernel_calls["capture"] > 0
+    assert kernel_calls["replay_update"] > 0
 
 
 def test_aclgraph_logprobs_without_batch_invariance_should_fail(monkeypatch: pytest.MonkeyPatch):
