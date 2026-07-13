@@ -28,6 +28,8 @@ import torch
 import triton
 import triton.language as tl
 
+from vllm.utils.torch_utils import direct_register_custom_op
+
 DEVICE = "npu"
 
 
@@ -569,3 +571,75 @@ def paged_attention(
         atten_mask,
         use_mxfp4_p
     )
+
+
+# ── direct_register_custom_op for graph mode ──────────────────────────
+
+
+def _paged_attention_custom_op_impl(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor | None,
+    actual_seq_qlen: torch.Tensor,
+    actual_seq_kvlen: torch.Tensor,
+    num_q_heads: int,
+    num_kv_heads: int,
+    softmax_scale: float,
+    block_size: int,
+    block_m: int = 16,
+    block_n: int = 64,
+    sinks: torch.Tensor | None = None,
+    atten_mask: torch.Tensor | None = None,
+    use_mxfp4_p: bool = False,
+) -> torch.Tensor:
+    """Graph-mode aware implementation: delegates to the existing
+    autograd.Function-based paged_attention."""
+    return _paged_attention.apply(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        actual_seq_qlen,
+        actual_seq_kvlen,
+        num_q_heads,
+        num_kv_heads,
+        softmax_scale,
+        block_size,
+        block_m,
+        block_n,
+        sinks,
+        atten_mask,
+        use_mxfp4_p,
+    )
+
+
+def _paged_attention_fake_impl(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor | None,
+    actual_seq_qlen: torch.Tensor,
+    actual_seq_kvlen: torch.Tensor,
+    num_q_heads: int,
+    num_kv_heads: int,
+    softmax_scale: float,
+    block_size: int,
+    block_m: int = 16,
+    block_n: int = 64,
+    sinks: torch.Tensor | None = None,
+    atten_mask: torch.Tensor | None = None,
+    use_mxfp4_p: bool = False,
+) -> torch.Tensor:
+    """Fake implementation for Dynamo/AOT tracing: returns an empty tensor
+    with the correct shape/dtype/device, no actual computation."""
+    return torch.empty_like(query)
+
+
+direct_register_custom_op(
+    op_name="triton_paged_attention",
+    op_func=_paged_attention_custom_op_impl,
+    fake_impl=_paged_attention_fake_impl,
+    mutates_args=[],
+    dispatch_key="PrivateUse1",
+)
