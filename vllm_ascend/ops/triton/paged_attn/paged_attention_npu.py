@@ -30,6 +30,7 @@ import triton.language as tl
 
 from .decode_utils import (
     DECODE_SPLIT_KV_NUM_PROGRAMS,
+    DECODE_SPLIT_KV_REDUCE_NUM_PROGRAMS,
     select_decode_heads_per_program,
 )
 
@@ -637,14 +638,16 @@ def _paged_attn_decode_split_kv_reduce(
     stride_o_head,
     stride_o_dim: tl.constexpr,
     NUM_Q_HEADS: tl.constexpr,
+    NUM_SEQS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
-    BLOCK_M: tl.constexpr,
 ):
-    """Reduce only sequences assigned to more than one Split-KV range."""
-    seq_idx = tl.program_id(0).to(tl.int64)
+    """Reduce one sequence/head pair per Vector program."""
+    work_idx = tl.program_id(0).to(tl.int64)
+    if work_idx >= NUM_SEQS * NUM_Q_HEADS:
+        return
 
-    offs_m = tl.arange(0, BLOCK_M)
-    head_valid = offs_m < NUM_Q_HEADS
+    seq_idx = work_idx // NUM_Q_HEADS
+    head_idx = work_idx % NUM_Q_HEADS
     offs_d = tl.arange(0, HEAD_DIM)
 
     descriptor_offset = seq_idx * 2
@@ -652,56 +655,41 @@ def _paged_attn_decode_split_kv_reduce(
     num_splits = tl.load(SeqDesc + descriptor_offset + 1).to(tl.int64)
     num_reduce_splits = tl.where(num_splits > 1, num_splits, 0)
 
-    global_lse_max = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    global_lse_max = tl.full((), float("-inf"), dtype=tl.float32)
     for split_idx in range(num_reduce_splits):
-        partial_row = (work_start + split_idx) * NUM_Q_HEADS + offs_m
-        partial_lse = tl.load(
-            PartialLse + partial_row,
-            mask=head_valid,
-            other=float("-inf"),
-        )
+        partial_row = (work_start + split_idx) * NUM_Q_HEADS + head_idx
+        partial_lse = tl.load(PartialLse + partial_row)
         global_lse_max = tl.maximum(global_lse_max, partial_lse)
 
-    denominator = tl.zeros([BLOCK_M], dtype=tl.float32)
-    output_acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    denominator = tl.full((), 0.0, dtype=tl.float32)
+    output_acc = tl.zeros([HEAD_DIM], dtype=tl.float32)
     for split_idx in range(num_reduce_splits):
-        partial_row = (work_start + split_idx) * NUM_Q_HEADS + offs_m
-        partial_lse = tl.load(
-            PartialLse + partial_row,
-            mask=head_valid,
-            other=float("-inf"),
-        )
-        split_valid = head_valid & (partial_lse != float("-inf"))
+        partial_row = (work_start + split_idx) * NUM_Q_HEADS + head_idx
+        partial_lse = tl.load(PartialLse + partial_row)
+        split_valid = partial_lse != float("-inf")
         safe_delta = tl.where(split_valid, partial_lse - global_lse_max, 0.0)
         weight = tl.where(split_valid, tl.exp(safe_delta), 0.0)
         partial_output = tl.load(
-            PartialOut + partial_row[:, None] * HEAD_DIM + offs_d[None, :],
-            mask=head_valid[:, None],
-            other=0.0,
+            PartialOut + partial_row * HEAD_DIM + offs_d,
         )
         denominator += weight
-        output_acc += weight[:, None] * partial_output
+        output_acc += weight * partial_output
 
     needs_reduction = num_splits > 1
     empty_row = denominator == 0.0
     safe_denominator = tl.where(empty_row, 1.0, denominator)
-    output_value = tl.where(
-        empty_row[:, None],
-        0.0,
-        output_acc / safe_denominator[:, None],
-    )
-    o_offsets = seq_idx * stride_o_tok + offs_m[:, None] * stride_o_head + offs_d[None, :] * stride_o_dim
+    output_value = tl.where(empty_row, 0.0, output_acc / safe_denominator)
+    o_offsets = seq_idx * stride_o_tok + head_idx * stride_o_head + offs_d * stride_o_dim
     tl.store(
         Out + o_offsets,
         output_value.to(Out.type.element_ty),
-        mask=needs_reduction & head_valid[:, None],
+        mask=needs_reduction,
     )
 
-    padding_mask = (num_splits == 0) & head_valid
     tl.store(
         Out + o_offsets,
-        tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32).to(Out.type.element_ty),
-        mask=padding_mask[:, None],
+        tl.zeros([HEAD_DIM], dtype=tl.float32).to(Out.type.element_ty),
+        mask=num_splits == 0,
     )
 
 
@@ -958,8 +946,8 @@ def paged_attention_decode_out(
 ):
     """Launch specialized single-token decode into caller-owned output.
 
-    The fixed Split-KV path consumes CPU-built block-range descriptors and
-    launches exactly 32 partial programs.
+    The fixed Split-KV path consumes CPU-built block-range descriptors,
+    launches 32 partial programs, and reduces them with 64 Vector programs.
     """
     assert query.shape == output.shape
     assert output.dtype == query.dtype
@@ -1102,7 +1090,7 @@ def paged_attention_decode_out(
         num_warps=8,
     )
 
-    reduce_grid = (query.shape[0],)
+    reduce_grid = (DECODE_SPLIT_KV_REDUCE_NUM_PROGRAMS,)
     _paged_attn_decode_split_kv_reduce[reduce_grid](
         PartialOut=partial_output,
         PartialLse=partial_lse,
@@ -1112,8 +1100,8 @@ def paged_attention_decode_out(
         stride_o_head=output.stride(1),
         stride_o_dim=output.stride(2),
         NUM_Q_HEADS=num_q_heads,
+        NUM_SEQS=query.shape[0],
         HEAD_DIM=DECODE_HEAD_DIM,
-        BLOCK_M=DECODE_BLOCK_M,
         num_warps=8,
     )
     return output

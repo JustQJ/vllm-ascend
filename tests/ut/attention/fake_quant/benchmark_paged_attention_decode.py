@@ -15,6 +15,7 @@ import torch_npu
 from vllm_ascend.ops.triton.paged_attn import paged_attention, paged_attention_decode_out
 from vllm_ascend.ops.triton.paged_attn.decode_utils import (
     DECODE_SPLIT_KV_NUM_PROGRAMS,
+    DECODE_SPLIT_KV_REDUCE_NUM_PROGRAMS,
     build_split_kv_descriptors,
     select_decode_heads_per_program,
 )
@@ -36,6 +37,7 @@ CSV_COLUMNS = [
     "num_head_groups",
     "grid_size",
     "split_kv_num_programs",
+    "split_kv_reduce_num_programs",
     "split_kv_chunk_size",
     "use_mxfp4_p",
     "backend",
@@ -357,6 +359,9 @@ def benchmark_case(
                     else batch_size * num_head_groups
                 ),
                 "split_kv_num_programs": split_kv_num_programs,
+                "split_kv_reduce_num_programs": (
+                    DECODE_SPLIT_KV_REDUCE_NUM_PROGRAMS if split_kv_num_programs > 1 else 0
+                ),
                 "split_kv_chunk_size": split_kv_chunk_size,
                 "use_mxfp4_p": use_mxfp4_p,
                 "backend": backend,
@@ -398,6 +403,8 @@ def run_and_print_case(
         f"kv_lens={list(kv_lens)}, "
         f"heads_per_program={rows[0]['heads_per_program']}, "
         f"split_kv_num_programs={split_kv_num_programs}, "
+        "split_kv_reduce_num_programs="
+        f"{rows[0]['split_kv_reduce_num_programs']}, "
         f"split_kv_chunk_size={rows[0]['split_kv_chunk_size']}:"
     )
     for row in rows:
