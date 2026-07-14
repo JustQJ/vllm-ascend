@@ -59,6 +59,16 @@ def parse_args():
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--samples", type=int, default=20)
     parser.add_argument("--repeats", type=int, default=20)
+    parser.add_argument(
+        "--heads-per-program",
+        type=int,
+        nargs="+",
+        choices=[1, 2, 4, 8, 16],
+        help=(
+            "Override the decode Q-head grouping. Multiple values run an HPP "
+            "sweep; omit this option to use the automatic policy."
+        ),
+    )
     parser.add_argument("--use-mxfp4-p", action="store_true")
     return parser.parse_args()
 
@@ -103,7 +113,13 @@ def build_inputs(batch_size, num_q_heads, kv_len):
     }
 
 
-def make_backend_functions(inputs, num_q_heads, kv_len, use_mxfp4_p):
+def make_backend_functions(
+    inputs,
+    num_q_heads,
+    kv_len,
+    use_mxfp4_p,
+    heads_per_program_override,
+):
     query = inputs["query"]
     key_cache = inputs["key_cache"]
     value_cache = inputs["value_cache"]
@@ -128,6 +144,7 @@ def make_backend_functions(inputs, num_q_heads, kv_len, use_mxfp4_p):
             num_q_heads=num_q_heads,
             num_kv_heads=NUM_KV_HEADS,
             use_mxfp4_p=use_mxfp4_p,
+            heads_per_program_override=heads_per_program_override,
         )
 
     def generic():
@@ -213,13 +230,22 @@ def benchmark_case(
     warmup,
     samples,
     repeats,
+    heads_per_program_override,
 ):
     inputs = build_inputs(batch_size, num_q_heads, kv_len)
-    backends = make_backend_functions(inputs, num_q_heads, kv_len, use_mxfp4_p)
+    backends = make_backend_functions(
+        inputs,
+        num_q_heads,
+        kv_len,
+        use_mxfp4_p,
+        heads_per_program_override,
+    )
     check_correctness(backends, use_mxfp4_p)
     latencies = {name: measure_latency_us(function, warmup, samples, repeats) for name, function in backends.items()}
 
-    heads_per_program = select_decode_heads_per_program(batch_size, num_q_heads, 32)
+    heads_per_program = heads_per_program_override
+    if heads_per_program is None:
+        heads_per_program = select_decode_heads_per_program(batch_size, num_q_heads, 32)
     num_head_groups = num_q_heads // heads_per_program
     generic_median = latencies["generic"]["median"]
     fia_median = latencies["fia"]["median"]
@@ -257,17 +283,31 @@ def main():
         raise ValueError("--batch-sizes must be positive")
     if any(length <= 0 for length in args.kv_lens):
         raise ValueError("--kv-lens must be positive")
+    if args.heads_per_program is not None:
+        invalid_pairs = [
+            (num_q_heads, heads_per_program)
+            for num_q_heads in args.q_heads
+            for heads_per_program in args.heads_per_program
+            if num_q_heads % heads_per_program != 0
+        ]
+        if invalid_pairs:
+            raise ValueError(
+                "--heads-per-program must divide --q-heads; invalid pairs: "
+                f"{invalid_pairs}"
+            )
 
     torch.manual_seed(0)
     torch_npu.npu.manual_seed_all(0)
+    heads_per_program_values = args.heads_per_program or [None]
     for num_q_heads in args.q_heads:
         for batch_size in args.batch_sizes:
             for kv_len in args.kv_lens:
                 if kv_len >= 32768 and batch_size >= 8:
                     print(f"Skipping case: num_q_heads={num_q_heads}, batch_size={batch_size}, kv_len={kv_len} (too large for memory)")
                     continue
-                
-                res = benchmark_case(
+
+                for heads_per_program in heads_per_program_values:
+                    res = benchmark_case(
                         num_q_heads=num_q_heads,
                         batch_size=batch_size,
                         kv_len=kv_len,
@@ -275,12 +315,18 @@ def main():
                         warmup=args.warmup,
                         samples=args.samples,
                         repeats=args.repeats,
+                        heads_per_program_override=heads_per_program,
                     )
-                print(f"Benchmark result for num_q_heads={num_q_heads}, batch_size={batch_size}, kv_len={kv_len}:")
-                for row in res:
-                    print(row)
-
-    
+                    effective_hpp = res[0]["heads_per_program"]
+                    print(
+                        "Benchmark result for "
+                        f"num_q_heads={num_q_heads}, "
+                        f"batch_size={batch_size}, "
+                        f"kv_len={kv_len}, "
+                        f"heads_per_program={effective_hpp}:"
+                    )
+                    for row in res:
+                        print(row)
 
 
 if __name__ == "__main__":

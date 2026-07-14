@@ -729,22 +729,28 @@ def paged_attention_decode_out(
     block_n=64,
     atten_mask=None,
     use_mxfp4_p=False,
+    heads_per_program_override=None,
 ):
     """Launch specialized single-token decode into caller-owned output."""
     assert query.shape == output.shape
     assert output.dtype == query.dtype
-    assert num_q_heads in (8, 16)  
-    assert num_kv_heads  == 1
-    
+    assert num_q_heads in (8, 16)
+    assert num_kv_heads == 1
+
     key_cache = _normalize_kv_cache(key_cache, DECODE_BLOCK_SIZE, 1, DECODE_HEAD_DIM)
     value_cache = _normalize_kv_cache(value_cache, DECODE_BLOCK_SIZE, 1, DECODE_HEAD_DIM)
 
+    if heads_per_program_override is None:
+        heads_per_program = select_decode_heads_per_program(
+            batch_size=query.shape[0],
+            num_q_heads=num_q_heads,
+            num_aicore=NUM_AI_CORES,
+        )
+    else:
+        heads_per_program = heads_per_program_override
+        assert heads_per_program in (1, 2, 4, 8, 16)
+        assert num_q_heads % heads_per_program == 0
 
-    heads_per_program = select_decode_heads_per_program(
-        batch_size=query.shape[0],
-        num_q_heads=num_q_heads,
-        num_aicore=NUM_AI_CORES,
-    )
     num_head_groups = num_q_heads // heads_per_program
     grid = (query.shape[0], num_head_groups)
     num_programs = grid[0] * grid[1]
