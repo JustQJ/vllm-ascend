@@ -22,6 +22,8 @@ NUM_KV_HEADS = 1
 BLOCK_SIZE = 128
 BLOCK_M = 16
 BLOCK_N = 64
+SPLIT_KV_NUM_PROGRAMS = 32
+SPLIT_KV_TOKENS_PER_PROGRAM = 4096
 SOFTMAX_SCALE = HEAD_DIM**-0.5
 SWA_INT_MAX = 2147483647
 CSV_COLUMNS = [
@@ -31,6 +33,7 @@ CSV_COLUMNS = [
     "heads_per_program",
     "num_head_groups",
     "grid_size",
+    "split_kv_num_programs",
     "use_mxfp4_p",
     "backend",
     "latency_us_min",
@@ -69,8 +72,56 @@ def parse_args():
             "sweep; omit this option to use the automatic policy."
         ),
     )
+    parser.add_argument(
+        "--split-kv-programs",
+        type=int,
+        nargs="+",
+        choices=[1, SPLIT_KV_NUM_PROGRAMS],
+        default=[1],
+        help=(
+            "Use 1 for the direct kernel or 32 for the fixed Split-KV "
+            "program pool."
+        ),
+    )
     parser.add_argument("--use-mxfp4-p", action="store_true")
     return parser.parse_args()
+
+
+def build_split_kv_descriptors(kv_lens, device):
+    """Build fixed Split-KV work descriptors on CPU, then copy to device."""
+    work_desc_cpu = torch.full(
+        (SPLIT_KV_NUM_PROGRAMS, 2),
+        -1,
+        dtype=torch.int32,
+    )
+    seq_desc_cpu = torch.zeros((len(kv_lens), 2), dtype=torch.int32)
+
+    work_start = 0
+    for seq_idx, kv_len in enumerate(kv_lens):
+        work_count = (
+            int(kv_len) + SPLIT_KV_TOKENS_PER_PROGRAM - 1
+        ) // SPLIT_KV_TOKENS_PER_PROGRAM
+        work_end = work_start + work_count
+        if work_end > SPLIT_KV_NUM_PROGRAMS:
+            raise ValueError(
+                "Split-KV requires more than 32 programs: "
+                f"required={work_end}, kv_lens={kv_lens}"
+            )
+
+        seq_desc_cpu[seq_idx, 0] = work_start
+        seq_desc_cpu[seq_idx, 1] = work_count
+        if work_count > 0:
+            work_desc_cpu[work_start:work_end, 0] = seq_idx
+            work_desc_cpu[work_start:work_end, 1] = torch.arange(
+                work_count,
+                dtype=torch.int32,
+            )
+        work_start = work_end
+
+    return (
+        work_desc_cpu.to(device=device).contiguous(),
+        seq_desc_cpu.to(device=device).contiguous(),
+    )
 
 
 def build_inputs(batch_size, num_q_heads, kv_len):
@@ -119,6 +170,7 @@ def make_backend_functions(
     kv_len,
     use_mxfp4_p,
     heads_per_program_override,
+    split_kv_num_programs,
 ):
     query = inputs["query"]
     key_cache = inputs["key_cache"]
@@ -129,6 +181,27 @@ def make_backend_functions(
     causal_mask = inputs["causal_mask"]
     output = inputs["output"]
     batch_size = query.shape[0]
+    split_kv_workspace = None
+    split_kv_descriptors = None
+    if split_kv_num_programs > 1:
+        partial_output = torch.empty(
+            SPLIT_KV_NUM_PROGRAMS,
+            num_q_heads,
+            HEAD_DIM,
+            dtype=torch.float32,
+            device=query.device,
+        )
+        partial_lse = torch.empty(
+            SPLIT_KV_NUM_PROGRAMS,
+            num_q_heads,
+            dtype=torch.float32,
+            device=query.device,
+        )
+        split_kv_workspace = (partial_output, partial_lse)
+        split_kv_descriptors = build_split_kv_descriptors(
+            [kv_len] * batch_size,
+            query.device,
+        )
 
     def specialized():
         return paged_attention_decode_out(
@@ -145,6 +218,9 @@ def make_backend_functions(
             num_kv_heads=NUM_KV_HEADS,
             use_mxfp4_p=use_mxfp4_p,
             heads_per_program_override=heads_per_program_override,
+            split_kv_num_programs=split_kv_num_programs,
+            split_kv_workspace=split_kv_workspace,
+            split_kv_descriptors=split_kv_descriptors,
         )
 
     def generic():
@@ -231,21 +307,35 @@ def benchmark_case(
     samples,
     repeats,
     heads_per_program_override,
+    split_kv_num_programs,
 ):
     inputs = build_inputs(batch_size, num_q_heads, kv_len)
+    heads_per_program = heads_per_program_override
+    if heads_per_program is None:
+        heads_per_program = select_decode_heads_per_program(batch_size, num_q_heads, 32)
+    if split_kv_num_programs > 1:
+        required_programs = batch_size * (
+            (kv_len + SPLIT_KV_TOKENS_PER_PROGRAM - 1)
+            // SPLIT_KV_TOKENS_PER_PROGRAM
+        )
+        if required_programs > SPLIT_KV_NUM_PROGRAMS:
+            raise ValueError(
+                "Split-KV requires more than 32 programs: "
+                f"required={required_programs}, batch_size={batch_size}, "
+                f"kv_len={kv_len}"
+            )
+        heads_per_program = num_q_heads
     backends = make_backend_functions(
         inputs,
         num_q_heads,
         kv_len,
         use_mxfp4_p,
         heads_per_program_override,
+        split_kv_num_programs,
     )
     check_correctness(backends, use_mxfp4_p)
     latencies = {name: measure_latency_us(function, warmup, samples, repeats) for name, function in backends.items()}
 
-    heads_per_program = heads_per_program_override
-    if heads_per_program is None:
-        heads_per_program = select_decode_heads_per_program(batch_size, num_q_heads, 32)
     num_head_groups = num_q_heads // heads_per_program
     generic_median = latencies["generic"]["median"]
     fia_median = latencies["fia"]["median"]
@@ -258,7 +348,12 @@ def benchmark_case(
                 "kv_len": kv_len,
                 "heads_per_program": heads_per_program,
                 "num_head_groups": num_head_groups,
-                "grid_size": batch_size * num_head_groups,
+                "grid_size": (
+                    SPLIT_KV_NUM_PROGRAMS
+                    if split_kv_num_programs > 1
+                    else batch_size * num_head_groups
+                ),
+                "split_kv_num_programs": split_kv_num_programs,
                 "use_mxfp4_p": use_mxfp4_p,
                 "backend": backend,
                 "latency_us_min": f"{timing['min']:.3f}",
@@ -307,26 +402,29 @@ def main():
                     continue
 
                 for heads_per_program in heads_per_program_values:
-                    res = benchmark_case(
-                        num_q_heads=num_q_heads,
-                        batch_size=batch_size,
-                        kv_len=kv_len,
-                        use_mxfp4_p=args.use_mxfp4_p,
-                        warmup=args.warmup,
-                        samples=args.samples,
-                        repeats=args.repeats,
-                        heads_per_program_override=heads_per_program,
-                    )
-                    effective_hpp = res[0]["heads_per_program"]
-                    print(
-                        "Benchmark result for "
-                        f"num_q_heads={num_q_heads}, "
-                        f"batch_size={batch_size}, "
-                        f"kv_len={kv_len}, "
-                        f"heads_per_program={effective_hpp}:"
-                    )
-                    for row in res:
-                        print(row)
+                    for split_kv_num_programs in args.split_kv_programs:
+                        res = benchmark_case(
+                            num_q_heads=num_q_heads,
+                            batch_size=batch_size,
+                            kv_len=kv_len,
+                            use_mxfp4_p=args.use_mxfp4_p,
+                            warmup=args.warmup,
+                            samples=args.samples,
+                            repeats=args.repeats,
+                            heads_per_program_override=heads_per_program,
+                            split_kv_num_programs=split_kv_num_programs,
+                        )
+                        effective_hpp = res[0]["heads_per_program"]
+                        print(
+                            "Benchmark result for "
+                            f"num_q_heads={num_q_heads}, "
+                            f"batch_size={batch_size}, "
+                            f"kv_len={kv_len}, "
+                            f"heads_per_program={effective_hpp}, "
+                            f"split_kv_num_programs={split_kv_num_programs}:"
+                        )
+                        for row in res:
+                            print(row)
 
 
 if __name__ == "__main__":
