@@ -65,9 +65,13 @@ from vllm_ascend.compilation.acl_graph import (
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.memcache_comm_fence import record_attention_compute_start
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
-from vllm_ascend.utils import weak_ref_tensors
 from vllm_ascend.ops.triton.paged_attn import paged_attention as fia_triton
 from vllm_ascend.ops.triton.paged_attn import paged_attention_decode_out as fia_triton_decode_out
+from vllm_ascend.ops.triton.paged_attn.decode_utils import (
+    DECODE_SPLIT_KV_NUM_PROGRAMS,
+    build_split_kv_descriptors,
+)
+from vllm_ascend.utils import weak_ref_tensors
 from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
 
 # default max value of sliding window size
@@ -407,6 +411,41 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self._seq_qlens_buffer = torch.zeros(
             self.vllm_config.scheduler_config.max_num_seqs, dtype=torch.int64, device="npu"
         )
+        self._split_kv_work_desc_buffer = None
+        self._split_kv_seq_desc_buffer = None
+        self._split_kv_partial_output_buffer = None
+        self._split_kv_partial_lse_buffer = None
+        if (
+            envs_ascend.VLLM_ASCEND_USE_PAGED_ATTENTION
+            and self.num_heads in (8, 16)
+            and self.num_kv_heads == 1
+            and self.head_size == 128
+            and self.sliding_window is None
+            and self.sinks is None
+            and not self.enable_c8_quant
+            and not self.enable_hamming_sparse
+        ):
+            self._split_kv_work_desc_buffer = torch.full(
+                (DECODE_SPLIT_KV_NUM_PROGRAMS, 3),
+                -1,
+                dtype=torch.int32,
+                device="npu",
+            )
+            self._split_kv_seq_desc_buffer = torch.zeros(
+                (self.vllm_config.scheduler_config.max_num_seqs, 2),
+                dtype=torch.int32,
+                device="npu",
+            )
+            self._split_kv_partial_output_buffer = torch.empty(
+                (DECODE_SPLIT_KV_NUM_PROGRAMS, self.num_heads, self.head_size),
+                dtype=torch.float32,
+                device="npu",
+            )
+            self._split_kv_partial_lse_buffer = torch.empty(
+                (DECODE_SPLIT_KV_NUM_PROGRAMS, self.num_heads),
+                dtype=torch.float32,
+                device="npu",
+            )
 
     @staticmethod
     def update_graph_params(
@@ -594,6 +633,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
             if _EXTRA_CTX.is_draft_model:
                 attn_keys = attn_keys * (len(graph_params.attn_params[num_tokens]) // num_layers)
             attn_count = 0
+            split_kv_descriptor_cache: dict[
+                tuple[int, ...], tuple[torch.Tensor, torch.Tensor]
+            ] = {}
             with torch.npu.stream(update_stream):
                 for key, param, handle, event in zip(
                     attn_keys,
@@ -623,7 +665,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         c8_v_aq_scale,
                         c8_v_aq_offset,
                         seq_lens_buffer,
-                        seq_qlens_buffer
+                        seq_qlens_buffer,
+                        split_kv_partial_output,
+                        split_kv_partial_lse,
+                        split_kv_work_desc,
+                        split_kv_seq_desc,
                     ) = param
 
                     if _EXTRA_CTX.is_draft_model:
@@ -658,6 +704,39 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     if seq_qlens_buffer is not None and latest_cpu_seq_qlens is not None:
                         num_reqs = latest_cpu_seq_qlens.numel()
                         seq_qlens_buffer[:num_reqs].copy_(latest_cpu_seq_qlens, non_blocking=True)
+
+                    split_kv_workspace = None
+                    split_kv_descriptors = None
+                    split_kv_num_programs = 1
+                    if split_kv_work_desc is not None and latest_cpu_seq_lens is not None:
+                        kv_lens_key = tuple(int(kv_len) for kv_len in latest_cpu_seq_lens.tolist())
+                        if len(kv_lens_key) != split_kv_seq_desc.shape[0]:
+                            raise ValueError(
+                                "Split-KV requires one kv_len per graph token: "
+                                f"kv_lens={len(kv_lens_key)}, "
+                                f"graph_tokens={split_kv_seq_desc.shape[0]}"
+                            )
+                        if kv_lens_key not in split_kv_descriptor_cache:
+                            work_desc, seq_desc, _ = build_split_kv_descriptors(
+                                list(kv_lens_key),
+                                block_size=block_size,
+                            )
+                            split_kv_descriptor_cache[kv_lens_key] = (
+                                torch.tensor(work_desc, dtype=torch.int32),
+                                torch.tensor(seq_desc, dtype=torch.int32),
+                            )
+                        work_desc_cpu, seq_desc_cpu = split_kv_descriptor_cache[kv_lens_key]
+                        split_kv_work_desc.copy_(work_desc_cpu, non_blocking=True)
+                        split_kv_seq_desc.copy_(seq_desc_cpu, non_blocking=True)
+                        split_kv_workspace = (
+                            split_kv_partial_output,
+                            split_kv_partial_lse,
+                        )
+                        split_kv_descriptors = (
+                            split_kv_work_desc,
+                            split_kv_seq_desc,
+                        )
+                        split_kv_num_programs = DECODE_SPLIT_KV_NUM_PROGRAMS
 
                     torch.npu.graph_task_update_begin(update_stream, handle)
                     input_layout = "TND"
@@ -695,6 +774,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
                             atten_mask=attn_mask,
                             use_mxfp4_p=envs_ascend.VLLM_ASCEND_PAGED_ATTN_USE_MXFP4_P,
                             output=attn_output.view_as(query),
+                            split_kv_num_programs=split_kv_num_programs,
+                            split_kv_workspace=split_kv_workspace,
+                            split_kv_descriptors=split_kv_descriptors,
                         )
                     else:
                         torch_npu.npu_fused_infer_attention_score.out(
@@ -846,17 +928,55 @@ class AscendAttentionBackendImpl(AttentionImpl):
             )  # type: ignore
         else:
             attn_params = attn_params + (None, None, None, None, self._seq_lens_buffer, self._seq_qlens_buffer)  # type: ignore
+
+        use_split_kv = (
+            envs_ascend.VLLM_ASCEND_USE_PAGED_ATTENTION
+            and num_tokens in (1, 2, 4)
+            and self.num_heads in (8, 16)
+            and self.num_kv_heads == 1
+            and self.head_size == 128
+            and block_size == 128
+            and self.sliding_window is None
+            and self.sinks is None
+            and not self.enable_c8_quant
+            and not self.enable_hamming_sparse
+            and not _EXTRA_CTX.is_draft_model
+            and self._split_kv_work_desc_buffer is not None
+        )
+        if use_split_kv:
+            assert self._split_kv_seq_desc_buffer is not None
+            assert self._split_kv_partial_output_buffer is not None
+            assert self._split_kv_partial_lse_buffer is not None
+            attn_params = attn_params + (
+                self._split_kv_partial_output_buffer,
+                self._split_kv_partial_lse_buffer,
+                self._split_kv_work_desc_buffer,
+                self._split_kv_seq_desc_buffer[:num_tokens],
+            )
+        else:
+            attn_params = attn_params + (None, None, None, None)
         graph_params.attn_params[num_tokens].append(attn_params)
 
         torch.npu.graph_task_group_begin(stream)
         if envs_ascend.VLLM_ASCEND_USE_PAGED_ATTENTION:
-            # Graph capture path: only the fixed-address buffers are passed
-            # here. Their *content* is refreshed each replay step by
-            # ``update_graph_params`` (copy_ + fill_), and ``fia_triton`` is
-            # re-invoked there under ``graph_task_update_begin/end`` -- so the
-            # host-side grid is recomputed from the live buffer contents at
-            # replay time, not baked in at capture. The zero-initialized
-            # buffers here only yield an empty placeholder launch.
+            # Split-KV captures a fixed two-kernel topology and fixed-address
+            # buffers. ``update_graph_params`` only refreshes descriptor
+            # contents before replay. The initial descriptors describe padding,
+            # so capture does not read a real KV range.
+            split_kv_workspace = None
+            split_kv_descriptors = None
+            split_kv_num_programs = 1
+            if use_split_kv:
+                split_kv_workspace = (
+                    self._split_kv_partial_output_buffer,
+                    self._split_kv_partial_lse_buffer,
+                )
+                split_kv_descriptors = (
+                    self._split_kv_work_desc_buffer,
+                    self._split_kv_seq_desc_buffer[:num_tokens],
+                )
+                split_kv_num_programs = DECODE_SPLIT_KV_NUM_PROGRAMS
+
             fia_triton_decode_out(
                 query=query,
                 key_cache=key,
@@ -871,6 +991,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 atten_mask=attn_mask,
                 use_mxfp4_p=envs_ascend.VLLM_ASCEND_PAGED_ATTN_USE_MXFP4_P,
                 output=output.view(num_tokens, self.num_heads, self.head_size),
+                split_kv_num_programs=split_kv_num_programs,
+                split_kv_workspace=split_kv_workspace,
+                split_kv_descriptors=split_kv_descriptors,
             )
         else:
             torch_npu.npu_fused_infer_attention_score.out(

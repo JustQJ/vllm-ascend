@@ -28,7 +28,10 @@ import torch
 import triton
 import triton.language as tl
 
-from .decode_utils import select_decode_heads_per_program
+from .decode_utils import (
+    DECODE_SPLIT_KV_NUM_PROGRAMS,
+    select_decode_heads_per_program,
+)
 
 DEVICE = "npu"
 
@@ -36,8 +39,6 @@ DECODE_BLOCK_SIZE = 128
 DECODE_BLOCK_M = 16
 DECODE_BLOCK_N = 64
 DECODE_HEAD_DIM = 128
-DECODE_SPLIT_KV_NUM_PROGRAMS = 32
-DECODE_SPLIT_KV_TOKENS_PER_PROGRAM = 4096
 
 NUM_AI_CORES = 32
 
@@ -512,21 +513,22 @@ def _paged_attn_decode_split_kv_fwd(
     block_table_stride: tl.int64,
     qk_scale,
     NUM_Q_HEADS: tl.constexpr,
-    KV_BLOCKS_PER_PROGRAM: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     USE_MXFP4_P: tl.constexpr,
 ):
-    """Assign a fixed program pool to 4096-token sequence chunks."""
+    """Compute CPU-assigned logical-block ranges with a fixed program pool."""
     work_idx = tl.program_id(0).to(tl.int64)
-    descriptor_offset = work_idx * 2
+    descriptor_offset = work_idx * 3
     descriptor_seq_idx = tl.load(WorkDesc + descriptor_offset).to(tl.int64)
-    descriptor_split_idx = tl.load(WorkDesc + descriptor_offset + 1).to(tl.int64)
+    descriptor_block_start = tl.load(WorkDesc + descriptor_offset + 1).to(tl.int64)
+    descriptor_block_end = tl.load(WorkDesc + descriptor_offset + 2).to(tl.int64)
     work_valid = descriptor_seq_idx >= 0
     seq_idx = tl.where(work_valid, descriptor_seq_idx, 0)
-    seq_split_idx = tl.where(work_valid, descriptor_split_idx, 0)
+    split_block_start = tl.where(work_valid, descriptor_block_start, 0)
+    split_block_end = tl.where(work_valid, descriptor_block_end, 0)
     seq_num_splits = tl.load(
         SeqDesc + seq_idx * 2 + 1,
         mask=work_valid,
@@ -545,12 +547,6 @@ def _paged_attn_decode_split_kv_fwd(
 
     kv_len = tl.load(kv_lens_ptr + seq_idx).to(tl.int64)
     kv_len = tl.where(work_valid, kv_len, 0)
-    num_logical_blocks = (kv_len + BLOCK_SIZE - 1) // BLOCK_SIZE
-    split_block_start = seq_split_idx * KV_BLOCKS_PER_PROGRAM
-    split_block_end = tl.minimum(
-        split_block_start + KV_BLOCKS_PER_PROGRAM,
-        num_logical_blocks,
-    )
     num_split_blocks = split_block_end - split_block_start
     seq_block_table = block_table_ptr + seq_idx * block_table_stride
 
@@ -640,7 +636,7 @@ def _paged_attn_decode_split_kv_reduce(
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
-    """Reduce only sequences that occupy more than one 4096-token chunk."""
+    """Reduce only sequences assigned to more than one Split-KV range."""
     seq_idx = tl.program_id(0).to(tl.int64)
 
     offs_m = tl.arange(0, BLOCK_M)
@@ -958,8 +954,8 @@ def paged_attention_decode_out(
 ):
     """Launch specialized single-token decode into caller-owned output.
 
-    The fixed Split-KV path requires the sum of ``ceil(kv_len / 4096)``
-    across the graph gear to be no greater than 32.
+    The fixed Split-KV path consumes CPU-built block-range descriptors and
+    launches exactly 32 partial programs.
     """
     assert query.shape == output.shape
     assert output.dtype == query.dtype
@@ -1057,7 +1053,7 @@ def paged_attention_decode_out(
 
     assert split_kv_descriptors is not None
     work_desc, seq_desc = split_kv_descriptors
-    assert work_desc.shape == (DECODE_SPLIT_KV_NUM_PROGRAMS, 2)
+    assert work_desc.shape == (DECODE_SPLIT_KV_NUM_PROGRAMS, 3)
     assert seq_desc.shape == (query.shape[0], 2)
     assert work_desc.dtype == torch.int32
     assert seq_desc.dtype == torch.int32
@@ -1066,9 +1062,6 @@ def paged_attention_decode_out(
     assert work_desc.is_contiguous()
     assert seq_desc.is_contiguous()
 
-    kv_blocks_per_program = (
-        DECODE_SPLIT_KV_TOKENS_PER_PROGRAM // DECODE_BLOCK_SIZE
-    )
     split_grid = (DECODE_SPLIT_KV_NUM_PROGRAMS,)
     _paged_attn_decode_split_kv_fwd[split_grid](
         Q=query,
@@ -1096,7 +1089,6 @@ def paged_attention_decode_out(
         block_table_stride=block_table.stride(0),
         qk_scale=softmax_scale,
         NUM_Q_HEADS=num_q_heads,
-        KV_BLOCKS_PER_PROGRAM=kv_blocks_per_program,
         HEAD_DIM=DECODE_HEAD_DIM,
         BLOCK_SIZE=DECODE_BLOCK_SIZE,
         BLOCK_M=DECODE_BLOCK_M,
