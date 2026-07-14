@@ -43,7 +43,7 @@ CSV_COLUMNS = [
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--q-heads", type=int, nargs="+", default=[8, 16])
+    parser.add_argument("--q-heads", type=int, nargs="+", default=[16])
     parser.add_argument(
         "--batch-sizes",
         type=int,
@@ -60,7 +60,6 @@ def parse_args():
     parser.add_argument("--samples", type=int, default=20)
     parser.add_argument("--repeats", type=int, default=20)
     parser.add_argument("--use-mxfp4-p", action="store_true")
-    parser.add_argument("--csv", type=Path)
     return parser.parse_args()
 
 
@@ -126,6 +125,8 @@ def make_backend_functions(inputs, num_q_heads, kv_len, use_mxfp4_p):
             output=output,
             softmax_scale=SOFTMAX_SCALE,
             block_size=BLOCK_SIZE,
+            num_q_heads=num_q_heads,
+            num_kv_heads=NUM_KV_HEADS,
             use_mxfp4_p=use_mxfp4_p,
         )
 
