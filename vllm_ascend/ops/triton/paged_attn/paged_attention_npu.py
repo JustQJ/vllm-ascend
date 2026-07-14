@@ -169,16 +169,19 @@ def _paged_attn_fwd_inner(
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, HEAD_DIM)
     num_tiles = (kv_seq_len + BLOCK_N - 1) // BLOCK_N
+    kv_seq_len_cmp = kv_seq_len.to(tl.float32)
+    q_abs_pos_cmp = q_abs_pos.to(tl.float32)
 
     for j in range(num_tiles):
         seq_offset = j * BLOCK_N + offs_n
+        seq_offset_cmp = seq_offset.to(tl.float32)
+        kv_lane_valid = seq_offset_cmp < kv_seq_len_cmp
         if IS_CONTIGUOUS_KV:
             k_token = kv_start + seq_offset
             k_offset = k_token[:, None] * stride_k_blk + kv_head_idx * stride_k_slot + offs_d[None, :] * stride_k_flat
         else:
             slot_in_block = seq_offset % BLOCK_SIZE
             logical_block = seq_offset // BLOCK_SIZE
-            kv_lane_valid = seq_offset < kv_seq_len
             phys_block = tl.load(
                 block_tables_ptr + logical_block,
                 mask=kv_lane_valid,
@@ -193,16 +196,20 @@ def _paged_attn_fwd_inner(
             )
         k = tl.load(
             K_base + k_offset,
-            mask=seq_offset[:, None] < kv_seq_len,
+            mask=kv_lane_valid[:, None],
             other=0.0,
         )
 
         qk = tl.dot(q, tl.trans(k)) * qk_scale
-        causal_mask = seq_offset[None, :] <= q_abs_pos[:, None]
+        causal_mask = seq_offset_cmp[None, :] <= q_abs_pos_cmp[:, None]
         if HAS_ATTEN_MASK:
             mask_k = seq_offset[None, :] - context_len
             mask_q = q_abs_pos[:, None] - context_len
-            mask_index_valid = (mask_q >= 0) & (mask_q < mask_rows) & (mask_k >= 0) & (mask_k < mask_cols)
+            mask_q_cmp = mask_q.to(tl.float32)
+            mask_k_cmp = mask_k.to(tl.float32)
+            mask_index_valid = (
+                (mask_q_cmp >= 0.0) & (mask_q_cmp < mask_rows) & (mask_k_cmp >= 0.0) & (mask_k_cmp < mask_cols)
+            )
             safe_mask_q = tl.where(mask_index_valid, mask_q, 0)
             safe_mask_k = tl.where(mask_index_valid, mask_k, 0)
             mask_offsets = safe_mask_q * stride_mask_q + safe_mask_k * stride_mask_k
@@ -212,7 +219,7 @@ def _paged_attn_fwd_inner(
                 other=0,
             )
             causal_mask = causal_mask & (mask_value == 0)
-        kv_mask = seq_offset[None, :] < kv_seq_len
+        kv_mask = kv_lane_valid[None, :]
         attn_valid = q_mask[:, None] & causal_mask & kv_mask
         qk_for_max = tl.where(attn_valid, qk, -1.0e20)
 
@@ -238,7 +245,7 @@ def _paged_attn_fwd_inner(
             )
         v = tl.load(
             V_base + v_offset,
-            mask=seq_offset[:, None] < kv_seq_len,
+            mask=kv_lane_valid[:, None],
             other=0.0,
         )
         acc += tl.dot(p.to(v.dtype), v)
@@ -315,7 +322,7 @@ def _paged_attn_fwd(
     offs_m = tl.arange(0, BLOCK_M)
     q_idx = q_start + q_block_local * BLOCK_M + offs_m
     q_local = q_idx - q_start
-    q_mask = q_idx < q_end
+    q_mask = q_idx.to(tl.float32) < q_end.to(tl.float32)
     q_idx_safe = tl.where(q_mask, q_idx, q_start)
 
     context_len = tl.maximum(kv_len - q_len, 0)
@@ -423,6 +430,7 @@ def _paged_attn_decode_fwd(
     )
 
     kv_len = tl.load(kv_lens_ptr + seq_idx).to(tl.int64)
+    kv_len_cmp = kv_len.to(tl.float32)
     num_logical_blocks = (kv_len + BLOCK_SIZE - 1) // BLOCK_SIZE
     seq_block_table = block_table_ptr + seq_idx * block_table_stride
 
@@ -437,7 +445,7 @@ def _paged_attn_decode_fwd(
             slot_base = tile_in_block * BLOCK_N
             slots = slot_base + offs_n
             logical_tokens = logical_block * BLOCK_SIZE + slots
-            token_valid = logical_tokens < kv_len
+            token_valid = logical_tokens.to(tl.float32) < kv_len_cmp
 
             # K cache is slot-major, so load complete token rows contiguously
             # from GM and transpose the UB-local tile for QK.
@@ -549,6 +557,7 @@ def _paged_attn_decode_split_kv_fwd(
 
     kv_len = tl.load(kv_lens_ptr + seq_idx).to(tl.int64)
     kv_len = tl.where(work_valid, kv_len, 0)
+    kv_len_cmp = kv_len.to(tl.float32)
     num_split_blocks = split_block_end - split_block_start
     seq_block_table = block_table_ptr + seq_idx * block_table_stride
 
@@ -564,7 +573,7 @@ def _paged_attn_decode_split_kv_fwd(
             slot_base = tile_in_block * BLOCK_N
             slots = slot_base + offs_n
             logical_tokens = logical_block * BLOCK_SIZE + slots
-            token_valid = logical_tokens < kv_len
+            token_valid = logical_tokens.to(tl.float32) < kv_len_cmp
 
             # K cache is slot-major, so load complete token rows contiguously
             # from GM and transpose the UB-local tile for QK.
