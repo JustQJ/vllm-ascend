@@ -4,16 +4,14 @@ Run this script on an Ascend NPU with the vLLM Ascend runtime installed.
 """
 
 import argparse
-import csv
 import statistics
-import sys
-from pathlib import Path
 
 import torch
 import torch_npu
 
 from vllm_ascend.ops.triton.paged_attn import paged_attention, paged_attention_decode_out
 from vllm_ascend.ops.triton.paged_attn.decode_utils import (
+    DECODE_SPLIT_KV_BATCH_SIZES,
     DECODE_SPLIT_KV_NUM_PROGRAMS,
     DECODE_SPLIT_KV_REDUCE_NUM_PROGRAMS,
     build_split_kv_descriptors,
@@ -38,6 +36,8 @@ CSV_COLUMNS = [
     "grid_size",
     "split_kv_num_programs",
     "split_kv_reduce_num_programs",
+    "split_kv_active_programs",
+    "split_kv_work_counts",
     "split_kv_chunk_size",
     "use_mxfp4_p",
     "backend",
@@ -68,7 +68,7 @@ def parse_args():
         "--heterogeneous-kv-lens",
         type=int,
         nargs="+",
-        default=[65536, 8192, 1024, 0],
+        default=[65536, 32768, 16384, 8192, 4096, 1024, 0, 0],
         help=(
             "Run one additional varied-length batch. The default includes a "
             "zero-length graph-padding sequence."
@@ -320,12 +320,14 @@ def benchmark_case(
     heads_per_program = heads_per_program_override
     if heads_per_program is None:
         heads_per_program = select_decode_heads_per_program(batch_size, num_q_heads, 32)
-    split_kv_chunk_size = 0
+    split_kv_max_chunk_size = 0
+    split_kv_work_counts = [0] * batch_size
     if split_kv_num_programs > 1:
-        _, _, split_kv_chunk_size = build_split_kv_descriptors(
+        _, seq_desc, split_kv_max_chunk_size = build_split_kv_descriptors(
             kv_lens,
             block_size=BLOCK_SIZE,
         )
+        split_kv_work_counts = [item[1] for item in seq_desc]
         heads_per_program = num_q_heads
     backends = make_backend_functions(
         inputs,
@@ -362,7 +364,10 @@ def benchmark_case(
                 "split_kv_reduce_num_programs": (
                     DECODE_SPLIT_KV_REDUCE_NUM_PROGRAMS if split_kv_num_programs > 1 else 0
                 ),
-                "split_kv_chunk_size": split_kv_chunk_size,
+                "split_kv_active_programs": sum(split_kv_work_counts),
+                "split_kv_work_counts": list(split_kv_work_counts),
+                # Keep the existing column name for benchmark CSV compatibility.
+                "split_kv_chunk_size": split_kv_max_chunk_size,
                 "use_mxfp4_p": use_mxfp4_p,
                 "backend": backend,
                 "latency_us_min": f"{timing['min']:.3f}",
@@ -405,7 +410,9 @@ def run_and_print_case(
         f"split_kv_num_programs={split_kv_num_programs}, "
         "split_kv_reduce_num_programs="
         f"{rows[0]['split_kv_reduce_num_programs']}, "
-        f"split_kv_chunk_size={rows[0]['split_kv_chunk_size']}:"
+        f"split_kv_active_programs={rows[0]['split_kv_active_programs']}, "
+        f"split_kv_work_counts={rows[0]['split_kv_work_counts']}, "
+        f"split_kv_max_chunk_size={rows[0]['split_kv_chunk_size']}:"
     )
     for row in rows:
         print(row)
@@ -424,8 +431,8 @@ def main():
     if any(length <= 0 for length in args.kv_lens):
         raise ValueError("--kv-lens must be positive")
     heterogeneous_kv_lens = args.heterogeneous_kv_lens
-    if len(heterogeneous_kv_lens) not in (1, 2, 4):
-        raise ValueError("--heterogeneous-kv-lens must contain 1, 2, or 4 values")
+    if len(heterogeneous_kv_lens) not in DECODE_SPLIT_KV_BATCH_SIZES:
+        raise ValueError("--heterogeneous-kv-lens must contain 1, 2, 4, or 8 values")
     if any(length < 0 for length in heterogeneous_kv_lens):
         raise ValueError("--heterogeneous-kv-lens must be non-negative")
     if max(heterogeneous_kv_lens) == 0:
@@ -450,18 +457,13 @@ def main():
         uniform_batch_sizes = [] if args.heterogeneous_only else args.batch_sizes
         for batch_size in uniform_batch_sizes:
             for kv_len in args.kv_lens:
-                if kv_len >= 32768 and batch_size >= 8:
-                    print(
-                        "Skipping case: "
-                        f"num_q_heads={num_q_heads}, "
-                        f"batch_size={batch_size}, kv_len={kv_len} "
-                        "(too large for memory)"
-                    )
-                    continue
 
                 for heads_per_program in heads_per_program_values:
                     for split_kv_num_programs in args.split_kv_programs:
-                        if split_kv_num_programs > 1 and batch_size not in (1, 2, 4):
+                        if (
+                            split_kv_num_programs > 1
+                            and batch_size not in DECODE_SPLIT_KV_BATCH_SIZES
+                        ):
                             print(
                                 "Skipping fixed Split-KV case: "
                                 f"batch_size={batch_size} is not a graph gear"

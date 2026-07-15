@@ -68,6 +68,7 @@ from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
 from vllm_ascend.ops.triton.paged_attn import paged_attention as fia_triton
 from vllm_ascend.ops.triton.paged_attn import paged_attention_decode_out as fia_triton_decode_out
 from vllm_ascend.ops.triton.paged_attn.decode_utils import (
+    DECODE_SPLIT_KV_BATCH_SIZES,
     DECODE_SPLIT_KV_NUM_PROGRAMS,
     build_split_kv_descriptors,
 )
@@ -931,7 +932,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         use_split_kv = (
             envs_ascend.VLLM_ASCEND_USE_PAGED_ATTENTION
-            and num_tokens in (1, 2, 4)
+            and num_tokens in DECODE_SPLIT_KV_BATCH_SIZES
             and self.num_heads in (8, 16)
             and self.num_kv_heads == 1
             and self.head_size == 128

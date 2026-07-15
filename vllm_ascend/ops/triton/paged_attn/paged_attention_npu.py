@@ -29,6 +29,7 @@ import triton
 import triton.language as tl
 
 from .decode_utils import (
+    DECODE_SPLIT_KV_BATCH_SIZES,
     DECODE_SPLIT_KV_NUM_PROGRAMS,
     DECODE_SPLIT_KV_REDUCE_NUM_PROGRAMS,
     select_decode_heads_per_program,
@@ -972,7 +973,7 @@ def paged_attention_decode_out(
     num_head_groups = num_q_heads // heads_per_program
     num_programs = query.shape[0] * num_head_groups
     if split_kv_num_programs > 1:
-        assert query.shape[0] in (1, 2, 4)
+        assert query.shape[0] in DECODE_SPLIT_KV_BATCH_SIZES
         num_programs = DECODE_SPLIT_KV_NUM_PROGRAMS
     assert num_programs <= 65535, (
         f"Ascend coreDim overflow: {num_programs} > 65535, "
