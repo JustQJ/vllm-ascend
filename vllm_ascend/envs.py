@@ -100,6 +100,20 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Directory used to dump bounded MLA Q and latent-KV samples for offline
+    # quantization analysis. Collection is disabled when this variable is unset.
+    # Dumped activations may contain sensitive information derived from user
+    # inputs; operators must protect the dump directory accordingly.
+    "VLLM_ASCEND_MLA_DATA_DUMP_DIR": lambda: os.getenv("VLLM_ASCEND_MLA_DATA_DUMP_DIR", None),
+    # Maximum number of current tokens saved from each MLA layer and phase in
+    # one collection step. Must be a positive integer. The default is 128.
+    "VLLM_ASCEND_MLA_DATA_DUMP_MAX_TOKENS": lambda: int(os.getenv("VLLM_ASCEND_MLA_DATA_DUMP_MAX_TOKENS", "128")),
+    # Maximum number of dump files written for each MLA layer and phase. Must
+    # be a positive integer. The default is 1 to bound synchronization and I/O.
+    "VLLM_ASCEND_MLA_DATA_DUMP_MAX_STEPS": lambda: int(os.getenv("VLLM_ASCEND_MLA_DATA_DUMP_MAX_STEPS", "1")),
+    # Optional comma-separated MLA layer filter. Entries can be full layer
+    # names or numeric layer indices, for example "0,30,60". Empty means all.
+    "VLLM_ASCEND_MLA_DATA_DUMP_LAYERS": lambda: os.getenv("VLLM_ASCEND_MLA_DATA_DUMP_LAYERS", ""),
 }
 
 # end-env-vars-definition

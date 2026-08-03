@@ -24,6 +24,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.mla_data_collector import MLADataCollector
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     ascend_chunked_prefill_workspace_size,
@@ -741,6 +742,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.enable_mlapo = enabling_mlapo(self.vllm_config)
 
         self.layer_name = kwargs.get("layer_name")
+        self.mla_data_collector = MLADataCollector(self.layer_name)
         self.fa_quant_layer = enable_fa_quant(self.vllm_config, self.layer_name)
         if self.fa_quant_layer:
             self.dtype = torch.float8_e4m3fn if get_ascend_device_type() == AscendDeviceType.A5 else torch.int8
@@ -1370,6 +1372,64 @@ class AscendMLAImpl(MLAAttentionImpl):
         x = torch_npu.npu_interleave_rope(x, cos, sin)
         return x.view(B, N, D)
 
+    def _collect_mla_data(
+        self,
+        phase: str,
+        kv_no_split: torch.Tensor,
+        q_latent: torch.Tensor,
+        q_rope_pre: torch.Tensor,
+        q_rope_post: torch.Tensor,
+        positions: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> None:
+        if not self.mla_data_collector.enabled or _EXTRA_CTX.capturing:
+            return
+
+        num_tokens = kv_no_split.shape[0]
+        kv_no_split = kv_no_split.view(
+            num_tokens,
+            self.num_kv_heads,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+        )
+        kv_latent_pre, k_rope_pre = kv_no_split.split(
+            [self.kv_lora_rank, self.qk_rope_head_dim],
+            dim=-1,
+        )
+        assert self.kv_a_layernorm is not None
+        kv_latent, _ = torch_npu.npu_rms_norm(
+            kv_latent_pre,
+            self.kv_a_layernorm.weight,
+            self.kv_a_layernorm.variance_epsilon,
+        )
+        k_rope_post = self.rope_single(k_rope_pre, cos, sin)
+
+        self.mla_data_collector.capture(
+            phase,
+            {
+                "kv_latent_pre_norm": kv_latent_pre,
+                "kv_latent": kv_latent,
+                "k_rope_pre": k_rope_pre,
+                "k_rope_post": k_rope_post,
+                "q_latent": q_latent,
+                "q_rope_pre": q_rope_pre,
+                "q_rope_post": q_rope_post,
+                "positions": positions,
+            },
+            metadata={
+                "kv_lora_rank": self.kv_lora_rank,
+                "qk_rope_head_dim": self.qk_rope_head_dim,
+                "num_heads": self.num_heads,
+                "num_kv_heads": self.num_kv_heads,
+                "is_draft_model": _EXTRA_CTX.is_draft_model,
+            },
+            tp_sharded_dims={
+                "q_latent": 1,
+                "q_rope_pre": 1,
+                "q_rope_post": 1,
+            },
+        )
+
     def _forward_decode(
         self,
         q_nope: torch.Tensor,
@@ -1587,10 +1647,28 @@ class AscendMLAImpl(MLAAttentionImpl):
         prefill_q = self.q_proj(prefill_q_c)[0].view(-1, self.num_heads, self.qk_head_dim)
         prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
         prefill_q_nope = prefill_q[..., : self.qk_nope_head_dim]
+        prefill_q_latent = None
+        if self.mla_data_collector.enabled and not _EXTRA_CTX.capturing:
+            prefill_q_latent = torch.bmm(
+                prefill_q_nope.transpose(0, 1),
+                self.W_UK_T,
+            ).transpose(0, 1)
         cos = attn_metadata.prefill.cos
         sin = attn_metadata.prefill.sin
         prefill_slots = attn_metadata.slot_mapping[num_decode_tokens:num_actual_tokens]
+        prefill_q_pe_pre = prefill_q_pe
         prefill_q_pe = self.rope_single(prefill_q_pe, cos, sin)
+        if prefill_q_latent is not None:
+            self._collect_mla_data(
+                "prefill",
+                prefill_kv_no_split,
+                prefill_q_latent,
+                prefill_q_pe_pre,
+                prefill_q_pe,
+                attn_metadata.prefill.input_positions,
+                cos,
+                sin,
+            )
         prefill_k_pe, prefill_k_c_normed = self.exec_kv_prefill(prefill_kv_no_split, cos, sin, kv_cache, prefill_slots)
         prefill_k_nope, prefill_value = (
             self.kv_b_proj(prefill_k_c_normed)[0]
@@ -1611,7 +1689,19 @@ class AscendMLAImpl(MLAAttentionImpl):
             decode_ql_nope,
             decode_q_pe,
         )
+        decode_q_pe_pre = decode_q_pe
         decode_q_pe = self.rope_single(decode_q_pe, cos, sin)
+        decode_kv_no_split = kv_no_split[:num_decode_tokens]
+        self._collect_mla_data(
+            "decode",
+            decode_kv_no_split,
+            decode_ql_nope,
+            decode_q_pe_pre,
+            decode_q_pe,
+            attn_metadata.decode.input_positions,
+            cos,
+            sin,
+        )
         dequant_scale_q_nope = None
         if self.fa_quant_layer and get_ascend_device_type() == AscendDeviceType.A5:
             decode_ql_nope, dequant_scale_q_nope = torch_npu.npu_dynamic_quant(
@@ -1619,7 +1709,6 @@ class AscendMLAImpl(MLAAttentionImpl):
             )
             decode_q_pe = (decode_q_pe / dequant_scale_q_nope.unsqueeze(-1) / self.fak_descale_float).to(torch.bfloat16)
         decode_slots = attn_metadata.slot_mapping[:num_decode_tokens:1]
-        decode_kv_no_split = kv_no_split[:num_decode_tokens]
         decode_k_pe, decode_k_nope = self.exec_kv_decode(decode_kv_no_split, cos, sin, kv_cache, decode_slots)
         return DecodeMLAPreprocessResult(
             decode_ql_nope, decode_q_pe, decode_k_nope, decode_k_pe, dequant_scale_q_nope=dequant_scale_q_nope
