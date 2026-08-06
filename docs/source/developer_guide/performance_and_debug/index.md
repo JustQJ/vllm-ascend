@@ -6,4 +6,3 @@ This section provides guides for benchmarking, performance tuning, profiling, an
 - **[Optimization and Tuning](optimization_and_tuning.md)** — Performance optimization
 - **[Service Profiling Guide](service_profiling_guide.md)** — Service profiling
 - **[msprobe Guide](msprobe_guide.md)** — Debugging with msprobe
-- **[MLA Data Collection](mla_data_collection.md)** — Collect MLA Q and latent-KV tensors for offline analysis
