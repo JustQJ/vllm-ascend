@@ -59,8 +59,7 @@ class MLADataCollector:
         self._lock = threading.Lock()
 
         if self.enabled and self._tp_rank() == 0:
-            assert self.config.dump_dir is not None
-            self.config.dump_dir.mkdir(parents=True, exist_ok=True)
+            self._layer_dump_dir().mkdir(parents=True, exist_ok=True)
 
     @property
     def enabled(self) -> bool:
@@ -73,6 +72,13 @@ class MLADataCollector:
             return True
         match = _LAYER_INDEX_PATTERN.search(self.layer_name)
         return match is not None and match.group(1) in self.config.layers
+
+    def _safe_layer_name(self) -> str:
+        return _SAFE_FILENAME_PATTERN.sub("_", self.layer_name).strip("_") or "unknown_layer"
+
+    def _layer_dump_dir(self) -> Path:
+        assert self.config.dump_dir is not None
+        return self.config.dump_dir / self._safe_layer_name()
 
     @staticmethod
     def _global_rank() -> int:
@@ -135,10 +141,8 @@ class MLADataCollector:
         cpu_tensors = {name: tensor.cpu() for name, tensor in gathered_tensors.items()}
 
         global_rank = self._global_rank()
-        safe_layer_name = _SAFE_FILENAME_PATTERN.sub("_", self.layer_name).strip("_")
-        filename = f"{safe_layer_name}.{phase}.rank{global_rank}.pid{os.getpid()}.step{step:04d}.pt"
-        assert self.config.dump_dir is not None
-        output_path = self.config.dump_dir / filename
+        filename = f"{phase}.rank{global_rank}.pid{os.getpid()}.step{step:04d}.pt"
+        output_path = self._layer_dump_dir() / filename
         temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
         payload = {
             "format_version": 2,

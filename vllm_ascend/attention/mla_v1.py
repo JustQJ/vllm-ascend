@@ -1382,6 +1382,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         positions: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
+        q_nope_prefill: torch.Tensor | None = None,
     ) -> None:
         if not self.mla_data_collector.enabled or _EXTRA_CTX.capturing:
             return
@@ -1404,30 +1405,37 @@ class AscendMLAImpl(MLAAttentionImpl):
         )
         k_rope_post = self.rope_single(k_rope_pre, cos, sin)
 
+        tensors = {
+            "kv_latent_pre_norm": kv_latent_pre,
+            "kv_latent": kv_latent,
+            "k_rope_pre": k_rope_pre,
+            "k_rope_post": k_rope_post,
+            "q_latent": q_latent,
+            "q_rope_pre": q_rope_pre,
+            "q_rope_post": q_rope_post,
+            "positions": positions,
+        }
+        tp_sharded_dims = {
+            "q_latent": 1,
+            "q_rope_pre": 1,
+            "q_rope_post": 1,
+        }
+        if q_nope_prefill is not None:
+            tensors["q_nope_prefill"] = q_nope_prefill
+            tp_sharded_dims["q_nope_prefill"] = 1
+
         self.mla_data_collector.capture(
             phase,
-            {
-                "kv_latent_pre_norm": kv_latent_pre,
-                "kv_latent": kv_latent,
-                "k_rope_pre": k_rope_pre,
-                "k_rope_post": k_rope_post,
-                "q_latent": q_latent,
-                "q_rope_pre": q_rope_pre,
-                "q_rope_post": q_rope_post,
-                "positions": positions,
-            },
+            tensors,
             metadata={
                 "kv_lora_rank": self.kv_lora_rank,
+                "qk_nope_head_dim": self.qk_nope_head_dim,
                 "qk_rope_head_dim": self.qk_rope_head_dim,
                 "num_heads": self.num_heads,
                 "num_kv_heads": self.num_kv_heads,
                 "is_draft_model": _EXTRA_CTX.is_draft_model,
             },
-            tp_sharded_dims={
-                "q_latent": 1,
-                "q_rope_pre": 1,
-                "q_rope_post": 1,
-            },
+            tp_sharded_dims=tp_sharded_dims,
         )
 
     def _forward_decode(
@@ -1668,6 +1676,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 attn_metadata.prefill.input_positions,
                 cos,
                 sin,
+                q_nope_prefill=prefill_q_nope,
             )
         prefill_k_pe, prefill_k_c_normed = self.exec_kv_prefill(prefill_kv_no_split, cos, sin, kv_cache, prefill_slots)
         prefill_k_nope, prefill_value = (

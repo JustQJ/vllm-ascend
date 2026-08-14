@@ -41,7 +41,9 @@ def test_collector_bounds_tokens_and_steps(tmp_path: Path):
     assert payload["tensor_metadata"]["q_latent"]["original_shape"] == (4, 3)
     assert payload["tensor_metadata"]["q_latent"]["saved_shape"] == (2, 3)
     assert collector.capture("decode", {"q_latent": tensor}) is None
-    assert len(list(tmp_path.glob("*.pt"))) == 1
+    assert output_path.parent == tmp_path / "model.layers.7.self_attn.attn"
+    assert output_path.name.startswith("decode.rank0.pid")
+    assert len(list(tmp_path.rglob("*.pt"))) == 1
 
 
 class _FakeTPGroup:
@@ -58,31 +60,43 @@ class _FakeTPGroup:
 @patch("vllm_ascend.attention.mla_data_collector.torch.distributed.is_initialized", return_value=True)
 def test_collector_gathers_q_heads_and_only_tp_rank_zero_saves(_is_initialized, tmp_path: Path):
     q_local = torch.arange(12, dtype=torch.float32).view(2, 2, 3)
+    q_nope_prefill = torch.arange(8, dtype=torch.float32).view(2, 2, 2)
     kv_replicated = torch.arange(6, dtype=torch.float32).view(2, 1, 3)
-    tensors = {"q_latent": q_local, "kv_latent": kv_replicated}
+    tensors = {
+        "q_latent": q_local,
+        "q_nope_prefill": q_nope_prefill,
+        "kv_latent": kv_replicated,
+    }
+    tp_sharded_dims = {"q_latent": 1, "q_nope_prefill": 1}
 
     with patch(
         "vllm_ascend.attention.mla_data_collector.get_tp_group",
         return_value=_FakeTPGroup(rank=1),
     ):
         non_root = MLADataCollector("model.layers.7.self_attn.attn", MLADataCollectorConfig(dump_dir=tmp_path))
-        assert non_root.capture("decode", tensors, tp_sharded_dims={"q_latent": 1}) is None
-        assert not list(tmp_path.glob("*.pt"))
+        assert non_root.capture("prefill", tensors, tp_sharded_dims=tp_sharded_dims) is None
+        assert not list(tmp_path.rglob("*.pt"))
 
     with patch(
         "vllm_ascend.attention.mla_data_collector.get_tp_group",
         return_value=_FakeTPGroup(rank=0),
     ):
         root = MLADataCollector("model.layers.7.self_attn.attn", MLADataCollectorConfig(dump_dir=tmp_path))
-        output_path = root.capture("decode", tensors, tp_sharded_dims={"q_latent": 1})
+        output_path = root.capture("prefill", tensors, tp_sharded_dims=tp_sharded_dims)
 
     assert output_path is not None
+    assert output_path.parent == tmp_path / "model.layers.7.self_attn.attn"
     payload = torch.load(output_path, weights_only=False)
     assert payload["tp_rank"] == 0
     assert payload["tp_size"] == 2
     assert torch.equal(payload["tensors"]["q_latent"], torch.cat((q_local, q_local + 10), dim=1))
+    assert torch.equal(
+        payload["tensors"]["q_nope_prefill"],
+        torch.cat((q_nope_prefill, q_nope_prefill + 10), dim=1),
+    )
     assert torch.equal(payload["tensors"]["kv_latent"], kv_replicated)
     assert payload["tensor_metadata"]["q_latent"]["tp_gather_dim"] == 1
+    assert payload["tensor_metadata"]["q_nope_prefill"]["tp_gather_dim"] == 1
     assert payload["tensor_metadata"]["kv_latent"]["tp_gather_dim"] is None
 
 

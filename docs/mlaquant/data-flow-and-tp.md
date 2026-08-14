@@ -17,6 +17,7 @@ flowchart TD
     QB --> QNOPE["q_nope<br/>[T, Hlocal, P]"]
     QB --> QRPRE["采集 q_rope_pre<br/>[T, Hlocal, R]"]
 
+    QNOPE --> QNPREFILL["采集 q_nope_prefill<br/>仅 prefill<br/>[T, Hlocal, P]"]
     QNOPE --> ABSORB["乘 W_UK 转置<br/>吸收到 KV latent 空间"]
     ABSORB --> QLAT["采集 q_latent<br/>[T, Hlocal, Lkv]"]
 
@@ -50,7 +51,7 @@ flowchart TD
     KRPOST --> PREFILL
 
     classDef collected fill:#ffe8a3,stroke:#cc7a00,stroke-width:2px,color:#111;
-    class QLAT,QRPRE,QRPOST,KVPRE,KVLAT,KRPRE,KRPOST,POS collected;
+    class QNPREFILL,QLAT,QRPRE,QRPOST,KVPRE,KVLAT,KRPRE,KRPOST,POS collected;
 ```
 
 ## TP 中哪些数据会切分
@@ -61,7 +62,9 @@ MLA 的 Q projection 是 Column Parallel，Q heads 按 TP rank 切分：
 Hlocal = Htotal / TP
 ```
 
-因此 `q_latent`、`q_rope_pre` 和 `q_rope_post` 在单卡上都只包含本地 Q head 分片，需要沿 head 维 `dim=1` 做 all-gather。
+因此 `q_nope_prefill`、`q_latent`、`q_rope_pre` 和 `q_rope_post` 在单卡上都只包含
+本地 Q head 分片，需要沿 head 维 `dim=1` 做 all-gather。`q_nope_prefill` 只存在于
+prefill 文件，decode 文件不会包含该字段。
 
 MLA 使用单个压缩 KV head，`W_DKV`/fused A projection 不进行 TP 切分。因此以下数据在纯 TP 模式下每张卡都有完整副本：
 
