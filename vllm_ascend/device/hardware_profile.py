@@ -31,6 +31,7 @@ class HardwareCapability(Enum):
     RUNTIME_CUSTOM_OPS = auto()
     SFA_DCP_REPLICATED_INDEXER = auto()
     STANDARD_WORKER_PATCHES = auto()
+    TURBOQUANT_4BIT_NC_CACHE = auto()
 
 
 class AttentionBackendFamily(Enum):
@@ -107,6 +108,7 @@ _STANDARD_CAPABILITIES = frozenset(
         HardwareCapability.RUNTIME_CUSTOM_OPS,
         HardwareCapability.SFA_DCP_REPLICATED_INDEXER,
         HardwareCapability.STANDARD_WORKER_PATCHES,
+        HardwareCapability.TURBOQUANT_4BIT_NC_CACHE,
     }
 )
 _A3_CAPABILITIES = _STANDARD_CAPABILITIES | {HardwareCapability.MC2_FULLMESH_V2_COMM}

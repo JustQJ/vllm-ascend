@@ -32,6 +32,7 @@ _STANDARD_CAPABILITIES = frozenset(
         HardwareCapability.RUNTIME_CUSTOM_OPS,
         HardwareCapability.SFA_DCP_REPLICATED_INDEXER,
         HardwareCapability.STANDARD_WORKER_PATCHES,
+        HardwareCapability.TURBOQUANT_4BIT_NC_CACHE,
     }
 )
 
