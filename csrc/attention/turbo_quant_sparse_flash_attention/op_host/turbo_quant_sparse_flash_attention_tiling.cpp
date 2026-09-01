@@ -428,6 +428,8 @@ void TQSFAMlaTiling::GetWorkspaceSize()
     // 复用 kvValidSize 已验证的“各 AIV 按 GetSubBlockIdx 分区写、vec1 整体读回”通路，
     // 不新增 GlobalTensor、不改函数签名。
     workspaceSize_ += 4 * 128 * 4 * (4 * actCoreNum);
+    // [TQ4 reuse] 相邻 query 复用的物理 tag cache：每 AIC 2 AIV × 4 slot × 256 int32 = 8KB。
+    workspaceSize_ += 2 * 4 * 256 * sizeof(int32_t) * actCoreNum;
 
     CalcFDWorkSpace(actCoreNum);
 }

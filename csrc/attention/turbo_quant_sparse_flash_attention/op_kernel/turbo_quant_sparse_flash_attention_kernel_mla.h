@@ -145,6 +145,7 @@ private:
     GlobalTensor<MM2_OUT_T> mm2ResGm;
     GlobalTensor<K_ROPE_T> kvMergeGm_;
     GlobalTensor<int32_t> kvValidSizeGm_;
+    GlobalTensor<int32_t> tq4ReuseTagGm_;
 
     GlobalTensor<int32_t> mm2ResInt32Gm;
     GlobalTensor<T> vec2ResGm;
@@ -492,6 +493,11 @@ __aicore__ inline void TurboQuantSparseFlashAttentionMla<QSFAT>::Init(
         // （按 half 视图是 [2048, 4096)，布局 slot(loop%4) × s2BaseSize(512)）。
         kvValidSizeGm_.SetGlobalBuffer(
             (__gm__ int32_t *)(workspace + qsfaOffset + (aiCoreIdx * 4) * 128 * 4 * sizeof(int32_t)));
+        qsfaOffset += GetBlockNum() * 4 * 128 * 4 * sizeof(int32_t);
+        // [TQ4 reuse] 相邻 query 物理 tag cache：每 AIC 2 AIV × 4 slot × 256 int32。
+        tq4ReuseTagGm_.SetGlobalBuffer(
+            (__gm__ int32_t *)(workspace + qsfaOffset + aiCoreIdx * 2 * 4 * 256 * sizeof(int32_t)));
+        qsfaOffset += GetBlockNum() * 2 * 4 * 256 * sizeof(int32_t);
     }
 
     if constexpr (FLASH_DECODE) {
@@ -507,7 +513,8 @@ __aicore__ inline void TurboQuantSparseFlashAttentionMla<QSFAT>::Init(
         vectorService.InitParams(constInfo, tilingData);
         vectorService.InitMm2ResInt32GmGlobalTensor(mm2ResInt32Gm);
         if constexpr (TEMPLATE_MODE == V_TEMPLATE) {
-            vectorService.InitVec0GlobalTensor(kvValidSizeGm_, kvMergeGm_, kRopeGm, keyGm, blockTableGm);
+            vectorService.InitVec0GlobalTensor(kvValidSizeGm_, kvMergeGm_, kRopeGm, keyGm, blockTableGm,
+                                               tq4ReuseTagGm_);
         }
         vectorService.InitVec1GlobalTensor(mm1ResGm, vec1ResGm, actualSeqLengthsQGm, actualSeqLengthsKVGm, lseMaxFdGm,
                                            lseSumFdGm, topKGm, softmaxMaxGm, softmaxSumGm);

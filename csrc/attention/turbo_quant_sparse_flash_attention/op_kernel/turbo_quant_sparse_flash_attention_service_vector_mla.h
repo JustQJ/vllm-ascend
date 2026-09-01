@@ -60,7 +60,8 @@ public:
                                                 const GlobalTensor<K_ROPE_T> &kvMergeGm,
                                                 const GlobalTensor<K_ROPE_T> &keyRopeGm,
                                                 const GlobalTensor<KV_T> &keyGm,
-                                                const GlobalTensor<int32_t> &blkTableGm);
+                                                const GlobalTensor<int32_t> &blkTableGm,
+                                                const GlobalTensor<int32_t> &tq4ReuseTagGm);
     __aicore__ inline void InitVec1GlobalTensor(GlobalTensor<MM1_OUT_T> mm1ResGm, GlobalTensor<K_ROPE_T> vec1ResGm,
                                                 GlobalTensor<int32_t> actualSeqLengthsQGm,
                                                 GlobalTensor<int32_t> actualSeqLengthsKVGm, GlobalTensor<T> lseMaxFdGm,
@@ -78,6 +79,13 @@ public:
                                    uint32_t dealRowCount, uint32_t columnCount, uint32_t actualColumnCount);
     // ================================Vector0==========================================
     __aicore__ inline void MergeKv(const RunInfo &runInfo);
+    __aicore__ inline void MergeKvLegacy(const RunInfo &runInfo);
+    // [TQ4 reuse] 相邻 query 位置锁定复用：同一物理 KV 行再次落到同一 slot 行时，
+    // 跳过 CopyIn/反量化/写出（不改变列顺序，输出与原始实现逐位一致）。
+    __aicore__ inline void Tq4ReuseOnQueryStart(const RunInfo &runInfo);
+    __aicore__ inline void MergeKvCached(const RunInfo &runInfo);
+    __aicore__ inline void FlushReuseMisses(const RunInfo &runInfo, uint32_t slot, int64_t flushIdx,
+                                            uint32_t colStart, int64_t batchCount);
     __aicore__ inline int64_t GetKeyBNBOffset(int64_t realS2Idx, const RunInfo &runInfo, int64_t s2IdLimit);
     __aicore__ inline void GetRealS2Idx(int64_t s2GmOffset, int64_t &realS2Idx, int64_t topkGmBaseOffset,
                                         const RunInfo &runInfo);
@@ -222,6 +230,12 @@ private:
     TBuf<> tq4CentBuf_; // 16 float (centSigned[k] = _CENT[(k+8)%16])
     // [O9] scale 批量导出用的索引表：sTIdx[i] = i*32（字节偏移），一次性初始化
     TBuf<> tq4STIdxBuf_; // 512B = 128 个 uint32
+    // [TQ4 reuse] GM 侧持久 tag：每 AIV 1024 int32（4 slot × 256），由 kernel 按核/AIV 偏移绑定。
+    GlobalTensor<int32_t> tq4ReuseTagGm_;
+    // [TQ4 reuse] stateValid_: GM tag 与 slot 内容一致（上一 eligible query 完整收尾）；
+    // queryActive_: 当前 query 复用路径已启用。两者均为本 AIV 本地状态，不跨核。
+    bool tq4ReuseStateValid_ = false;
+    bool tq4ReuseQueryActive_ = false;
     // [TQ4] per-column scale 专用暂存。曾经挤在 v0ValidSizeUb_ 内（手工偏移 4096/5120），
     // 实测 M 分块数>1 时 Cast/Duplicate 必崩 507015，故改为独立 buffer。
     //   half 视图 [0, 512)   : vec1 从 GM 读回的 512 个 s_j
@@ -314,13 +328,15 @@ __aicore__ inline void QSFAVectorService<QSFAT>::InitVec0GlobalTensor(const Glob
                                                                       const GlobalTensor<K_ROPE_T> &kvMergeGm,
                                                                       const GlobalTensor<K_ROPE_T> &keyRopeGm,
                                                                       const GlobalTensor<KV_T> &keyGm,
-                                                                      const GlobalTensor<int32_t> &blkTableGm)
+                                                                      const GlobalTensor<int32_t> &blkTableGm,
+                                                                      const GlobalTensor<int32_t> &tq4ReuseTagGm)
 {
     this->kvMergeGm_ = kvMergeGm;
     this->keyRopeGm_ = keyRopeGm;
     this->keyGm_ = keyGm;
     this->blkTableGm_ = blkTableGm;
     this->kvValidSizeGm_ = kvValidSizeGm;
+    this->tq4ReuseTagGm_ = tq4ReuseTagGm;
     this->tq4ScaleGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t *>(kvValidSizeGm.GetPhyAddr(0)));
 }
 
@@ -1072,9 +1088,236 @@ __aicore__ inline void QSFAVectorService<QSFAT>::CopyOutMrgeResult(int64_t mte2S
 }
 
 // b s1 k
+// ===== [TQ4 reuse] 相邻 query 位置锁定复用（near-token reuse 阶段 1）=====
+// hit 定义：本 AIV 半区第 i 行的物理 KV tag 与上一 eligible query 同位相同。
+// 不做任何列排列（stableTopK == rawTopK），输出与 legacy 逐位一致；hit 行跳过
+// CopyIn/反量化/写出，miss 行按连续 run 组织批量写出。状态均为本 AIV 本地：
+// stateValid_ 表示 GM tag 与 slot 内容一致（上一 eligible query 完整 4 tile 收尾）。
+template <typename QSFAT>
+__aicore__ inline void QSFAVectorService<QSFAT>::Tq4ReuseOnQueryStart(const RunInfo &runInfo)
+{
+    // 每个 query 恰好 4 个 tile 且从 s2Idx 0 开始时，query 间 slot 奇偶稳定；
+    // 其余形态（尾块、S2 分核、非 TQ4/PA/TND 等）的 slot 覆写会使 tag 失真，回退并失效。
+    bool eligible = false;
+    if constexpr (LAYOUT_T == QSFA_LAYOUT::TND && PAGE_ATTENTION) {
+        eligible = constInfo.keyQuantMode == QUANT_MODE::TQ4 &&
+                   constInfo.quantScaleRepoMode == QUANT_SCALE_REPO_MODE::COMBINE &&
+                   constInfo.sparseBlockSize == 1 && constInfo.sparseBlockCount == 2048 &&
+                   constInfo.s2BaseSize == 512 && constInfo.kvHeadNum == 1 && constInfo.headDim == 512 &&
+                   constInfo.headDimRope == 64 && runInfo.actS2Size == 2048 &&
+                   runInfo.curSInnerLoopTimes == 4 && runInfo.s2Idx == 0 && runInfo.tndIsS2SplitCore == 0;
+    }
+    tq4ReuseQueryActive_ = eligible;
+    if (!eligible) {
+        tq4ReuseStateValid_ = false;
+    }
+}
+
+template <typename QSFAT>
+__aicore__ inline void QSFAVectorService<QSFAT>::FlushReuseMisses(const RunInfo &runInfo, uint32_t slot,
+                                                                  int64_t flushIdx, uint32_t colStart,
+                                                                  int64_t batchCount)
+{
+    // 与 CopyOutMrgeResult 的 TQ4 分支同形态，列起点换成本 miss run 的 colStart。
+    SetFlag<AscendC::HardEvent::MTE2_V>(0);
+    WaitFlag<AscendC::HardEvent::MTE2_V>(0);
+    LocalTensor<KV_T> srcTensor = kvMergUb_[(flushIdx % 2) * INPUT1_BUFFER_OFFSET / sizeof(KV_T)];
+    LocalTensor<K_ROPE_T> antiKvTensorAsB16 = tmpBuff1.Get<K_ROPE_T>();
+    WaitFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF1_FLAG);
+    Tq4DequantRows(srcTensor, antiKvTensorAsB16, static_cast<int32_t>(batchCount));
+
+    const uint32_t colBase = GetSubBlockIdx() * 256 + colStart; // tile 内全局列号
+    {
+        // scale 向量化导出：每行读 1 个 32B block，再 Gather 出头 2B，写 scale ring 对应列。
+        uint32_t scaleByteOff = constInfo.headDim / 2 + constInfo.headDimRope * sizeof(K_ROPE_T);
+        LocalTensor<half> qsfaSTUb = tmpBuff2.Get<half>();
+        LocalTensor<half> qsfaSTUb32 = tmpBuff2.Get<half>()[512];
+        LocalTensor<half> qsfaSrcHalf = srcTensor.template ReinterpretCast<half>()[scaleByteOff / 2];
+        DataCopyParams stParams;
+        stParams.blockCount = static_cast<uint16_t>(batchCount);
+        stParams.blockLen = 1;
+        stParams.srcStride = static_cast<uint16_t>(QSFAAlign(386U, static_cast<uint32_t>(BYTE_BLOCK)) / BYTE_BLOCK - 1);
+        stParams.dstStride = 0;
+        DataCopy(qsfaSTUb32, qsfaSrcHalf, stParams);
+        PipeBarrier<PIPE_V>();
+        LocalTensor<uint32_t> qsfaSTIdx = tq4STIdxBuf_.Get<uint32_t>();
+        Gather(qsfaSTUb, qsfaSTUb32, qsfaSTIdx, 0, static_cast<uint32_t>(batchCount));
+        SetFlag<AscendC::HardEvent::V_MTE3>(SYNC_OUTPUT_BUF1_FLAG);
+        WaitFlag<AscendC::HardEvent::V_MTE3>(SYNC_OUTPUT_BUF1_FLAG);
+        LocalTensor<uint16_t> qsfaScaleSrc = qsfaSTUb.template ReinterpretCast<uint16_t>();
+        DataCopyExtParams scaleOut;
+        scaleOut.blockCount = 1;
+        scaleOut.blockLen = static_cast<uint32_t>(batchCount) * sizeof(uint16_t);
+        scaleOut.srcStride = 0;
+        scaleOut.dstStride = 0;
+        DataCopyPad(tq4ScaleGm_[TQ4_SCALE_HALF_BASE + slot * TQ4_SCALE_SLOT_STRIDE + colBase], qsfaScaleSrc,
+                    scaleOut);
+    }
+
+    uint64_t gmBase = slot * (512 * constInfo.combineHeadDim) + colBase * constInfo.combineHeadDim;
+    DataCopyExtParams out;
+    out.blockCount = static_cast<uint16_t>(batchCount);
+    out.blockLen = constInfo.headDim * sizeof(K_ROPE_T);
+    out.srcStride = 0;
+    out.dstStride = (constInfo.combineHeadDim - constInfo.headDim) * sizeof(K_ROPE_T);
+    DataCopyPad(kvMergeGm_[gmBase], antiKvTensorAsB16, out);
+
+    LocalTensor<K_ROPE_T> ropeUb = srcTensor[constInfo.headDim / 2].template ReinterpretCast<K_ROPE_T>();
+    out.blockLen = constInfo.headDimRope * sizeof(K_ROPE_T);
+    // UB 侧 srcStride 以 32B 块为单位：行距 416B=13 块，blockLen 128B=4 块。
+    out.srcStride = 416 / BYTE_BLOCK - constInfo.headDimRope * sizeof(K_ROPE_T) / BYTE_BLOCK;
+    out.dstStride = (constInfo.combineHeadDim - constInfo.headDimRope) * sizeof(K_ROPE_T);
+    DataCopyPad(kvMergeGm_[gmBase + constInfo.headDim], ropeUb, out);
+    SetFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF1_FLAG);
+    SetFlag<AscendC::HardEvent::MTE3_MTE2>(flushIdx % 2); // 本 kvMergUb_ 半区可被 refill
+}
+
+template <typename QSFAT>
+__aicore__ inline void QSFAVectorService<QSFAT>::MergeKvCached(const RunInfo &runInfo)
+{
+    constexpr uint32_t HALF_ROWS = 256; // s2BaseSize 512 由两个 AIV 平分
+    constexpr uint32_t SLOT_PITCH = 416; // 386B slot 按 32B 对齐
+    constexpr uint32_t SLOT_BYTES = 386; // headDim/2 + headDimRope*2 + 2
+    const uint32_t slot = runInfo.loop % MERGE_CACHE_GM_BUF_NUM;
+    const uint32_t half = GetSubBlockIdx();
+
+    // 入口必须等尽所有异步流水：cur/prevTags 叠在 inputBuff2 尾部（[20480, 22528)），而上一
+    // 阶段（ProcessVec2 的 bmm2ResPreUb = inputBuff2，最大铺满 32K）的 V/MTE2 写可能仍在
+    // 飞行。若不排干，旧写会盖掉本 tile 预处理写入的 curTags（实测抓到 tag 变成上一阶段
+    // 的 bf16 注意力数据），随后 keyGm_[tag * 386] 的 MTE2 读越界报 aicore exception。
+    PipeBarrier<PIPE_ALL>();
+    uint64_t prefixQ = (runInfo.bIdx <= 0) ? 0 : actualSeqLengthsQGm.GetValue(runInfo.bIdx - 1);    int64_t topkBase = static_cast<int64_t>(prefixQ + runInfo.gS1Idx / constInfo.gSize) * constInfo.kvHeadNum *
+                       constInfo.sparseBlockCount;
+    int64_t s2IdLimit = runInfo.curActualSeqLenOri;
+    if (constInfo.sparseMode == 3) {
+        s2IdLimit = runInfo.curActualSeqLenOri - runInfo.actS1Size + runInfo.gS1Idx / constInfo.gSize + 1;
+    }
+
+    // 注意：MTE3_MTE2 前奏不能在合法性校验之前下发——校验失败回退 MergeKvLegacy 时
+    // legacy 会再 set 一次同号标志，多出的 set 泄漏进跨 tile 的标志计数（硬件计数器
+    // 有限位，持续泄漏会溢出报 aicore exception；即使不溢出也会令后续 wait 提前放行）。
+
+    // tag 暂存借用 inputBuff2 尾部：TQ4 反量化 scratch 只用 [0, 20480)（CHUNK=4 布局
+    // work 8K + half 4K + idx 8K），[20480, 22528) 放 cur/prev tag 各 1KB。tag 生命周期
+    // 仅本次 MergeKvCached 调用（跨 flush 存活、跨 task 不需要）。该 buffer 的另一使用者
+    // Vec2 bmm2ResPreUb 会铺满整块 32K，与本区地址重叠——靠入口的 PipeBarrier<PIPE_ALL>
+    // 排干上一阶段的在飞写来保证安全（见函数开头注释）。byte-LUT 分支 CHUNK=16 会用到
+    // 28K，rebase 时须把此区上移或改走独立 buffer。
+    static_assert(TQ4_DEQUANT_CHUNK * 512 * 10U <= 20480U, // 每元素 work 4B + half 2B + idx 4B
+                  "reuse tag area overlaps TQ4 dequant scratch");
+    constexpr uint32_t REUSE_TAG_ELEMS = 20480U / sizeof(int32_t);
+    LocalTensor<int32_t> curTags = inputBuff2.Get<int32_t>()[REUSE_TAG_ELEMS];
+    LocalTensor<int32_t> prevTags = inputBuff2.Get<int32_t>()[REUSE_TAG_ELEMS + HALF_ROWS];
+
+    // 1) 计算本 AIV 半区 256 行的物理 tag。任一位置越过 causal 上限或地址非法，
+    //    则本 tile 及本 query 后续 tile 全部回退 legacy，并使 cache 失效。
+    int64_t tileBase = static_cast<int64_t>(runInfo.s2Idx) * 512 + half * HALF_ROWS;
+    for (uint32_t i = 0; i < HALF_ROWS; ++i) {
+        int64_t tok = topkGm_.GetValue(topkBase + tileBase + i);
+        if (unlikely(tok < 0 || tok >= s2IdLimit)) {
+            tq4ReuseQueryActive_ = false;
+            tq4ReuseStateValid_ = false;
+            MergeKvLegacy(runInfo);
+            return;
+        }
+        int64_t blk = blkTableGm_.GetValue(static_cast<int64_t>(runInfo.bIdx) * constInfo.maxBlockNumPerBatch +
+                                           tok / constInfo.kvCacheBlockSize);
+        int64_t tag = blk * constInfo.kvCacheBlockSize + tok % constInfo.kvCacheBlockSize; // kvHeadNum==1
+        if (unlikely(blk < 0 || tag > INT32_MAX)) {
+            tq4ReuseQueryActive_ = false;
+            tq4ReuseStateValid_ = false;
+            MergeKvLegacy(runInfo);
+            return;
+        }
+        curTags.SetValue(i, static_cast<int32_t>(tag));
+    }
+
+    // 2) 读上一 query 同位 tag（GM→UB 1KB）；PipeBarrier 保证 MTE2 完成后再做标量比较，
+    //    且先于同址的写回（MTE2 读 -> MTE3 写的 GM 序）。
+    DataCopy(prevTags, tq4ReuseTagGm_[half * 1024 + slot * HALF_ROWS], HALF_ROWS);
+    PipeBarrier<PIPE_ALL>();
+    SetFlag<AscendC::HardEvent::S_MTE3>(0);
+    WaitFlag<AscendC::HardEvent::S_MTE3>(0);
+    DataCopy(tq4ReuseTagGm_[half * 1024 + slot * HALF_ROWS], curTags, HALF_ROWS);
+
+    // 与 legacy 相同的 MTE3_MTE2 前奏（平衡：set 2 + 每 flush 1，wait 每 batch 1 + 末尾 2），
+    // 必须放在所有回退分支之后（见上方注释）。
+    SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
+    SetFlag<AscendC::HardEvent::MTE3_MTE2>(1);
+
+    // 3) miss 行按连续 run 组织：CopyIn 紧凑入 kvMergUb_ 半区，run 断开或满 32 行即 flush。
+    const bool stateOk = tq4ReuseStateValid_;
+    int64_t flushIdx = 0;
+    uint32_t batchCnt = 0;
+    uint32_t batchCol = 0;
+    for (uint32_t i = 0; i < HALF_ROWS; ++i) {
+        if (stateOk && prevTags.GetValue(i) == curTags.GetValue(i)) {
+            continue; // hit：kvMergeGm_ 与 scale 保持上一 query 写入的内容
+        }
+        if (batchCnt > 0 && (batchCnt >= 32 || i != batchCol + batchCnt)) {
+            FlushReuseMisses(runInfo, slot, flushIdx, batchCol, batchCnt);
+            ++flushIdx;
+            batchCnt = 0;
+        }
+        if (batchCnt == 0) {
+            batchCol = i;
+            WaitFlag<AscendC::HardEvent::MTE3_MTE2>(flushIdx % 2); // 半区可覆写
+        }
+        DataCopyExtParams cp;
+        cp.blockCount = 1;
+        cp.blockLen = SLOT_BYTES;
+        cp.srcStride = 0;
+        cp.dstStride = 0;
+        DataCopyPadExtParams<KV_T> pad;
+        pad.isPad = true;
+        pad.leftPadding = 0;
+        pad.rightPadding = SLOT_PITCH - SLOT_BYTES;
+        pad.paddingValue = 0;
+        DataCopyPad(kvMergUb_[(flushIdx % 2) * INPUT1_BUFFER_OFFSET / sizeof(KV_T) + batchCnt * SLOT_PITCH],
+                    keyGm_[static_cast<int64_t>(curTags.GetValue(i)) * SLOT_BYTES], cp, pad);
+        ++batchCnt;
+    }
+    if (batchCnt > 0) {
+        FlushReuseMisses(runInfo, slot, flushIdx, batchCol, batchCnt);
+    }
+
+    // 4) validSize 恒为满半区（hit 行同样参与 attention），发布路径与 legacy 相同。
+    WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);
+    WaitFlag<AscendC::HardEvent::MTE3_MTE2>(1);
+    v0ValidSizeUb_.SetValue(slot, HALF_ROWS);
+    SetFlag<AscendC::HardEvent::S_MTE3>(1);
+    WaitFlag<AscendC::HardEvent::S_MTE3>(1);
+    DataCopyExtParams vsParams;
+    vsParams.blockCount = 1;
+    vsParams.blockLen = 128 * sizeof(int32_t);
+    vsParams.srcStride = 0;
+    vsParams.dstStride = 0;
+    DataCopyPad(kvValidSizeGm_[slot * (128 * 2) + half * 128], v0ValidSizeUb_, vsParams);
+
+    // 5) 本 query 最后一个 tile 收尾后，tag 才作为下一 query 的有效前驱。
+    if (runInfo.s2Idx + 1 == runInfo.curSInnerLoopTimes) {
+        tq4ReuseStateValid_ = true;
+    }
+}
+
 template <typename QSFAT>
 __aicore__ inline void QSFAVectorService<QSFAT>::MergeKv(const RunInfo &runInfo)
 {
+    // [TQ4 reuse] tile0 判定复用资格；启用时走位置锁定复用路径（输出与下文 legacy 逐位一致）。
+    if (runInfo.isFirstSInnerLoop) {
+        Tq4ReuseOnQueryStart(runInfo);
+    }
+    if (tq4ReuseQueryActive_) {
+        MergeKvCached(runInfo);
+        return;
+    }
+    MergeKvLegacy(runInfo);
+}
+
+template <typename QSFAT>
+__aicore__ inline void QSFAVectorService<QSFAT>::MergeKvLegacy(const RunInfo &runInfo)
+{
+
     int64_t s2ProcessSize = runInfo.actualSingleProcessSInnerSize;
     int64_t s2Pair = CeilDiv(s2ProcessSize, 2L * constInfo.sparseBlockSize);
     int64_t topkGmBaseOffset = 0;
