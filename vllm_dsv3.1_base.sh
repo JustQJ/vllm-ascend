@@ -30,7 +30,6 @@ vllm serve $MODEL_PATH \
   --quantization ascend \
   --trust-remote-code \
   --speculative-config '{"num_speculative_tokens": 3,"method": "deepseek_mtp"}' \
-  --profiler-config '{"profiler": "torch", "torch_profiler_dir": "/mnt/share/t00970481/vllm-profile", "torch_profiler_with_stack": false}' \
   --additional_config '{"enable_cpu_binding": "True", "multistream_overlap_shared_expert": true, "enable_mlapo": true}' \
   --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}'
   # --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}'
