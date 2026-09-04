@@ -1041,8 +1041,17 @@ class AscendMLAImpl(MLAAttentionImpl):
         return ql_nope.transpose(0, 1), q_pe
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
-        # NOTE: We currently do not support quant kv_b_proj.
-        assert isinstance(self.kv_b_proj.quant_method, UnquantizedLinearMethod)
+        # kv_b_proj may originate from a quantized checkpoint, but it must
+        # have been resolved to a dense model-dtype weight before MLA
+        # processes it. What matters is the weight's final state, not the
+        # quant method class: a scheme may own the layer yet leave it dense
+        # (see AscendFp8BlockLinearMethod), and a quantized weight would come
+        # in a layout the absorb path below cannot split.
+        assert self.kv_b_proj.weight.dtype == act_dtype, (
+            f"Ascend MLA requires kv_b_proj to be dense in {act_dtype}, "
+            f"got {self.kv_b_proj.weight.dtype} from "
+            f"{type(self.kv_b_proj.quant_method).__name__}"
+        )
         # NOTE: Weight will be reshaped next, we need to revert and transpose it.
         kv_b_proj_weight = torch_npu.npu_format_cast(self.kv_b_proj.weight.data, ACL_FORMAT_FRACTAL_ND).T
         assert kv_b_proj_weight.shape == (

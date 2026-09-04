@@ -169,10 +169,14 @@ class AscendFp8BlockLinearMethod(AscendLinearScheme):
         del layer.weight_scale_inv
 
         if _is_absorbed_by_attention(layer):
-            # Decided locally rather than on the scheme: the attention backend
-            # splits this layer and disposes of it, so apply() is never reached
-            # and nothing about this layer should speak for any other.
+            # Decided locally rather than on the scheme: nothing about this
+            # layer should speak for any other. The resolved matrix stays
+            # dense because both backends need it: SFA absorbs it and disposes
+            # of the layer, while dense MLA keeps running it during prefill
+            # and re-absorbs it from this weight. Drop the MXFP8 helper so
+            # apply() serves those calls through the unquantized path.
             layer.weight = torch.nn.Parameter(maybe_trans_nz(resolved), requires_grad=False)
+            self.mxfp8_method = None
             return
 
         if self.mxfp8_method is not None and not _supports_mx_regroup(resolved.shape[1], self.mxfp8_method.group_size):

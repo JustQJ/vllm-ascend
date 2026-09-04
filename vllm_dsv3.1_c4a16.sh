@@ -14,7 +14,7 @@ export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 MODEL_PATH=$1
 
 vllm serve $MODEL_PATH \
-  --max_model_len 49152 \
+  --max_model_len 64000 \
   --max-num-batched-tokens 2048  \
   --served-model-name deepseek_v3 \
   --gpu-memory-utilization 0.94 \
@@ -23,11 +23,10 @@ vllm serve $MODEL_PATH \
   --port 9007 \
   --block-size 128 \
   --no-enable-prefix-caching \
-  --data-parallel-size 1 \
+  --data-parallel-size 2 \
   --tensor-parallel-size 4 \
   --enable-expert-parallel \
   --max-num-seqs 32 \
-  --quantization ascend \
   --trust-remote-code \
   --speculative-config '{"num_speculative_tokens": 3,"method": "deepseek_mtp"}' \
   --additional_config '{"enable_cpu_binding": true, "multistream_overlap_shared_expert": true, "enable_mlapo": false, "enable_mla_kv_pseudo_quant": true, "enable_mla_rope_k_pseudo_quant": false, "mla_kv_pseudo_quant_block_size": 32, "mla_rope_k_pseudo_quant_block_size": 32}' \
