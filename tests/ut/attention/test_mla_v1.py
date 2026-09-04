@@ -1195,6 +1195,16 @@ class TestAscendMLAImpl(TestBase):
         self.assertEqual(self.impl.num_heads_padded, 256)
         self.assertEqual(self.impl.head_padding, 0)
 
+    def test_force_unfused_preprocess_without_c4(self):
+        self.impl.enable_mla_unfused_preprocess = True
+        self.impl.enable_mla_kv_pseudo_quant = False
+        self.impl.enable_mla_rope_k_pseudo_quant = False
+
+        self.assertTrue(self.impl._requires_unfused_mla_preprocess())
+
+        self.impl.enable_mla_unfused_preprocess = False
+        self.assertFalse(self.impl._requires_unfused_mla_preprocess())
+
     @patch("vllm_ascend.attention.mla_v1.get_current_vllm_config")
     def test_init_head_padding_for_non_power_of_two(self, mock_get_current_vllm_config):
         """Test head padding computation for num_heads that are not power of 2 (e.g. GLM-4.7-Flash with 20 heads)."""
@@ -2278,6 +2288,181 @@ class TestAscendMLAImpl(TestBase):
 
         self.assertEqual(k_pe.shape[-1], self.impl.qk_rope_head_dim)
         self.assertEqual(k_nope.shape[-1], self.impl.kv_lora_rank)
+
+    @patch("vllm_ascend.attention.mla_v1.DeviceOperator.reshape_and_cache")
+    @patch("vllm_ascend.attention.mla_v1.pseudo_quantize_fp4_per_block")
+    @patch("vllm_ascend.attention.mla_v1.torch_npu.npu_kv_rmsnorm_rope_cache", create=True)
+    @patch("vllm_ascend.attention.mla_v1.torch_npu.npu_rms_norm", create=True)
+    def test_exec_kv_decode_with_forced_unfused_preprocess_without_c4(
+        self,
+        mock_npu_rms_norm,
+        mock_kv_rmsnorm_rope_cache,
+        mock_pseudo_quant,
+        mock_reshape_and_cache,
+    ):
+        batch_size = 2
+        num_kv_heads = self.impl.num_kv_heads
+        kv_no_split = torch.randn(
+            batch_size,
+            num_kv_heads,
+            self.impl.kv_lora_rank + self.impl.qk_rope_head_dim,
+        )
+        k_nope = torch.randn(batch_size, num_kv_heads, self.impl.kv_lora_rank)
+        k_pe = torch.randn(batch_size, num_kv_heads, self.impl.qk_rope_head_dim)
+        slots = torch.arange(batch_size)
+        kv_cache = [MagicMock(), MagicMock()]
+
+        self.impl.enable_mla_unfused_preprocess = True
+        self.impl.enable_mla_kv_pseudo_quant = False
+        self.impl.enable_mla_rope_k_pseudo_quant = False
+        self.impl.rope_single = MagicMock(return_value=k_pe)
+        self.impl._quantize_mla_c8_cache = MagicMock(side_effect=lambda value: value)
+        mock_npu_rms_norm.return_value = (k_nope, MagicMock())
+
+        for fa_quant_layer in (False, True):
+            with self.subTest(fa_quant_layer=fa_quant_layer):
+                self.impl.fa_quant_layer = fa_quant_layer
+                actual_k_pe, actual_k_nope = self.impl.exec_kv_decode(
+                    kv_no_split,
+                    MagicMock(),
+                    MagicMock(),
+                    kv_cache,
+                    slots,
+                )
+                self.assertIs(actual_k_pe, kv_cache[1])
+                self.assertIs(actual_k_nope, kv_cache[0])
+
+        mock_kv_rmsnorm_rope_cache.assert_not_called()
+        mock_pseudo_quant.assert_not_called()
+        self.assertEqual(mock_npu_rms_norm.call_count, 2)
+        self.assertEqual(self.impl.rope_single.call_count, 2)
+        self.assertEqual(self.impl._quantize_mla_c8_cache.call_count, 2)
+        self.assertEqual(mock_reshape_and_cache.call_count, 2)
+
+    @patch("vllm_ascend.attention.mla_v1.DeviceOperator.reshape_and_cache")
+    @patch("vllm_ascend.attention.mla_v1.pseudo_quantize_fp4_per_block")
+    @patch("vllm_ascend.attention.mla_v1.torch_npu.npu_rms_norm", create=True)
+    def test_exec_kv_decode_with_latent_and_rope_pseudo_quant(
+        self,
+        mock_npu_rms_norm,
+        mock_pseudo_quant,
+        mock_reshape_and_cache,
+    ):
+        batch_size = 2
+        num_kv_heads = self.impl.num_kv_heads
+        kv_no_split = torch.randn(
+            batch_size,
+            num_kv_heads,
+            self.impl.kv_lora_rank + self.impl.qk_rope_head_dim,
+        )
+        k_nope = torch.randn(batch_size, num_kv_heads, self.impl.kv_lora_rank)
+        k_pe = torch.randn(batch_size, num_kv_heads, self.impl.qk_rope_head_dim)
+        quantized_k_nope = k_nope + 1
+        quantized_k_pe = k_pe + 2
+        slots = torch.arange(batch_size)
+        kv_cache = [MagicMock(), MagicMock()]
+
+        self.impl.enable_mla_kv_pseudo_quant = True
+        self.impl.enable_mla_rope_k_pseudo_quant = True
+        self.impl.mla_kv_pseudo_quant_block_size = 16
+        self.impl.mla_rope_k_pseudo_quant_block_size = 8
+        self.impl.fa_quant_layer = False
+        self.impl.rope_single = MagicMock(return_value=k_pe)
+        mock_npu_rms_norm.return_value = (k_nope, MagicMock())
+        mock_pseudo_quant.side_effect = [quantized_k_nope, quantized_k_pe]
+
+        actual_k_pe, actual_k_nope = self.impl.exec_kv_decode(
+            kv_no_split,
+            MagicMock(),
+            MagicMock(),
+            kv_cache,
+            slots,
+        )
+
+        self.assertEqual(mock_pseudo_quant.call_count, 2)
+        mock_reshape_and_cache.assert_called_once_with(
+            key=quantized_k_nope,
+            value=quantized_k_pe,
+            key_cache=kv_cache[0],
+            value_cache=kv_cache[1],
+            slot_mapping=slots,
+        )
+        self.assertIs(actual_k_pe, kv_cache[1])
+        self.assertIs(actual_k_nope, kv_cache[0])
+
+    @patch("vllm_ascend.attention.mla_v1.DeviceOperator.reshape_and_cache")
+    @patch("vllm_ascend.attention.mla_v1.pseudo_quantize_fp4_per_block")
+    @patch("vllm_ascend.attention.mla_v1.torch_npu.npu_rms_norm", create=True)
+    def test_exec_kv_prefill_with_latent_only_pseudo_quant(
+        self,
+        mock_npu_rms_norm,
+        mock_pseudo_quant,
+        mock_reshape_and_cache,
+    ):
+        batch_size = 2
+        num_kv_heads = self.impl.num_kv_heads
+        kv_no_split = torch.randn(
+            batch_size,
+            num_kv_heads,
+            self.impl.kv_lora_rank + self.impl.qk_rope_head_dim,
+        )
+        k_nope = torch.randn(batch_size, num_kv_heads, self.impl.kv_lora_rank)
+        k_pe = torch.randn(batch_size, num_kv_heads, self.impl.qk_rope_head_dim)
+        quantized_k_nope = k_nope + 1
+        slots = torch.arange(batch_size)
+        kv_cache = [MagicMock(), MagicMock()]
+
+        self.impl.enable_mla_kv_pseudo_quant = True
+        self.impl.enable_mla_rope_k_pseudo_quant = False
+        self.impl.mla_kv_pseudo_quant_block_size = 16
+        self.impl.fa_quant_layer = False
+        self.impl.rope_single = MagicMock(return_value=k_pe)
+        mock_npu_rms_norm.return_value = (k_nope, MagicMock())
+        mock_pseudo_quant.return_value = quantized_k_nope
+
+        actual_k_pe, actual_k_nope = self.impl.exec_kv_prefill(
+            kv_no_split,
+            MagicMock(),
+            MagicMock(),
+            kv_cache,
+            slots,
+        )
+
+        mock_pseudo_quant.assert_called_once_with(k_nope, block_size=16)
+        mock_reshape_and_cache.assert_called_once_with(
+            key=quantized_k_nope,
+            value=k_pe,
+            key_cache=kv_cache[0],
+            value_cache=kv_cache[1],
+            slot_mapping=slots,
+        )
+        self.assertIs(actual_k_pe, k_pe)
+        self.assertIs(actual_k_nope, quantized_k_nope)
+
+    @patch("vllm_ascend.attention.mla_v1.torch.mul")
+    def test_quantize_mla_c8_cache_with_fp8_attention(self, mock_mul):
+        k_nope = MagicMock()
+        k_nope_float = MagicMock()
+        scaled_k_nope = MagicMock()
+        quantized_k_nope = MagicMock()
+        reciprocal = MagicMock()
+        cache_scale = MagicMock()
+        cache_scale.dtype = torch.float32
+        reciprocal.view.return_value = cache_scale
+        k_nope.to.return_value = k_nope_float
+        mock_mul.return_value = scaled_k_nope
+        scaled_k_nope.to.return_value = quantized_k_nope
+        self.impl.fa_quant_layer = True
+        self.impl.support_fp8_attention = True
+        self.impl.fak_descale_reciprocal = reciprocal
+
+        result = self.impl._quantize_mla_c8_cache(k_nope)
+
+        reciprocal.view.assert_called_once_with(1, -1, 1)
+        k_nope.to.assert_called_once_with(cache_scale.dtype)
+        mock_mul.assert_called_once_with(k_nope_float, cache_scale)
+        scaled_k_nope.to.assert_called_once_with(torch.float8_e4m3fn)
+        self.assertIs(result, quantized_k_nope)
 
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     @patch("torch_npu.npu_fused_infer_attention_score_v2")

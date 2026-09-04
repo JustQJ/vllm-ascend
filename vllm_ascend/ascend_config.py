@@ -254,6 +254,11 @@ class AscendConfig:
             "enable_prefill_mc2": false,
             "multistream_overlap_shared_expert": false,
             "enable_kv_nz": false,
+            "enable_mla_unfused_preprocess": false,
+            "enable_mla_kv_pseudo_quant": false,
+            "enable_mla_rope_k_pseudo_quant": false,
+            "mla_kv_pseudo_quant_block_size": 32,
+            "mla_rope_k_pseudo_quant_block_size": 32,
             "enable_mc2_hierarchy_comm": false,
             "enable_reduce_sample": false,
             "enable_dsa_cp": false,
@@ -388,6 +393,14 @@ class AscendConfig:
     enable_prefill_mc2: bool = False
     multistream_overlap_shared_expert: bool = False
     enable_kv_nz: bool = False
+    # Experimental classic-MLA preprocessing and C4 QDQ controls. The
+    # unfused switch selects explicit RMSNorm/RoPE/cache-scatter without
+    # enabling either pseudo-quantization switch.
+    enable_mla_unfused_preprocess: bool = False
+    enable_mla_kv_pseudo_quant: bool = False
+    enable_mla_rope_k_pseudo_quant: bool = False
+    mla_kv_pseudo_quant_block_size: int = 32
+    mla_rope_k_pseudo_quant_block_size: int = 32
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     enable_reduce_sample: bool = False
     enable_dsa_cp: bool = False

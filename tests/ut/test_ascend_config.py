@@ -189,6 +189,11 @@ class TestAscendConfig(TestBase):
         ascend_config = init_ascend_config(test_vllm_config)
         self.assertFalse(ascend_config.multistream_overlap_shared_expert)
         self.assertFalse(ascend_config.enable_kv_nz)
+        self.assertFalse(ascend_config.enable_mla_unfused_preprocess)
+        self.assertFalse(ascend_config.enable_mla_kv_pseudo_quant)
+        self.assertFalse(ascend_config.enable_mla_rope_k_pseudo_quant)
+        self.assertEqual(ascend_config.mla_kv_pseudo_quant_block_size, 32)
+        self.assertEqual(ascend_config.mla_rope_k_pseudo_quant_block_size, 32)
         self.assertEqual(ascend_config.weight_nz_mode, 1)
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
@@ -234,6 +239,11 @@ class TestAscendConfig(TestBase):
             "eplb_config": {"num_redundant_experts": 2},
             "refresh": True,
             "enable_kv_nz": False,
+            "enable_mla_unfused_preprocess": True,
+            "enable_mla_kv_pseudo_quant": True,
+            "enable_mla_rope_k_pseudo_quant": True,
+            "mla_kv_pseudo_quant_block_size": 64,
+            "mla_rope_k_pseudo_quant_block_size": 16,
             "xlite_graph_config": {"enabled": False, "full_mode": True},
             "finegrained_tp_config": {"lmhead_tensor_parallel_size": "0"},
         }
@@ -244,6 +254,11 @@ class TestAscendConfig(TestBase):
         ascend_compilation_config = ascend_config.ascend_compilation_config
         self.assertFalse(ascend_compilation_config.fuse_norm_quant)
         self.assertFalse(ascend_config.enable_kv_nz)
+        self.assertTrue(ascend_config.enable_mla_unfused_preprocess)
+        self.assertTrue(ascend_config.enable_mla_kv_pseudo_quant)
+        self.assertTrue(ascend_config.enable_mla_rope_k_pseudo_quant)
+        self.assertEqual(ascend_config.mla_kv_pseudo_quant_block_size, 64)
+        self.assertEqual(ascend_config.mla_rope_k_pseudo_quant_block_size, 16)
         self.assertTrue(ascend_compilation_config.enable_npugraph_ex)
         self.assertFalse(ascend_compilation_config.enable_static_kernel)
 

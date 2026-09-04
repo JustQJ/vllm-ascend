@@ -25,6 +25,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.pseudo_quant import pseudo_quantize_fp4_per_block
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     ascend_chunked_prefill_workspace_size,
@@ -856,6 +857,15 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         ascend_config = get_ascend_config()
         self.enable_kv_nz = ascend_config.enable_kv_nz
+        self.enable_mla_unfused_preprocess = ascend_config.enable_mla_unfused_preprocess
+        self.enable_mla_kv_pseudo_quant = ascend_config.enable_mla_kv_pseudo_quant
+        self.enable_mla_rope_k_pseudo_quant = ascend_config.enable_mla_rope_k_pseudo_quant
+        self.mla_kv_pseudo_quant_block_size = ascend_config.mla_kv_pseudo_quant_block_size
+        self.mla_rope_k_pseudo_quant_block_size = ascend_config.mla_rope_k_pseudo_quant_block_size
+        if self.mla_kv_pseudo_quant_block_size <= 0:
+            raise ValueError("mla_kv_pseudo_quant_block_size must be greater than 0")
+        if self.mla_rope_k_pseudo_quant_block_size <= 0:
+            raise ValueError("mla_rope_k_pseudo_quant_block_size must be greater than 0")
 
         self.ring_mla_mask_size = 512
 
@@ -1171,6 +1181,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             and self.vllm_config.kv_transfer_config.is_kv_consumer
             and self.vllm_config.scheduler_config.max_num_batched_tokens <= MLAPO_MAX_SUPPORTED_TOKENS
             and not ascend_config.mlapo_keep_prefill_weights
+            and not self._requires_unfused_mla_preprocess()
         ):
             self.fused_qkv_a_proj.weight = None  # type: ignore[union-attr]
             self.fused_qkv_a_proj.deq_scale = None  # type: ignore[union-attr]
@@ -1179,6 +1190,14 @@ class AscendMLAImpl(MLAAttentionImpl):
             self.q_proj.deq_scale = None
             self.q_proj.quant_bias = None
             torch.npu.empty_cache()
+
+    def _requires_unfused_mla_preprocess(self) -> bool:
+        """Whether MLA preprocessing must expose Q/KV intermediates."""
+        return (
+            self.enable_mla_unfused_preprocess
+            or self.enable_mla_kv_pseudo_quant
+            or self.enable_mla_rope_k_pseudo_quant
+        )
 
     def get_context_seq_len_npu(self, index: int, attn_metadata: AscendMLAMetadata):
         prefill_metadata = attn_metadata.prefill
@@ -1424,6 +1443,16 @@ class AscendMLAImpl(MLAAttentionImpl):
             return kv_cache[1], kv_cache[0]
 
         assert self.kv_a_layernorm is not None
+        if self._requires_unfused_mla_preprocess():
+            return self._exec_kv_unfused(
+                kv_no_split,
+                cos,
+                sin,
+                kv_cache,
+                slots,
+                return_current_kv=False,
+            )
+
         B = kv_no_split.shape[0]
         N = self.num_kv_heads
         S = 1
@@ -1461,6 +1490,16 @@ class AscendMLAImpl(MLAAttentionImpl):
             return self._exec_kv_no_rope(kv_no_split, kv_cache, slots)
 
         assert self.kv_a_layernorm is not None
+        if self._requires_unfused_mla_preprocess():
+            return self._exec_kv_unfused(
+                kv_no_split,
+                cos,
+                sin,
+                kv_cache,
+                slots,
+                return_current_kv=True,
+            )
+
         B = kv_no_split.shape[0]
         N = self.num_kv_heads
         S = 1
@@ -1484,6 +1523,86 @@ class AscendMLAImpl(MLAAttentionImpl):
             is_output_kv=True,
         )
         return k_pe, k_nope
+
+    def _exec_kv_unfused(
+        self,
+        kv_no_split: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        kv_cache: tuple,
+        slots: torch.Tensor,
+        return_current_kv: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run explicit MLA KV preprocessing with optional C4 QDQ."""
+        assert self.kv_a_layernorm is not None
+
+        batch_size = kv_no_split.shape[0]
+        kv_no_split = kv_no_split.view(
+            batch_size,
+            self.num_kv_heads,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+        )
+        k_nope, k_pe = kv_no_split.split(
+            [self.kv_lora_rank, self.qk_rope_head_dim],
+            dim=-1,
+        )
+        k_nope, _ = torch_npu.npu_rms_norm(
+            k_nope,
+            self.kv_a_layernorm.weight,  # type: ignore[union-attr]
+            epsilon=self.kv_a_layernorm.variance_epsilon,  # type: ignore[union-attr]
+        )
+        k_pe = self.rope_single(k_pe, cos, sin)
+        k_nope, k_pe = self._pseudo_quantize_mla_kv(k_nope, k_pe)
+        cache_k_nope = self._quantize_mla_c8_cache(k_nope)
+
+        DeviceOperator.reshape_and_cache(
+            key=cache_k_nope,
+            value=k_pe,
+            key_cache=kv_cache[0],
+            value_cache=kv_cache[1],
+            slot_mapping=slots,
+        )
+        if return_current_kv:
+            return k_pe, k_nope
+        return kv_cache[1], kv_cache[0]
+
+    def _pseudo_quantize_mla_kv(
+        self,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.enable_mla_kv_pseudo_quant:
+            logger.info_once(
+                "Pseudo-quantizing MLA latent c_KV with block size %d",
+                self.mla_kv_pseudo_quant_block_size,
+            )
+            k_nope = pseudo_quantize_fp4_per_block(
+                k_nope,
+                block_size=self.mla_kv_pseudo_quant_block_size,
+            )
+        if self.enable_mla_rope_k_pseudo_quant:
+            logger.info_once(
+                "Pseudo-quantizing MLA RoPE k_R with block size %d",
+                self.mla_rope_k_pseudo_quant_block_size,
+            )
+            k_pe = pseudo_quantize_fp4_per_block(
+                k_pe,
+                block_size=self.mla_rope_k_pseudo_quant_block_size,
+            )
+        return k_nope, k_pe
+
+    def _quantize_mla_c8_cache(self, k_nope: torch.Tensor) -> torch.Tensor:
+        """Convert the explicit latent KV result to the A5 FP8 cache."""
+        if not self.fa_quant_layer:
+            return k_nope
+        if not self.support_fp8_attention:
+            raise NotImplementedError("Explicit MLA C8 preprocessing only supports A5 FP8 attention")
+
+        cache_scale = self.fak_descale_reciprocal.view(1, -1, 1)
+        return torch.mul(
+            k_nope.to(cache_scale.dtype),
+            cache_scale,
+        ).to(torch.float8_e4m3fn)
 
     def rope_single(
         self,
@@ -1969,7 +2088,8 @@ class AscendMLAImpl(MLAAttentionImpl):
             HardwareCapability.MLA_DECODE_PROLOG_WITHOUT_ROPE
         )
         if (
-            (self.fa_quant_layer or self.enable_mlapo)
+            not self._requires_unfused_mla_preprocess()
+            and (self.fa_quant_layer or self.enable_mlapo)
             and can_use_decode_prolog
             and attn_metadata.num_decode_tokens <= MLAPO_MAX_SUPPORTED_TOKENS
             and attn_metadata.num_prefills == 0
