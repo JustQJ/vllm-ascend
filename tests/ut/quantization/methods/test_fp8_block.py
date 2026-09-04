@@ -186,6 +186,29 @@ class TestAscendFp8BlockLinearMethod(TestBase):
         self.assertEqual(layer.weight.dtype, torch.bfloat16)
         expected = reference_resolve(weight, scale_inv, 4, 32, torch.bfloat16)
         self.assertTrue(torch.equal(layer.weight.data, expected))
+        # The MXFP8 helper is dropped so apply() serves this layer dense.
+        self.assertIsNone(scheme.mxfp8_method)
+
+    def test_apply_serves_dense_absorbed_layer_with_unquantized_gemm_on_950(self):
+        # Dense MLA never disposes kv_b_proj: prefill runs it directly and
+        # upstream's dequant fallback feeds it an identity matrix while
+        # absorbing. The layer was left dense, so routing it to MXFP8 would
+        # read a weight_scale that was never created.
+        scheme = self.build_scheme(is_950=True, block_size=(4, 32))
+        layer, _, _ = self._make_layer()
+        layer.prefix = "model.layers.0.self_attn.kv_b_proj"
+
+        with (
+            patch(f"{MODULE}.maybe_trans_nz", side_effect=lambda tensor: tensor),
+            patch(f"{MODULE}.torch_npu"),
+        ):
+            scheme.process_weights_after_loading(layer)
+        self.assertIsNone(scheme.mxfp8_method)
+
+        x = torch.randn(2, 64)
+        with patch("torch.ops.vllm.unquantized_gemm", return_value="gemm") as mock_gemm:
+            self.assertEqual(scheme.apply(layer, x), "gemm")
+        mock_gemm.assert_called_once_with(x, layer.weight, None)
 
     def test_falls_back_when_reduction_dim_is_not_mx_aligned(self):
         scheme = self.build_scheme(is_950=True, block_size=(4, 32))

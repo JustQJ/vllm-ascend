@@ -1728,7 +1728,7 @@ class TestAscendMLAImpl(TestBase):
         layer.quant_method = quant_method
         shape_0 = self.impl.num_heads * (self.impl.qk_nope_head_dim + self.impl.v_head_dim)
         shape_1 = self.impl.kv_lora_rank
-        layer.weight = torch.randn(shape_0, shape_1)
+        layer.weight = torch.randn(shape_0, shape_1, dtype=torch.bfloat16)
         self.impl.kv_b_proj = layer
         mock_format_cast.return_value = layer.weight
         self.impl.process_weights_after_loading(torch.bfloat16)
@@ -1750,7 +1750,7 @@ class TestAscendMLAImpl(TestBase):
         layer.quant_method = quant_method
         shape_0 = self.impl.num_heads * (self.impl.qk_nope_head_dim + self.impl.v_head_dim)
         shape_1 = self.impl.kv_lora_rank
-        layer.weight = torch.randn(shape_0, shape_1)
+        layer.weight = torch.randn(shape_0, shape_1, dtype=torch.bfloat16)
         self.impl.kv_b_proj = layer
         mock_format_cast.return_value = layer.weight
 
@@ -1776,7 +1776,7 @@ class TestAscendMLAImpl(TestBase):
         layer.quant_method = quant_method
         shape_0 = self.impl.num_heads * (self.impl.qk_nope_head_dim + self.impl.v_head_dim)
         shape_1 = self.impl.kv_lora_rank
-        layer.weight = torch.randn(shape_0, shape_1)
+        layer.weight = torch.randn(shape_0, shape_1, dtype=torch.bfloat16)
         self.impl.kv_b_proj = layer
         mock_format_cast.return_value = layer.weight
         self.impl.enable_mlapo = True
@@ -1817,7 +1817,7 @@ class TestAscendMLAImpl(TestBase):
         layer.quant_method = quant_method
         shape_0 = self.impl.num_heads * (self.impl.qk_nope_head_dim + self.impl.v_head_dim)
         shape_1 = self.impl.kv_lora_rank
-        layer.weight = torch.randn(shape_0, shape_1)
+        layer.weight = torch.randn(shape_0, shape_1, dtype=torch.bfloat16)
         self.impl.kv_b_proj = layer
         mock_format_cast.return_value = layer.weight
 
@@ -1857,7 +1857,7 @@ class TestAscendMLAImpl(TestBase):
         layer.quant_method = quant_method
         shape_0 = self.impl.num_heads * (self.impl.qk_nope_head_dim + self.impl.v_head_dim)
         shape_1 = self.impl.kv_lora_rank
-        layer.weight = torch.randn(shape_0, shape_1)
+        layer.weight = torch.randn(shape_0, shape_1, dtype=torch.bfloat16)
         self.impl.kv_b_proj = layer
         mock_format_cast.return_value = layer.weight
 
@@ -1888,7 +1888,34 @@ class TestAscendMLAImpl(TestBase):
         layer.quant_method = quant_method
         shape_0 = self.impl.num_heads * (self.impl.qk_nope_head_dim + self.impl.v_head_dim)
         shape_1 = self.impl.kv_lora_rank
-        layer.weight = torch.randn(shape_0, shape_1)
+        layer.weight = torch.randn(shape_0, shape_1, dtype=torch.bfloat16)
+        self.impl.kv_b_proj = layer
+        mock_format_cast.return_value = layer.weight
+
+        self.impl.enable_mlapo = False
+        self.impl.fa_quant_layer = False
+
+        self.impl.process_weights_after_loading(torch.bfloat16)
+
+        self.assertEqual(self.impl.W_UK_T.shape[0], self.impl.num_heads)
+        self.assertEqual(self.impl.W_UK_T.shape[1], self.impl.qk_nope_head_dim)
+        self.assertEqual(self.impl.W_UK_T.shape[2], self.impl.kv_lora_rank)
+
+        self.assertEqual(self.impl.W_UV.shape[0], self.impl.num_heads)
+        self.assertEqual(self.impl.W_UV.shape[1], self.impl.kv_lora_rank)
+        self.assertEqual(self.impl.W_UV.shape[2], self.impl.v_head_dim)
+
+    @patch("torch_npu.npu_format_cast")
+    def test_process_weights_after_loading_accepts_dense_quantized_kv_b_proj(self, mock_format_cast):
+        # Native block-wise FP8 checkpoints resolve kv_b_proj to a dense
+        # bfloat16 weight under an AscendLinearMethod wrapper; the absorb
+        # path needs the dense weight, not an UnquantizedLinearMethod.
+        layer = MagicMock(spec=LinearBase)
+        layer.input_size_per_partition = 10
+        layer.quant_method = MagicMock()  # any wrapper that left dense weights
+        shape_0 = self.impl.num_heads * (self.impl.qk_nope_head_dim + self.impl.v_head_dim)
+        shape_1 = self.impl.kv_lora_rank
+        layer.weight = torch.randn(shape_0, shape_1, dtype=torch.bfloat16)
         self.impl.kv_b_proj = layer
         mock_format_cast.return_value = layer.weight
 
