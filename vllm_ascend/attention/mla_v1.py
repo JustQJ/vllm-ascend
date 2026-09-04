@@ -1534,6 +1534,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         return_current_kv: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run explicit MLA KV preprocessing with optional C4 QDQ."""
+        logger.info_once("=======> Running unfused MLA KV preprocessing")
         assert self.kv_a_layernorm is not None
 
         batch_size = kv_no_split.shape[0]
