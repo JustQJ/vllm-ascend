@@ -18,9 +18,11 @@
 #define TURBOQUANT_SPARSE_FLASH_ATTENTION_TORCH_ADPT_H
 
 #include <limits>
+#include "turbo_quant_group_plan.h"
 
 namespace vllm_ascend {
 
+template <bool GROUP_PROTOTYPE = false>
 std::tuple<at::Tensor, at::Tensor, at::Tensor> turboquant_sparse_flash_attention(
     const at::Tensor &query, const at::Tensor &key, const at::Tensor &value,
     const at::Tensor &sparse_indices,
@@ -142,6 +144,22 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> turboquant_sparse_flash_attention
     at::Tensor softmax_max = at::empty(softmax_size, query.options().dtype(at::kFloat));
     at::Tensor softmax_sum = at::empty(softmax_size, query.options().dtype(at::kFloat));
 
+    c10::optional<at::Tensor> group_desc, union_ids, owners;
+    if constexpr (GROUP_PROTOTYPE) {
+        const int64_t topk = sparse_indices.size(2);
+        // Shape-only dispatch: replay may change all lengths, IDs and grouping decisions.
+        const uint64_t bytesPerToken = topk > 0 ? uint64_t(topk) * 5 + tq_group::DESC_WORDS * 4 : 0;
+        const bool fits = bytesPerToken > 0 && uint64_t(query.size(0)) <= tq_group::MAX_METADATA_BYTES / bytesPerToken;
+        if (query.size(1) == tq_group::GROUP_HEADS && sparse_block_size == 1 &&
+            topk > 0 && topk <= tq_group::MAX_TOPK && fits) {
+            group_desc = at::empty({query.size(0), tq_group::DESC_WORDS}, query.options().dtype(at::kInt));
+            union_ids = at::empty({query.size(0), topk}, query.options().dtype(at::kInt));
+            owners = at::empty({query.size(0), topk}, query.options().dtype(at::kByte));
+            EXEC_NPU_CMD(aclnnTurboQuantGroupPrepare, sparse_indices, actual_seq_lengths_query,
+                         actual_seq_lengths_kv, sparse_mode, *group_desc, *union_ids, *owners);
+        }
+    }
+
     EXEC_NPU_CMD(aclnnTurboQuantSparseFlashAttention,
                  query,
                  key,
@@ -152,6 +170,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> turboquant_sparse_flash_attention
                  block_table,
                  actual_seq_lengths_query,
                  actual_seq_lengths_kv,
+                 group_desc,
+                 union_ids,
+                 owners,
                  scale_value,
                  key_quant_mode,
                  value_quant_mode,

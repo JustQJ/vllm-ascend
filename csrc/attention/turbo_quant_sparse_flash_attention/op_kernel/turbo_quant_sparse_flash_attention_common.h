@@ -17,6 +17,8 @@
 #define TURBOQUANT_SPARSE_FLASH_ATTENTION_COMMON_H
 
 #include "kernel_operator.h"
+#define TQ_GROUP_INLINE __aicore__ inline
+#include "../turbo_quant_group_plan.h"
 #include "kernel_tiling/kernel_tiling.h"
 #include "lib/matmul_intf.h"
 #include "lib/matrix/matmul/tiling.h"
@@ -88,6 +90,8 @@ __aicore__ inline T1 Min(T1 a, T2 b)
 }
 
 struct RunInfo {
+    uint32_t groupSize = 1;
+    uint64_t groupUnionOffset = 0;
     uint32_t loop;
     uint32_t bIdx;
     uint32_t gIdx;
@@ -183,6 +187,7 @@ struct ConstInfo {
     uint32_t sparseMode = 0;
     bool needInit = false;
     bool returnSoftmaxLse = false;
+    bool groupEnabled = false;
 
     // FlashDecoding
     uint64_t combineLseOffset = 0ULL;

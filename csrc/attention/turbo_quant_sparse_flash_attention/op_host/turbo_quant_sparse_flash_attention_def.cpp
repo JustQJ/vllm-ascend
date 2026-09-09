@@ -63,6 +63,13 @@ public:
             .DataType({ge::DT_INT32})
             .Format({ge::FORMAT_ND})
             .AutoContiguous();
+        // Internal fixed-capacity metadata, supplied only by the grouped prototype launcher.
+        for (const char *input : {"group_descriptors", "group_union_ids"}) {
+            this->Input(input).ParamType(OPTIONAL).DataType({ge::DT_INT32})
+                .Format({ge::FORMAT_ND}).AutoContiguous();
+        }
+        this->Input("group_owners").ParamType(OPTIONAL).DataType({ge::DT_UINT8})
+            .Format({ge::FORMAT_ND}).AutoContiguous();
         this->Output("attention_out").ParamType(REQUIRED).DataType({ge::DT_BF16}).Format({ge::FORMAT_ND});
         this->Output("softmax_max").ParamType(REQUIRED).DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND});
         this->Output("softmax_sum").ParamType(REQUIRED).DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND});

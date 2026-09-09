@@ -275,7 +275,7 @@ void TQSFAMlaTiling::InitParams()
 
 void TQSFAMlaTiling::CalcUbBmm()
 {
-    uint32_t qsfaCubeMSize = qsfaInfo_->gSize * qsfaInfo_->s1Size;
+    uint32_t qsfaCubeMSize = groupEnabled_ ? tq_group::MAX_GROUP_M : qsfaInfo_->gSize * qsfaInfo_->s1Size;
     uint32_t qsfaMaxMSize = mBaseSize_;
     if (qsfaCubeMSize > qsfaMaxMSize) {
         qsfaCubeMSize = qsfaMaxMSize;
@@ -301,7 +301,7 @@ void TQSFAMlaTiling::CalcInnerSize(uint32_t qsfaS2Size)
     }
 
     sInnerLoopTimes_ = (qsfaS2Size + sInnerSize_ - 1) / sInnerSize_;
-    if (sInnerSize_ > qsfaS2Size) {
+    if (!groupEnabled_ && sInnerSize_ > qsfaS2Size) {
         sInnerSize_ = qsfaS2Size;
     }
     sInnerSizeAlign_ = Align(sInnerSize_, BYTE_BLOCK); // 元素个数按照基本块大小对齐
@@ -347,6 +347,7 @@ void TQSFAMlaTiling::FillTilingBaseParamsMla()
     tilingData_.baseParams.set_isActualLenDimsNull(qsfaInfo_->actualQSeqLenFlag ? 0U : 1U);
     tilingData_.baseParams.set_isActualLenDimsKVNull(qsfaInfo_->actualSeqLenFlag ? 0U : 1U);
     tilingData_.baseParams.set_returnSoftmaxLse(qsfaInfo_->returnSoftmaxLse ? 1U : 0U);
+    tilingData_.baseParams.set_groupEnabled(groupEnabled_ ? 1U : 0U);
 }
 
 // for flash decode
@@ -444,6 +445,33 @@ void TQSFAMlaTiling::CalcBlockDim()
 ge::graphStatus TQSFAMlaTiling::DoOpTiling(TQSFATilingInfo *qsfaInfo)
 {
     qsfaInfo_ = qsfaInfo;
+    constexpr uint32_t GROUP_DESC_INPUT = 9;
+    const auto *groupShape = context_->GetOptionalInputShape(GROUP_DESC_INPUT);
+    const auto *unionShape = context_->GetOptionalInputShape(GROUP_DESC_INPUT + 1);
+    const auto *ownerShape = context_->GetOptionalInputShape(GROUP_DESC_INPUT + 2);
+    groupEnabled_ = groupShape != nullptr;
+    if (groupEnabled_ || unionShape != nullptr || ownerShape != nullptr) {
+        if (!groupEnabled_ || unionShape == nullptr || ownerShape == nullptr ||
+            qsfaInfo_->gSize != tq_group::GROUP_HEADS || qsfaInfo_->sparseBlockSize != 1 ||
+            qsfaInfo_->sparseBlockCount == 0 || qsfaInfo_->sparseBlockCount > tq_group::MAX_TOPK ||
+            qsfaInfo_->s1Size > INT32_MAX) {
+            return ge::GRAPH_FAILED;
+        }
+        const auto &d = groupShape->GetStorageShape();
+        const auto &u = unionShape->GetStorageShape();
+        const auto &o = ownerShape->GetStorageShape();
+        if (d.GetDimNum() != 2 || d.GetDim(0) != qsfaInfo_->s1Size || d.GetDim(1) != tq_group::DESC_WORDS ||
+            u.GetDimNum() != 2 || u.GetDim(0) != qsfaInfo_->s1Size || u.GetDim(1) != qsfaInfo_->sparseBlockCount ||
+            o.GetDimNum() != 2 || o.GetDim(0) != u.GetDim(0) || o.GetDim(1) != u.GetDim(1)) {
+            return ge::GRAPH_FAILED;
+        }
+        for (uint32_t i = 0; i < 3; ++i) {
+            const auto *desc = context_->GetOptionalInputDesc(GROUP_DESC_INPUT + i);
+            if (desc == nullptr || desc->GetDataType() != (i == 2 ? ge::DT_UINT8 : ge::DT_INT32)) {
+                return ge::GRAPH_FAILED;
+            }
+        }
+    }
     if (GetPlatformInfo() != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }

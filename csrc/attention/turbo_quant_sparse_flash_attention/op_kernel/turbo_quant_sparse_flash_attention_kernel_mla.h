@@ -67,7 +67,9 @@ public:
     __aicore__ inline void Init(__gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_t *value,
                                 __gm__ uint8_t *sparseIndices, __gm__ uint8_t *keyScale, __gm__ uint8_t *valueScale,
                                 __gm__ uint8_t *blockTable, __gm__ uint8_t *actualSeqLengthsQ,
-                                __gm__ uint8_t *actualSeqLengths, __gm__ uint8_t *attentionOut,
+                                __gm__ uint8_t *actualSeqLengths, __gm__ uint8_t *groupDescriptors,
+                                __gm__ uint8_t *groupUnionIds, __gm__ uint8_t *groupOwners,
+                                __gm__ uint8_t *attentionOut,
                                 __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum, __gm__ uint8_t *workspace,
                                 const TurboQuantSparseFlashAttentionTilingDataMla *__restrict tiling,
                                 __gm__ uint8_t *gmTiling, TPipe *tPipe);
@@ -136,6 +138,7 @@ private:
     GlobalTensor<int32_t> blockTableGm;
     GlobalTensor<int32_t> topKGm;
 
+    GlobalTensor<int32_t> groupDescriptorsGm;
     GlobalTensor<int32_t> actualSeqLengthsQGm;
     GlobalTensor<int32_t> actualSeqLengthsKVGm;
 
@@ -163,6 +166,8 @@ private:
     __aicore__ inline void InitOutputSingleCore();
     // ================================Process functions================================
     __aicore__ inline void ProcessBalance();
+    __aicore__ inline void ProcessGroups();
+    __aicore__ inline void ExecutePipeline(uint32_t loop, RunInfo extraInfo[QSFA_PRELOAD_TASK_CACHE_SIZE]);
     __aicore__ inline void PreloadPipeline(uint32_t loop, uint64_t s2Start, uint64_t s2LoopIdx,
                                            RunInfo extraInfo[QSFA_PRELOAD_TASK_CACHE_SIZE]);
     // ================================Offset Calc=====================================
@@ -216,6 +221,7 @@ __aicore__ inline void TurboQuantSparseFlashAttentionMla<QSFAT>::InitTilingData(
     constInfo.valueQuantMode = static_cast<QUANT_MODE>(tilingData->baseParams.valueQuantMode);
     constInfo.tileSize = tilingData->baseParams.tileSize;
     constInfo.returnSoftmaxLse = (tilingData->baseParams.returnSoftmaxLse != 0);
+    constInfo.groupEnabled = (tilingData->baseParams.groupEnabled != 0);
     constInfo.combineHeadDim = (constInfo.quantScaleRepoMode == QUANT_SCALE_REPO_MODE::COMBINE) ?
                                    constInfo.headDim + constInfo.headDimRope :
                                    constInfo.headDim;
@@ -413,7 +419,9 @@ template <typename QSFAT>
 __aicore__ inline void TurboQuantSparseFlashAttentionMla<QSFAT>::Init(
     __gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_t *value, __gm__ uint8_t *sparseIndices,
     __gm__ uint8_t *keyScale, __gm__ uint8_t *valueScale, __gm__ uint8_t *blockTable, __gm__ uint8_t *actualSeqLengthsQ,
-    __gm__ uint8_t *actualSeqLengths, __gm__ uint8_t *attentionOut, __gm__ uint8_t *softmaxMax,
+    __gm__ uint8_t *actualSeqLengths, __gm__ uint8_t *groupDescriptors,
+    __gm__ uint8_t *groupUnionIds, __gm__ uint8_t *groupOwners,
+    __gm__ uint8_t *attentionOut, __gm__ uint8_t *softmaxMax,
     __gm__ uint8_t *softmaxSum, __gm__ uint8_t *workspace,
     const TurboQuantSparseFlashAttentionTilingDataMla *__restrict tiling, __gm__ uint8_t *gmTiling, TPipe *tPipe)
 {
@@ -432,7 +440,11 @@ __aicore__ inline void TurboQuantSparseFlashAttentionMla<QSFAT>::Init(
     InitActualSeqLen(actualSeqLengthsQ, actualSeqLengths);
 
     // 初始化计算参数
-    InitCalcParamsEach();
+    if (!constInfo.groupEnabled) {
+        InitCalcParamsEach();
+    } else {
+        groupDescriptorsGm.SetGlobalBuffer((__gm__ int32_t *)groupDescriptors);
+    }
     keyPtr = key;
     valuePtr = value;
     pipe = tPipe;
@@ -505,6 +517,9 @@ __aicore__ inline void TurboQuantSparseFlashAttentionMla<QSFAT>::Init(
 
     if ASCEND_IS_AIV {
         vectorService.InitParams(constInfo, tilingData);
+        if (constInfo.groupEnabled) {
+            vectorService.InitGroupTensors(groupUnionIds, groupOwners);
+        }
         vectorService.InitMm2ResInt32GmGlobalTensor(mm2ResInt32Gm);
         if constexpr (TEMPLATE_MODE == V_TEMPLATE) {
             vectorService.InitVec0GlobalTensor(kvValidSizeGm_, kvMergeGm_, kRopeGm, keyGm, blockTableGm);
@@ -772,7 +787,11 @@ __aicore__ inline void TurboQuantSparseFlashAttentionMla<QSFAT>::Process()
             vectorService.AllocEventID();
             vectorService.InitSoftmaxDefaultBuffer();
         }
-        ProcessBalance();
+        if (constInfo.groupEnabled) {
+            ProcessGroups();
+        } else {
+            ProcessBalance();
+        }
 
         if ASCEND_IS_AIC {
             matmulService.FreeEventID();
@@ -788,6 +807,89 @@ __aicore__ inline void TurboQuantSparseFlashAttentionMla<QSFAT>::GetBN2Idx(uint3
 {
     bIdx = bN2Idx / kvHeadNum;
     n2Idx = bN2Idx % kvHeadNum;
+}
+
+// Prototype scheduler: descriptors are indexed by original token position.
+// All three subcores traverse identical slots. A group is never split across
+// AICs, and draining two pipeline stages at group boundaries keeps online
+// softmax state ownership explicit. Later tuning can overlap adjacent groups.
+template <typename QSFAT>
+__aicore__ inline void TurboQuantSparseFlashAttentionMla<QSFAT>::ProcessGroups()
+{
+    RunInfo extraInfo[QSFA_PRELOAD_TASK_CACHE_SIZE];
+    uint32_t loop = 0;
+    if ASCEND_IS_AIC {
+        for (uint32_t i = 0; i < 4; ++i) {
+            CrossCoreSetFlag<ConstInfo::QSFA_SYNC_MODE2, PIPE_MTE2>(3);
+        }
+    }
+    // Distribute four-query address ranges, not token modulo core count:
+    // otherwise leaders at 0,4,8,... would leave 3/4 of the cores idle.
+    const uint32_t queryBlocks = (constInfo.qSeqSize + tq_group::MAX_GROUP - 1) / tq_group::MAX_GROUP;
+    for (uint32_t queryBlock = aiCoreIdx; queryBlock < queryBlocks; queryBlock += GetBlockNum()) {
+        const uint32_t endToken = Min(uint64_t((queryBlock + 1) * tq_group::MAX_GROUP), constInfo.qSeqSize);
+        for (uint32_t token = queryBlock * tq_group::MAX_GROUP; token < endToken; ++token) {
+            const uint64_t base = uint64_t(token) * tq_group::DESC_WORDS;
+            const int32_t kind = groupDescriptorsGm.GetValue(base + tq_group::KIND);
+            if (kind == tq_group::SKIP) {
+                continue;
+            }
+            const uint32_t groupSize = groupDescriptorsGm.GetValue(base + tq_group::SIZE);
+            const int32_t batch = groupDescriptorsGm.GetValue(base + tq_group::BATCH);
+            const uint32_t localStart = groupDescriptorsGm.GetValue(base + tq_group::LOCAL_START);
+            if (kind == tq_group::ZERO) {
+                // One writer; use original TND offsets even for capacity-only padding.
+                if ASCEND_IS_AIV {
+                    if (GetSubBlockIdx() == 0) {
+                        matmul::InitOutput<OUT_T>(attentionOutGm[uint64_t(token) * constInfo.gSize * constInfo.headDim],
+                                                 groupSize * constInfo.gSize * constInfo.headDim, 0);
+                        if (constInfo.returnSoftmaxLse) {
+                            matmul::InitOutput<T>(softmaxMaxGm[uint64_t(token) * constInfo.gSize],
+                                                 groupSize * constInfo.gSize, -2e38f);
+                            matmul::InitOutput<T>(softmaxSumGm[uint64_t(token) * constInfo.gSize],
+                                                 groupSize * constInfo.gSize, 0);
+                        }
+                    }
+                }
+                continue;
+            }
+            tempLoopInfo.bIdx = batch;
+            tempLoopInfo.n2Idx = 0;
+            tempLoopInfo.gS1Idx = localStart * constInfo.gSize;
+            GetActualSeqLen(batch);
+            GetPreNextTokensLeftUp();
+            if (kind == tq_group::GROUP) {
+                tempLoopInfo.curActualSeqLen = groupDescriptorsGm.GetValue(base + tq_group::LENGTH);
+            } else {
+                GetSparseActualSeqLen(batch, localStart, 0);
+            }
+            if (tempLoopInfo.curActualSeqLen == 0) {
+                DealActSeqLenIsZero(batch, localStart, 0);
+                continue;
+            }
+            tempLoopInfo.s2LoopTimes = (tempLoopInfo.curActualSeqLen + constInfo.s2BaseSize - 1) / constInfo.s2BaseSize;
+            tempLoopInfo.mBasicSizeTail = constInfo.gSize;
+            tempLoopInfo.tndIsS2SplitCore = false;
+            tempLoopInfo.tndCoreStartKVSplitPos = 0;
+            for (uint32_t tile = 0; tile < tempLoopInfo.s2LoopTimes + 2; ++tile, ++loop) {
+                RunInfo &info = extraInfo[loop % QSFA_PRELOAD_TASK_CACHE_SIZE];
+                info.isValid = tile < tempLoopInfo.s2LoopTimes;
+                if (info.isValid) {
+                    CalcParams(loop, 0, tile, info);
+                    info.groupSize = kind == tq_group::GROUP ? groupSize : 1;
+                    info.groupUnionOffset = uint64_t(token) * constInfo.sparseBlockCount;
+                    info.actMBaseSize = groupSize * constInfo.gSize;
+                    CalcMSizeInfo(info);
+                }
+                ExecutePipeline(loop, extraInfo);
+            }
+        }
+    }
+    if ASCEND_IS_AIV {
+        for (uint32_t i = 0; i < 4; ++i) {
+            CrossCoreWaitFlag(3);
+        }
+    }
 }
 
 template <typename QSFAT>
@@ -859,11 +961,17 @@ template <typename QSFAT>
 __aicore__ inline void TurboQuantSparseFlashAttentionMla<QSFAT>::PreloadPipeline(
     uint32_t loop, uint64_t s2Start, uint64_t s2LoopIdx, RunInfo extraInfo[QSFA_PRELOAD_TASK_CACHE_SIZE])
 {
-    RunInfo &extraInfo0 = extraInfo[loop % QSFA_PRELOAD_TASK_CACHE_SIZE];       // 本轮任务
-    RunInfo &extraInfo2 = extraInfo[(loop + 2) % QSFA_PRELOAD_TASK_CACHE_SIZE]; // 上一轮任务
-    RunInfo &extraInfo1 = extraInfo[(loop + 1) % QSFA_PRELOAD_TASK_CACHE_SIZE]; // 上两轮任务
+    CalcParams(loop, s2Start, s2LoopIdx, extraInfo[loop % QSFA_PRELOAD_TASK_CACHE_SIZE]);
+    ExecutePipeline(loop, extraInfo);
+}
 
-    CalcParams(loop, s2Start, s2LoopIdx, extraInfo0);
+template <typename QSFAT>
+__aicore__ inline void TurboQuantSparseFlashAttentionMla<QSFAT>::ExecutePipeline(
+    uint32_t loop, RunInfo extraInfo[QSFA_PRELOAD_TASK_CACHE_SIZE])
+{
+    RunInfo &extraInfo0 = extraInfo[loop % QSFA_PRELOAD_TASK_CACHE_SIZE];
+    RunInfo &extraInfo2 = extraInfo[(loop + 2) % QSFA_PRELOAD_TASK_CACHE_SIZE];
+    RunInfo &extraInfo1 = extraInfo[(loop + 1) % QSFA_PRELOAD_TASK_CACHE_SIZE];
 
     if (extraInfo0.isValid) {
         if ASCEND_IS_AIC {

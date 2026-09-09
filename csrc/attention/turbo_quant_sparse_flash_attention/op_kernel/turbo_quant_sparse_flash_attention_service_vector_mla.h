@@ -78,6 +78,14 @@ public:
                                    uint32_t dealRowCount, uint32_t columnCount, uint32_t actualColumnCount);
     // ================================Vector0==========================================
     __aicore__ inline void MergeKv(const RunInfo &runInfo);
+    __aicore__ inline void InitGroupTensors(__gm__ uint8_t *ids, __gm__ uint8_t *owners)
+    {
+        groupUnionGm_.SetGlobalBuffer((__gm__ int32_t *)ids);
+        groupOwnersGm_.SetGlobalBuffer((__gm__ uint8_t *)owners);
+    }
+    __aicore__ inline bool ApplyGroupMask(const RunInfo &info, const MSplitInfo &mSplitInfo,
+                                         LocalTensor<T> &scores, uint32_t startRow,
+                                         uint32_t rows, uint32_t columns);
     __aicore__ inline int64_t GetKeyBNBOffset(int64_t realS2Idx, const RunInfo &runInfo, int64_t s2IdLimit);
     __aicore__ inline void GetRealS2Idx(int64_t s2GmOffset, int64_t &realS2Idx, int64_t topkGmBaseOffset,
                                         const RunInfo &runInfo);
@@ -235,12 +243,18 @@ private:
     //   half 视图 [0, 512)   : vec1 从 GM 读回的 512 个 s_j
     //   float 视图 [256, 768): 展开成 fp32 供按列 Mul（起始 byte 1024）
     TBuf<> tq4ScaleBuf_; // 4K
+    TBuf<> groupOwnerBuf_; // one 512-column tile, independent of dequant scratch
+    GlobalTensor<int32_t> groupUnionGm_;
+    GlobalTensor<uint8_t> groupOwnersGm_;
     LocalTensor<float> tq4Cent_;
 };
 
 template <typename QSFAT>
 __aicore__ inline void QSFAVectorService<QSFAT>::InitBuffers(TPipe *pipe)
 {
+    if (constInfo.groupEnabled) {
+        pipe->InitBuffer(groupOwnerBuf_, ConstInfo::BUFFER_SIZE_BYTE_512B);
+    }
     pipe->InitBuffer(inputBuff1, ConstInfo::BUFFER_SIZE_BYTE_32K * 2); // 2:pingpong
     pipe->InitBuffer(inputBuff2, ConstInfo::BUFFER_SIZE_BYTE_32K);
     pipe->InitBuffer(outputBuff1, ConstInfo::BUFFER_SIZE_BYTE_32K);
@@ -659,6 +673,28 @@ __aicore__ inline void QSFAVectorService<QSFAT>::SetMidInf(const LocalTensor<T> 
 }
 
 template <typename QSFAT>
+__aicore__ inline bool QSFAVectorService<QSFAT>::ApplyGroupMask(
+    const RunInfo &info, const MSplitInfo &mSplitInfo, LocalTensor<T> &scores,
+    uint32_t startRow, uint32_t rows, uint32_t columns)
+{
+    const uint32_t groupRow = mSplitInfo.nBufferStartM + mSplitInfo.vecStartM + startRow;
+    const uint32_t bit = 1U << (groupRow / constInfo.gSize);
+    auto owners = groupOwnerBuf_.Get<uint8_t>();
+    bool anyValid = false;
+    // Scalar ownership checks are deliberate in this first prototype. Score
+    // updates use aligned vector masks rather than unaligned scalar stores.
+    for (uint32_t col = 0; col < columns; ++col) {
+        const bool valid = col < info.actualSingleProcessSInnerSize && (owners.GetValue(col) & bit) != 0;
+        anyValid |= valid;
+        if (!valid) {
+            SetInfInBlk(scores, rows, columns, col, col + 1);
+        }
+    }
+    PipeBarrier<PIPE_V>();
+    return anyValid;
+}
+
+template <typename QSFAT>
 __aicore__ inline void QSFAVectorService<QSFAT>::SoftmaxFlashV2Compute(
     const RunInfo &info, const MSplitInfo &mSplitInfo, LocalTensor<T> &mmResUb, LocalTensor<uint8_t> &softmaxTmpUb,
     uint32_t startRow, uint32_t dealRowCount, uint32_t columnCount, uint32_t actualColumnCount)
@@ -687,6 +723,11 @@ __aicore__ inline void QSFAVectorService<QSFAT>::SoftmaxFlashV2Compute(
         DataCopy(softmaxSumUb[softmaxOutOffset], inSumTensor, dealRowCount);
         PipeBarrier<PIPE_V>();
         DataCopy(softmaxMaxUb[softmaxOutOffset], inMaxTensor, dealRowCount);
+        if (info.groupSize > 1) {
+            Duplicate(mmResUb, static_cast<T>(0), dealRowCount * columnCount);
+            Duplicate(softmaxExpUb[softmaxOutOffset], static_cast<T>(1), dealRowCount);
+            PipeBarrier<PIPE_V>();
+        }
     }
 }
 
@@ -717,8 +758,12 @@ __aicore__ inline void QSFAVectorService<QSFAT>::DealBmm1ResBaseBlock(const RunI
     LocalTensor<T> qsfaTmpAFloorUb = tmpBuff1.Get<T>();
     LocalTensor<uint8_t> qsfaSoftmaxTmpUb = qsfaTmpAFloorUb.template ReinterpretCast<uint8_t>();
 
+    uint32_t softmaxColumns = info.actualSingleProcessSInnerSize;
+    if (info.groupSize > 1 && !ApplyGroupMask(info, mSplitInfo, qsfaMmResUb, startRow, dealRowCount, columnCount)) {
+        softmaxColumns = 0;
+    }
     SoftmaxFlashV2Compute(info, mSplitInfo, qsfaMmResUb, qsfaSoftmaxTmpUb, startRow, dealRowCount, columnCount,
-                          info.actualSingleProcessSInnerSize);
+                          softmaxColumns);
 
     PipeBarrier<PIPE_V>();
     // [TQ4] V 侧：MLA 中 K=V，score 侧已按列乘过 s_j，输出侧还需再乘一次 ——
@@ -759,6 +804,9 @@ __aicore__ inline void QSFAVectorService<QSFAT>::ProcessVec1SingleBuf(const RunI
 
     if (qsfaMSplitSize > mSplitInfo.vecDealM) {
         qsfaMSplitSize = mSplitInfo.vecDealM;
+    }
+    if (info.groupSize > 1 && qsfaMSplitSize > tq_group::GROUP_HEADS) {
+        qsfaMSplitSize = tq_group::GROUP_HEADS;
     }
     uint32_t qsfaLoopCount = (mSplitInfo.vecDealM + qsfaMSplitSize - 1) / qsfaMSplitSize;
     uint32_t qsfaTailSplitSize = mSplitInfo.vecDealM - (qsfaLoopCount - 1) * qsfaMSplitSize;
@@ -805,6 +853,13 @@ __aicore__ inline void QSFAVectorService<QSFAT>::ProcessVec1SingleBuf(const RunI
                 }
             }
         }
+        if (info.groupSize > 1) {
+            DataCopyExtParams ownerCopy{1, info.actualSingleProcessSInnerSize, 0, 0, 0};
+            DataCopyPadExtParams<uint8_t> ownerPad{false, 0, 0, 0};
+            DataCopyPad(groupOwnerBuf_.Get<uint8_t>(),
+                        groupOwnersGm_[info.groupUnionOffset + uint64_t(info.s2Idx) * constInfo.s2BaseSize],
+                        ownerCopy, ownerPad);
+        }
         SetFlag<HardEvent::MTE2_S>(0);
         if (unlikely(qsfaLoopCount == 0)) {
             // scalar同步影响较大，挪到循环内部进行
@@ -825,6 +880,11 @@ template <typename QSFAT>
 __aicore__ inline void QSFAVectorService<QSFAT>::GetRealS2Idx(int64_t s2GmOffset, int64_t &realS2Idx,
                                                               int64_t topkGmBaseOffset, const RunInfo &runInfo)
 {
+    if (runInfo.groupSize > 1) {
+        const uint64_t column = s2GmOffset + uint64_t(runInfo.s2Idx) * constInfo.s2BaseSize;
+        realS2Idx = column < runInfo.actS2Size ? groupUnionGm_.GetValue(runInfo.groupUnionOffset + column) : -1;
+        return;
+    }
     int64_t qsfaTopkGmIdx = (s2GmOffset + runInfo.s2Idx * constInfo.s2BaseSize) / constInfo.sparseBlockSize;
     if (unlikely(qsfaTopkGmIdx >= constInfo.sparseBlockCount)) {
         realS2Idx = -1;
@@ -1003,13 +1063,19 @@ __aicore__ inline void QSFAVectorService<QSFAT>::CopyInKv(int64_t &mte2Size, int
                                                           const RunInfo &runInfo)
 {
     int64_t s2IdLimit = runInfo.curActualSeqLenOri;
-    if (constInfo.sparseMode == 3) {
+    if (runInfo.groupSize == 1 && constInfo.sparseMode == 3) {
         s2IdLimit = runInfo.curActualSeqLenOri - runInfo.actS1Size + runInfo.gS1Idx / constInfo.gSize + 1;
     }
 
     int64_t keyBNBOffset1 = GetKeyBNBOffset(realS2Idx1, runInfo, s2IdLimit);
     int64_t keyBNBOffset2 = GetKeyBNBOffset(realS2Idx2, runInfo, s2IdLimit);
     if (unlikely(keyBNBOffset1 < 0 && keyBNBOffset2 < 0)) {
+        return;
+    }
+
+    if (runInfo.groupSize > 1) {
+        CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, realS2Idx1, keyBNBOffset1, s2IdLimit, runInfo);
+        CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, realS2Idx2, keyBNBOffset2, s2IdLimit, runInfo);
         return;
     }
 
@@ -1383,6 +1449,13 @@ __aicore__ inline void QSFAVectorService<QSFAT>::DealBmm2ResBaseBlock(const RunI
         Brcb(softmaxSumBrcb, softmaxSumUb[(info.loop % constInfo.preLoadNum) * SOFTMAX_TMP_BUFFER_OFFSET + baseOffset],
              (mSplitInfo.vecDealM + 7) / 8, {1, 8});
         PipeBarrier<PIPE_V>();
+        if (info.groupSize > 1) {
+            // Empty membership rows have sum=0 and accumulated output=0. Use
+            // denominator 1 only for normalization; exported LSE keeps sum=0.
+            // Nonempty online-softmax sums are >=1 because the maximum contributes 1.
+            Maxs(softmaxSumBrcb, softmaxSumBrcb, static_cast<T>(1), dealRowCount * BLOCK_ELEMENT_NUM);
+            PipeBarrier<PIPE_V>();
+        }
         RowDivs(bmm2ResUb, bmm2ResUb, softmaxSumBrcb, dealRowCount, columnCount, actualColumnCount);
 
         PipeBarrier<PIPE_V>();

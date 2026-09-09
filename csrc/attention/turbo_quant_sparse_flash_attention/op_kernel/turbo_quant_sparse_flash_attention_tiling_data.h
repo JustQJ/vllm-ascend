@@ -33,6 +33,8 @@ int64_t valueQuantMode;
 int64_t tileSize;
 uint32_t isActualLenDimsNull;
 uint32_t isActualLenDimsKVNull;
+uint32_t returnSoftmaxLse;
+uint32_t groupEnabled;
 };
 struct alignas(8) TurboQuantSparseFlashAttentionSingleCoreParamsMla {
 uint32_t usedCoreNum;

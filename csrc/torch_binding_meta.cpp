@@ -2145,6 +2145,7 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_msa_index_score", &vllm_ascend::meta::npu_msa_index_score_meta);
     // TurboQuant 4-bit MLA latent
     ops.impl("turboquant_sparse_flash_attention", &vllm_ascend::meta::turboquant_sparse_flash_attention_meta);
+    ops.impl("turboquant_sparse_flash_attention_grouped", &vllm_ascend::meta::turboquant_sparse_flash_attention_meta);
     ops.impl("turbo_quant_compress_latent", &vllm_ascend::meta::turbo_quant_compress_latent_meta);
     ops.impl("npu_kv_quant_sparse_flash_attention",
              &vllm_ascend::meta::npu_kv_quant_sparse_flash_attention_meta);

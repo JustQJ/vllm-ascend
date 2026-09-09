@@ -70,8 +70,9 @@ def test_turboquant_sfa_schema_requires_paged_inputs(required_input: str) -> Non
         torch.ops._C_ascend.turboquant_sparse_flash_attention(*_sfa_inputs(), **kwargs)
 
 
-def test_turboquant_sfa_meta_shapes() -> None:
-    output, softmax_max, softmax_sum = torch.ops._C_ascend.turboquant_sparse_flash_attention(
+@pytest.mark.parametrize("op_name", ["turboquant_sparse_flash_attention", "turboquant_sparse_flash_attention_grouped"])
+def test_turboquant_sfa_meta_shapes(op_name: str) -> None:
+    output, softmax_max, softmax_sum = getattr(torch.ops._C_ascend, op_name)(
         *_sfa_inputs(),
         **_sfa_kwargs(),
     )

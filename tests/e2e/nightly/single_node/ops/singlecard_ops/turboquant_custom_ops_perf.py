@@ -201,6 +201,8 @@ def make_sfa_inputs(
     topk: int,
     q_heads: int,
     pool_blocks: int,
+    implementation: str = "legacy",
+    topk_pattern: str = "random",
 ) -> dict[str, object]:
     """Realistic sparse-attention case over a paged TurboQuant KV pool.
 
@@ -242,6 +244,17 @@ def make_sfa_inputs(
     # addressing pattern (gather) and do not change kernel cost.
     indices = torch.sort(torch.randint(0, ctx_tokens, (batch * q_tokens, 1, topk), generator=g, dtype=torch.int32), dim=-1).values
 
+    if topk_pattern == "shared":
+        # Best-case grouping ceiling: distinct IDs, shared by all queries of a
+        # request and visible even to its first query. Random randint content
+        # above may contain duplicates and intentionally exercises fallback.
+        visible_context = ctx_tokens - q_tokens + 1
+        if visible_context < topk:
+            raise ValueError("shared TopK requires CTX - Q + 1 >= TOPK")
+        for b in range(batch):
+            shared = torch.randperm(visible_context, generator=g)[:topk].sort().values.to(torch.int32)
+            indices[b * q_tokens : (b + 1) * q_tokens, 0] = shared
+
     kv_npu = kv.npu()
     query_npu = query.npu()
     indices_npu = indices.npu()
@@ -251,8 +264,14 @@ def make_sfa_inputs(
     seq_kv = torch.full((batch,), ctx_tokens, dtype=torch.int32).npu()
     torch.npu.synchronize()
 
+    op = (
+        torch.ops._C_ascend.turboquant_sparse_flash_attention_grouped
+        if implementation == "grouped"
+        else torch.ops._C_ascend.turboquant_sparse_flash_attention
+    )
+
     def call() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return torch.ops._C_ascend.turboquant_sparse_flash_attention(
+        return op(
             query_npu,
             kv_npu,
             kv_npu,
@@ -365,7 +384,10 @@ def bench_sfa(args: argparse.Namespace) -> list[dict[str, object]]:
         # Real single-request pool from the 128k capture; auto-grow so B requests
         # with disjoint physical blocks still fit.
         pool_blocks = args.sfa_pool_blocks or max(1595, (batch * logical_blocks * 11 + 9) // 10)
-        case_inputs = make_sfa_inputs(batch, q_tokens, ctx_tokens, topk, q_heads, pool_blocks)
+        case_inputs = make_sfa_inputs(
+            batch, q_tokens, ctx_tokens, topk, q_heads, pool_blocks,
+            args.sfa_implementation, args.sfa_topk_pattern,
+        )
         call = case_inputs["call"]
 
         # Correctness gate before timing: each case must match the numpy
@@ -389,7 +411,7 @@ def bench_sfa(args: argparse.Namespace) -> list[dict[str, object]]:
         kv_bytes = batch * q_tokens * topk * TQ_SLOT_ROW_BYTES  # kvHeadNum=1: slots shared across heads
         rows.append(
             {
-                "op": "sfa",
+                "op": f"sfa({args.sfa_implementation},{args.sfa_topk_pattern})",
                 "shape": f"B={batch} Q={q_tokens} CTX={ctx_tokens} N1={q_heads} K={topk} pool={case_inputs['pool_mb']:.0f}MB",
                 **stats,
                 "TFLOP/s": flops / stats["min_us"] / 1e6,
@@ -464,6 +486,14 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="physical KV pool size in 128-token blocks; 0 = auto (max of the 128k "
         "capture pool 1595 and 1.1x the per-case disjoint paging need, default: 0)",
+    )
+    parser.add_argument(
+        "--sfa-implementation", choices=["legacy", "grouped"], default="legacy",
+        help="SFA entry point; grouped includes device union preparation",
+    )
+    parser.add_argument(
+        "--sfa-topk-pattern", choices=["random", "shared"], default="random",
+        help="shared uses identical unique, causal-visible TopK per request; random may trigger duplicate fallback",
     )
     parser.add_argument("--sfa-heads", type=int, default=16, help="query head count for SFA (default: 16)")
     parser.add_argument(

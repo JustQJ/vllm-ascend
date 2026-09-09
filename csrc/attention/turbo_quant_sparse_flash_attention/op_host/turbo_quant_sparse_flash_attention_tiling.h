@@ -16,6 +16,7 @@
 #define TURBOQUANT_SPARSE_FLASH_ATTENTION_TILING_H
 
 #include <sstream>
+#include "../turbo_quant_group_plan.h"
 #include <graph/utils/type_utils.h>
 #include <tiling/platform/platform_ascendc.h>
 #include <exe_graph/runtime/tiling_context.h>
@@ -182,6 +183,7 @@ TILING_DATA_FIELD_DEF(int64_t, tileSize)
 TILING_DATA_FIELD_DEF(uint32_t, isActualLenDimsNull)
 TILING_DATA_FIELD_DEF(uint32_t, isActualLenDimsKVNull)
 TILING_DATA_FIELD_DEF(uint32_t, returnSoftmaxLse)
+TILING_DATA_FIELD_DEF(uint32_t, groupEnabled)
 END_TILING_DATA_DEF
 
 REGISTER_TILING_DATA_CLASS(TurboQuantSparseFlashAttentionBaseParamsMlaOp, TurboQuantSparseFlashAttentionBaseParamsMla)
@@ -369,6 +371,7 @@ private:
     uint64_t tilingKey_{0};
 
     uint32_t headDimAlign_ = 0;
+    bool groupEnabled_ = false;
     uint32_t mBaseSize_ = 128;
     uint32_t mFdBaseSize_ = 8;
 
