@@ -194,6 +194,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         self.update_stream.wait_stream(torch.npu.current_stream())
         ret = super().run_fullgraph(desc)
         graph.update(self.update_stream, resolved_tasks)
+        logger.info_once("ACL graph replay is active for the V2 target model (UpdatableGraph, logged once).")
         return ret
 
     def capture(

@@ -1451,6 +1451,22 @@ def is_c8_mxfp_kv_quant(vllm_config: VllmConfig) -> bool:
     return cache_config is not None and cache_config.cache_dtype == C8_MXFP_KV_CACHE_DTYPE
 
 
+def is_mxfp_kv_quant(vllm_config: VllmConfig, kv_cache_spec=None) -> bool:
+    cache_config = getattr(vllm_config, "cache_config", None)
+    dtype = getattr(cache_config, "cache_dtype", None)
+    if getattr(kv_cache_spec, "is_draft", False):
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        dtype = getattr(speculative_config, "kv_cache_dtype", None) or dtype
+    if dtype not in ("mxfp8", "mxfp4"):
+        return False
+    # FullAttentionSpec.merge does not preserve the non-comparing is_draft
+    # tag. The physical dtype still distinguishes a BF16 draft from packed
+    # target storage after planner grouping.
+    spec_dtype = getattr(kv_cache_spec, "dtype", None)
+    packed_dtype = torch.uint8 if dtype == "mxfp4" else torch.float8_e4m3fn
+    return spec_dtype is None or spec_dtype == packed_dtype
+
+
 def refresh_block_size(vllm_config):
     """
     Refresh the block size in cache config.
@@ -1478,11 +1494,11 @@ def refresh_block_size(vllm_config):
 
     # Hybrid page padding is handled by the upstream cache planner. C8 only
     # constrains the scheduler block to contain whole 512-token kernel blocks.
-    if is_c8_mxfp_kv_quant(vllm_config):
+    if is_mxfp_kv_quant(vllm_config):
         kernel_size = A5_C8_MXFP_KV_CACHE_BLOCK_SIZE
         if cache_config.block_size % kernel_size:
             if getattr(cache_config, "user_specified_block_size", False):
-                raise ValueError(f"C8_MXFP requires --block-size to be a multiple of {kernel_size}.")
+                raise ValueError(f"MXFP requires --block-size to be a multiple of {kernel_size}.")
             cache_config.block_size = kernel_size
         return
 

@@ -267,6 +267,7 @@ class TestC8MXFPQfaMetadataPlan(TestBase):
         self.impl.num_heads = 8
         self.impl.num_kv_heads = 2
         self.impl.head_size = 128
+        self.impl.vllm_config = SimpleNamespace(additional_config={})
 
     def _plans(self, calls):
         """Issue one step's worth of plans; return (plans, operator calls)."""

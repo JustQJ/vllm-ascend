@@ -49,7 +49,7 @@ from vllm.logger import logger
 # Ascend-only ``--kv-cache-dtype`` values: ``"int8"`` (DeepSeek V4 / similar
 # Ascend MLA KV cache dtype) and ``"mxfp8"`` (C8-MXFP KV cache on the QFA
 # path).
-_ASCEND_CACHE_DTYPES = ("int8", "mxfp8")
+_ASCEND_CACHE_DTYPES = ("int8", "mxfp8", "mxfp4")
 
 
 def _apply_kv_cache_dtype_int8_patch() -> None:

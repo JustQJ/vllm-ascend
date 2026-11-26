@@ -117,8 +117,8 @@ from vllm_ascend.utils import (
     enable_sfa,
     enable_sfa_dcp_replicated_indexer,
     get_kv_cache_tensor_layers,
-    is_c8_mxfp_kv_quant,
     is_hidden_state_cache_spec,
+    is_mxfp_kv_quant,
     kv_cache_spec_uses_packed_sfa_main_cache,
     vllm_version_is,
 )
@@ -193,9 +193,14 @@ def _align_hybrid_attention_page_sizes(kv_cache_specs: dict[str, KVCacheSpec], m
         # Paired SFA has two physical page classes. Row byte ratios must never
         # change the logical token ownership or checkpoint granularity.
         return
-    # MLA and compressed-cache subclasses manage their own storage layouts.
+    # MLA subclasses and packet caches with explicit state byte counts manage
+    # their own storage layout. MXFP target pages may coexist with BF16 draft
+    # pages: pad their physical stride below, without resizing logical blocks
+    # according to dense K/V element widths.
     attention_specs = {
-        name: spec for name, spec in kv_cache_specs.items() if type(spec) in (FullAttentionSpec, SlidingWindowSpec)
+        name: spec
+        for name, spec in kv_cache_specs.items()
+        if type(spec) in (FullAttentionSpec, SlidingWindowSpec) and spec.state_content_bytes is None
     }
     if not attention_specs:
         return
@@ -388,8 +393,13 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
         if getattr(attn_module, "attn_backend", None) is AscendFlashAttentionBackend:
             # Account for the kernel's physical width before sizing/allocating pages.
             spec = AscendFlashAttentionBackend.customize_spec(spec)
-        if type(spec) is FullAttentionSpec and is_c8_mxfp_kv_quant(vllm_config):
-            spec = mxfp_cache_spec(spec)
+        if type(spec) is FullAttentionSpec and is_mxfp_kv_quant(vllm_config, spec):
+            if vllm_config.cache_config.cache_dtype == "mxfp4":
+                from vllm_ascend.attention.attention_c4_mxfp import mxfp4_cache_spec
+
+                spec = mxfp4_cache_spec(spec)
+            else:
+                spec = mxfp_cache_spec(spec)
         kv_cache_spec[layer_name] = spec
         if isinstance(spec, AttentionSpec) and getattr(attn_module, "align_kv_cache_with_mamba", True):
             attention_layer_names.append(layer_name)
@@ -1546,7 +1556,7 @@ def _allocate_kv_cache(
                 if type(layer_spec) is not FullAttentionSpec:
                     kv_cache_raw_tensors[layer_name] = _allocate_int8_cache_tensor(layer_size, alignment, device)
                     continue
-                if is_c8_mxfp_kv_quant(vllm_config):
+                if is_mxfp_kv_quant(vllm_config, layer_spec):
                     # One packet-backed allocation holds K, V and both scales.
                     kv_cache_raw_tensors[layer_name] = _allocate_int8_cache_tensor(layer_size, alignment, device)
                     continue
@@ -1750,11 +1760,16 @@ def _reshape_kv_cache_v2(
 
             kv_cache_spec = layer_kv_cache_spec[layer_name]
 
-            if type(kv_cache_spec) is FullAttentionSpec and is_c8_mxfp_kv_quant(vllm_config):
+            if type(kv_cache_spec) is FullAttentionSpec and is_mxfp_kv_quant(vllm_config, kv_cache_spec):
                 raw_cache = kv_cache_raw_tensors[layer_name]
                 if not isinstance(raw_cache, torch.Tensor):
                     raise ValueError("C8_MXFP requires one combined raw allocation per layer.")
-                kv_caches[layer_name] = mxfp_cache_views_for_spec(raw_cache, kv_cache_spec, kernel_block_size)
+                if vllm_config.cache_config.cache_dtype == "mxfp4":
+                    from vllm_ascend.attention.attention_c4_mxfp import mxfp4_cache_views_for_spec
+
+                    kv_caches[layer_name] = mxfp4_cache_views_for_spec(raw_cache, kv_cache_spec, kernel_block_size)
+                else:
+                    kv_caches[layer_name] = mxfp_cache_views_for_spec(raw_cache, kv_cache_spec, kernel_block_size)
                 continue
 
             if qwen4_cache_layout is not None:

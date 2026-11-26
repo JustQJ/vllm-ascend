@@ -582,19 +582,24 @@ class AscendModelSlimConfig(QuantizationConfig):
         """Upstream use staticmethod, but we need to use instance attribute"""
         suffix_map: dict[str, str | None] = {}
         regex_map = {}
+        if self._has_mxfp_c4_recipe:
+            suffix_map[".fa_v.scale"] = ".attn.v_cache_scale"
+            suffix_map[".fa_v.offset"] = None
+            suffix_map[".c4_rotation.matrix"] = ".attn._mxfp_rotation"
+            suffix_map.update(dict.fromkeys(_MXFP_C8_UNUSED_FA_SUFFIXES, None))
         if self._has_mxfp_c8_recipe and not self.enable_mxfp_c8_quant:
             logger.warning_once(
                 "[quantization] The checkpoint carries an MXFP8 KV recipe, but "
                 "--kv-cache-dtype is not 'mxfp8'; the recipe is not enabled. "
                 "Pass --kv-cache-dtype mxfp8 to serve with C8-MXFP."
             )
-        if self.enable_mxfp_c8_quant and self.enable_fa_quant:
-            # A checkpoint can carry fa_quant_type alongside an MXFP8 KV
+        if (self._has_mxfp_c4_recipe or self.enable_mxfp_c8_quant) and self.enable_fa_quant:
+            # A checkpoint can carry fa_quant_type alongside an MXFP KV
             # recipe; FAKQuant would win every shared dispatch and rename
             # fa_v.scale into an MLA submodule this dense model does not
             # have, silently dropping the scale. Stand FAKQuant down.
             logger.warning_once(
-                "[quantization] fa_quant_type=%s is declared alongside an MXFP8 KV cache; ignoring FAKQuant.",
+                "[quantization] fa_quant_type=%s is declared alongside an MXFP KV recipe; ignoring FAKQuant.",
                 self.quant_description.get("fa_quant_type", ""),
             )
             self.enable_fa_quant = False
@@ -863,7 +868,14 @@ class AscendModelSlimConfig(QuantizationConfig):
             return AscendLinearMethod(scheme)
 
         elif isinstance(layer, AttentionLayerBase):
-            if self.is_fa_quant_layer(prefix):
+            c4_parent = prefix.removesuffix(".attn")
+            if self.quant_description.get(c4_parent + ".quant_type") == "QK_MXFP4_DYNAMIC_V_MXFP4_PER_CHANNEL":
+                from ..methods.kv_cache.mxfp_c4 import AscendC4MXFPKVCacheAttentionMethod
+
+                if not self._is_full_attention_layer(layer) or c4_parent + ".c4_config" not in self.quant_description:
+                    raise ValueError("ModelSlim C4 requires a full-attention layer and its c4_config")
+                scheme = AscendC4MXFPKVCacheAttentionMethod(self.quant_description, prefix)
+            elif self.is_fa_quant_layer(prefix):
                 fa_quant_type = self.quant_description["fa_quant_type"]
                 scheme = create_scheme_for_layer(fa_quant_type, prefix, "attention")
                 logger.debug("Select AscendKVCacheMethod for %s (layer=%s)", prefix, "AttentionLayerBase[fa]")
@@ -988,6 +1000,13 @@ class AscendModelSlimConfig(QuantizationConfig):
         kv_quant_type = self.quant_description.get("kv_cache_type", "")
         return kv_quant_type == _MXFP_C8_KV_CACHE_TYPE or any(
             key.endswith(_MXFP_C8_LAYER_QUANT_TYPE_SUFFIX) and value in _MXFP_C8_LAYER_QUANT_TYPES
+            for key, value in self.quant_description.items()
+        )
+
+    @property
+    def _has_mxfp_c4_recipe(self) -> bool:
+        return any(
+            key.endswith(".self_attn.quant_type") and value == "QK_MXFP4_DYNAMIC_V_MXFP4_PER_CHANNEL"
             for key, value in self.quant_description.items()
         )
 

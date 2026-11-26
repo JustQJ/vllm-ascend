@@ -467,6 +467,13 @@ class NPUPlatform(Platform):
             HybridAttentionMambaModelConfig.verify_and_update_config(vllm_config)
             return
 
+        if vllm_config.cache_config.cache_dtype == "mxfp4":
+            from vllm_ascend.attention.attention_c4_mxfp import AscendC4MXFPAttentionBackend
+
+            # Static scale loading swaps the layer backend after weights load.
+            # Hybrid page planning happens earlier and must already count the
+            # packed data plus E8M0 scales, rather than uint8 logical elements.
+            backend_cls = AscendC4MXFPAttentionBackend
         super()._align_hybrid_block_size(vllm_config, backend_cls)
 
         if vllm_config.model_config.use_mla and vllm_config.model_config.hf_config.model_type == "kimi_k31":

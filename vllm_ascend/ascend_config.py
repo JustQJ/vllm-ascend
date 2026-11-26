@@ -658,6 +658,8 @@ class AscendConfig:
     dump_config_path: str | None = None
     runtime_config_path: str | None = None
     runtime_config_hot_reload: bool = False
+    # Explicit sidecar calibration/static V configuration for packed MXFP KV.
+    mxfp_static: dict[str, Any] = dataclasses.field(default_factory=dict)
     # Runtime object constructed in init_ascend_config (not from additional_config dict).
     runtime_config: Any = None
     mc2_comm_alg: Literal["", "fullmesh", "hierarchy", "fullmesh_v2"] = ""

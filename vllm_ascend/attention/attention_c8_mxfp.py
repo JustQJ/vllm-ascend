@@ -323,6 +323,11 @@ def fill_mxfp_v_scale_cache(value_scale: torch.Tensor, value_scale_cache: torch.
     overwrite these bytes while they own a page; static checkpoint scales
     do not imply a permanent value in shared backing storage.
     """
+    if value_scale_cache.ndim == 5:
+        from vllm_ascend.attention.attention_c4_mxfp import fill_mxfp4_v_scale_cache
+
+        fill_mxfp4_v_scale_cache(value_scale, value_scale_cache)
+        return
     num_kv_heads = value_scale_cache.shape[1]
     v_dim_frags = value_scale_cache.shape[2]
     v_dim_frag_size = value_scale_cache.shape[4]
@@ -515,6 +520,10 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
     # this subclass's constructor. Class-level defaults are therefore
     # required for objects that predate the class swap.
     enable_hamming_sparse: bool = False
+    qfa_quant_mode = QFA_QUANT_MODE_MXFP8
+    qfa_kv_layout = QFA_LAYOUT_PA_NZ
+    qfa_data_dtype = torch.float8_e4m3fn
+    qfa_allow_no_mask = True
 
     def _qfa_step_cache(self, attn_metadata: AscendMetadata) -> dict:
         cache = getattr(attn_metadata, "qfa_metadata_cache", None)
@@ -582,6 +591,8 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         """
         cache = self._qfa_step_cache(attn_metadata)
         plan_key = (
+            self.qfa_quant_mode,
+            self.qfa_kv_layout,
             self.num_heads,
             self.num_kv_heads,
             self.head_size,
@@ -594,13 +605,15 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             # TND + PA: pass cu_seqlens_q only; the KV side is addressed via
             # block_table + seqused_kv. batch_size must NOT be passed with a
             # TND layout_q (the checker rejects it).
-            from cann_ops_transformer.ops import quant_flash_attn_metadata
+            from vllm_ascend.attention.mxfp_static import qfa_ops
+
+            quant_flash_attn_metadata = qfa_ops(self.vllm_config).quant_flash_attn_metadata
 
             metadata = quant_flash_attn_metadata(
                 self.num_heads,
                 self.num_kv_heads,
                 self.head_size,
-                QFA_QUANT_MODE_MXFP8,
+                self.qfa_quant_mode,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_kv=None,
                 seqused_q=None,
@@ -612,7 +625,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
                 win_right=-1,
                 layout_q=QFA_LAYOUT_TND,
                 layout_q_descale=layout_q_descale,
-                layout_kv=QFA_LAYOUT_PA_NZ,
+                layout_kv=self.qfa_kv_layout,
                 layout_out=QFA_LAYOUT_TND,
             )
             cache[plan_key] = metadata
@@ -685,19 +698,27 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         key_scale = key_scale.view(torch.float8_e8m0fnu)
         value_scale = value_scale.view(torch.float8_e8m0fnu)
         query_scale = query_scale.view(torch.float8_e8m0fnu)
-        from cann_ops_transformer.ops import quant_flash_attn
+        from vllm_ascend.attention.mxfp_static import qfa_ops
+
+        quant_flash_attn = qfa_ops(self.vllm_config).quant_flash_attn
 
         # cann_ops_transformer delivery signature (verified on-device): the
         # allocating wrapper is capture-safe under npugraph_ex (ops-transformer
         # golden tests capture exactly this call, GRAPH_PATH=7).
+        options = {}
+        if self.qfa_quant_mode == 5:
+            options["quant_schema"] = getattr(
+                self, "qfa_quant_schema",
+                (self.vllm_config.additional_config or {}).get("mxfp_static", {}).get("quant_schema", 2),
+            )
         result = quant_flash_attn(
-            quant_query,
-            key,
-            value,
+            quant_query.view(self.qfa_data_dtype),
+            key.view(self.qfa_data_dtype),
+            value.view(self.qfa_data_dtype),
             query_scale,
             key_scale,
             value_scale,
-            QFA_QUANT_MODE_MXFP8,
+            self.qfa_quant_mode,
             block_table=attn_metadata.block_tables,
             p_scale=None,
             cu_seqlens_q=cu_seqlens_q,
@@ -717,9 +738,10 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             max_seqlen_kv=-1,
             layout_q=QFA_LAYOUT_TND,
             layout_q_descale=layout_q_descale,
-            layout_kv=QFA_LAYOUT_PA_NZ,
+            layout_kv=self.qfa_kv_layout,
             layout_out=QFA_LAYOUT_TND,
             return_softmax_lse=False,
+            **options,
         )
         # return_softmax_lse=False yields an empty LSE tensor in the
         # cann_ops flavor; tolerate both tuple and single-tensor returns.
@@ -781,7 +803,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         # a kernel template that never reads the mask; at Q_S == 1 that is
         # exactly equivalent to CAUSAL (the KV range is bounded by seqused_kv).
         # MTP verify steps (Q_S = 1 + num_spec) keep CAUSAL.
-        mask_mode = QFA_MASK_MODE_NO_MASK if max_seqlen_q == 1 else QFA_MASK_MODE_CAUSAL
+        mask_mode = QFA_MASK_MODE_NO_MASK if self.qfa_allow_no_mask and max_seqlen_q == 1 else QFA_MASK_MODE_CAUSAL
 
         # Both operators have to agree on the q scale layout: it is what
         # picks the kernel, and the metadata plan is computed for that kernel.
@@ -849,15 +871,14 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             slot_mapping,
         )
 
-        # Only K's scale is per-token; the runner fills static V scales at
-        # setup and restores them when a physical page is reassigned to C8.
+        # K scales are per-token. forward writes this layer's static V scales
+        # only for its addressed token groups after the K/V scatter.
         scatter_mxfp_k_scale_cache(
             # Byte view: index_put_ on float8 falls back to AICPU.
             key_scale.view(torch.uint8) if key_scale.dtype != torch.uint8 else key_scale,
             kv_cache[2],
             self._qfa_k_scale_slot_index(attn_metadata, slot_mapping, block_size),
         )
-        notify_kv_cache_written()
 
     def forward(
         self,
@@ -927,6 +948,14 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             value_mxfp8 = value_mxfp8.view((attn_metadata.num_actual_tokens, *original_value_shape[1:]))
 
             self.reshape_and_cache(key_mxfp8, value_mxfp8, key_scale, kv_cache, attn_metadata)
+            from vllm_ascend.ops.triton.mxfp_v_scale import scatter_v_scales
+
+            # Physical pages can belong to another layer/GDN between uses.
+            # Global fills would assign the last layer's scales to every owner.
+            scatter_v_scales(
+                layer.v_cache_scale, kv_cache[3], attn_metadata.slot_mapping[: attn_metadata.num_actual_tokens]
+            )
+            notify_kv_cache_written()
 
         # PA_NZ: QFA reads the packet-packed strided cache views directly
         # (built once at allocation) -- no transpose, no storage copy.

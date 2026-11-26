@@ -64,10 +64,6 @@ from vllm_ascend.ascend_forward_context import (
     set_mc2_mask,
     set_mc2_tokens_capacity,
 )
-from vllm_ascend.attention.attention_c8_mxfp import (
-    AscendC8MXFPAttentionBackendImpl,
-    fill_mxfp_v_scale_cache,
-)
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
 from vllm_ascend.attention.fa_v1 import AscendFlashAttentionBackend
 from vllm_ascend.attention.flashmla import prepare_flashmla_batch_req_state
@@ -106,7 +102,6 @@ from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.utils import (
     create_hccl_pg_options,
     enable_sfa_dcp_sharded_indexer,
-    is_c8_mxfp_kv_quant,
     is_deepseek_v41,
     lmhead_tp_enable,
     lmhead_tp_max_num_logits,
@@ -133,7 +128,6 @@ from vllm_ascend.worker.v2.spec_decode import init_speculator
 from vllm_ascend.worker.v2.states import AscendRequestState
 from vllm_ascend.worker.v2.utils import (
     AscendV2KVBlockZeroer,
-    C8KVBlockZeroer,
     communicator_switch,
     prepare_v41_dummy_ring_state,
     prepare_v41_source_rope,
@@ -331,6 +325,10 @@ class NPUModelRunner(GPUModelRunner):
             # memory profiling.
             join_nz_warm_thread()
 
+        from vllm_ascend.attention.mxfp_static import install_mxfp_static_layers
+
+        install_mxfp_static_layers(self.vllm_config)
+
         # In cudagraph modes the dumper must be started before graph capture so
         # that aclgraph capture/replay is instrumented (v1 parity: v1 starts
         # the dumper at the end of load_model).
@@ -402,12 +400,6 @@ class NPUModelRunner(GPUModelRunner):
             cache_dtype=self.cache_config.cache_dtype,
             excluded_cache_components=excluded_cache_components,
         )
-        if is_c8_mxfp_kv_quant(self.vllm_config):
-            # The zeroer skips the static V scales (4th tuple component); the
-            # wrapper restores them on pages reassigned from Mamba.
-            self.kv_block_zeroer = C8KVBlockZeroer(  # type: ignore[assignment]
-                self.kv_block_zeroer, self._c8_mxfp_v_scale_caches, fill_mxfp_v_scale_cache
-            )
 
     def _initialize_kv_cache_upstream(
         self,
@@ -548,34 +540,6 @@ class NPUModelRunner(GPUModelRunner):
             static_forward_context=self.compilation_config.static_forward_context,
         )
         self.model_state.kvpp_runtime = self.kvpp
-
-        self._fill_c8_mxfp_v_scale_caches()
-
-    def _fill_c8_mxfp_v_scale_caches(self) -> None:
-        """Initialize C8 V scales and retain views for page reassignment."""
-        self._c8_mxfp_v_scale_caches = []
-        num_blocks = self.kv_cache_config.num_blocks
-        if num_blocks <= 0:
-            return
-        for layer in self.compilation_config.static_forward_context.values():
-            if isinstance(getattr(layer, "impl", None), AscendC8MXFPAttentionBackendImpl):
-                value_scale_cache = layer.kv_cache[3]
-                assert value_scale_cache.shape[0] % num_blocks == 0
-                kernel_blocks_per_page = value_scale_cache.shape[0] // num_blocks
-                self._c8_mxfp_v_scale_caches.append((layer.v_cache_scale, value_scale_cache, kernel_blocks_per_page))
-                fill_mxfp_v_scale_cache(layer.v_cache_scale, value_scale_cache)
-
-    def shutdown(self) -> None:
-        # Drop C8 packet views before the parent collects tensors and
-        # empties the allocator cache.
-        entries = getattr(self, "_c8_mxfp_v_scale_caches", None)
-        if entries is not None:
-            entries.clear()
-        zeroer = getattr(self, "kv_block_zeroer", None)
-        if isinstance(zeroer, C8KVBlockZeroer):
-            zeroer.entries.clear()
-            self.kv_block_zeroer = zeroer.delegate
-        super().shutdown()
 
     def _register_sparse_kv_caches(self, kv_caches: dict[str, Any]) -> None:
         """Bind host pools before the V2 KV connector registers its destinations."""
